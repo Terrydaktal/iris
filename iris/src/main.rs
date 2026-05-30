@@ -2779,6 +2779,7 @@ impl ImageViewer {
                         .collect();
                         
                     let mut clicked_path = None;
+                    let mut single_clicked_path = None;
                     
                     if filtered_images.is_empty() {
                         ui.centered_and_justified(|ui| {
@@ -2895,8 +2896,10 @@ impl ImageViewer {
                                                 });
                                             });
                                             
-                                        if is_clicked {
+                                        if response.double_clicked() {
                                             clicked_path = Some((*path).clone());
+                                        } else if response.clicked() {
+                                            single_clicked_path = Some((*path).clone());
                                         }
                                     }
                                 });
@@ -2913,6 +2916,17 @@ impl ImageViewer {
                         self.offset = egui::Vec2::ZERO;
                         self.update_exif();
                         ui.ctx().request_repaint();
+                    }
+                    
+                    if let Some(path) = single_clicked_path {
+                        if let Some(pos) = self.recursive_images.iter().position(|p| p == &path) {
+                            self.images = self.recursive_images.clone();
+                            self.current_index = pos;
+                            self.update_exif();
+                            self.show_exif = true;
+                            self.side_panel_mode = SidePanelMode::Duplicates;
+                            ui.ctx().request_repaint();
+                        }
                     }
                 }
                 
@@ -2977,6 +2991,7 @@ impl ImageViewer {
                             let cols = (available_width / col_width).floor().max(1.0) as usize;
                             
                             let mut clicked_result_idx = None;
+                            let mut single_clicked_result_idx = None;
                             let mut clicked_similar = None;
                             let mut clicked_person = None;
                             
@@ -3152,10 +3167,13 @@ impl ImageViewer {
                                                     });
                                                 });
                                                 
-                                            if is_clicked {
-                                                // Find index of clicked item in results
+                                            if response.double_clicked() {
                                                 if let Some(pos) = self.semantic_results.iter().position(|r| r.media_path.as_ref() == Some(path)) {
                                                     clicked_result_idx = Some(pos);
+                                                }
+                                            } else if response.clicked() {
+                                                if let Some(pos) = self.semantic_results.iter().position(|r| r.media_path.as_ref() == Some(path)) {
+                                                    single_clicked_result_idx = Some(pos);
                                                 }
                                             }
                                         }
@@ -3175,6 +3193,17 @@ impl ImageViewer {
                                 self.zoom = 1.0;
                                 self.offset = egui::Vec2::ZERO;
                                 self.update_exif();
+                                ui.ctx().request_repaint();
+                            }
+                            if let Some(idx) = single_clicked_result_idx {
+                                let active_paths: Vec<PathBuf> = self.semantic_results.iter()
+                                    .filter_map(|r| r.media_path.clone())
+                                    .collect();
+                                self.images = active_paths;
+                                self.current_index = idx;
+                                self.update_exif();
+                                self.show_exif = true;
+                                self.side_panel_mode = SidePanelMode::Duplicates;
                                 ui.ctx().request_repaint();
                             }
                             if let Some(item) = clicked_similar {
