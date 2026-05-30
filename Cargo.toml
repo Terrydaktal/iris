@@ -8,3 +8,13 @@ eframe = "0.33.3"
 egui_extras = { version = "0.33.3", features = ["all_loaders"] }
 image = { version = "0.25.10", features = ["jpeg", "png", "webp", "bmp", "gif", "tiff", "avif"] }
 rfd = "0.17.2"
+anyhow = "1.0"
+arrow-array = "57.2"
+futures = "0.3"
+lancedb = "0.26.2"
+ort = "2.0.0-rc.12"
+rayon = "1.11"
+serde_json = "1.0"
+tokenizers = "0.23"
+tokio = { version = "1.48", features = ["rt-multi-thread"] }
+num_cpus = "1.17"

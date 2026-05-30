@@ -3,6 +3,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use anyhow::{anyhow, bail, Context, Result};
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch,
+    StringArray, StructArray,
+};
+use futures::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use ort::session::Session;
+use ort::value::Tensor;
+use rayon::prelude::*;
+use serde_json::Value;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 fn get_socket_path() -> PathBuf {
     let username = std::env::var("USER")
@@ -210,6 +226,7 @@ fn extract_system_block(exif_data: &str) -> String {
 enum SidePanelMode {
     Layout,
     Exif,
+    Duplicates,
 }
 
 #[derive(Clone)]
@@ -953,6 +970,1214 @@ fn collect_images_recursive(dir: &Path, tx: &std::sync::mpsc::Sender<PathBuf>, v
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum ExploreMode {
+    Filesystem,
+    Semantic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Clip,
+    Ocr,
+}
+
+struct ClipIndex {
+    entries: Vec<ClipEntry>,
+    dim: usize,
+    file_count: usize,
+}
+
+struct FaceIndex {
+    entries: Vec<FaceEntry>,
+    file_count: usize,
+}
+
+struct OcrIndex {
+    entries: Vec<OcrEntry>,
+    file_count: usize,
+}
+
+#[derive(Clone)]
+struct ClipEntry {
+    file_name: Arc<str>,
+    is_video: bool,
+    timestamp_sec: f32,
+    vector: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct FaceEntry {
+    file_name: Arc<str>,
+    is_video: bool,
+    timestamp_sec: f32,
+    vector: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct OcrEntry {
+    file_name: Arc<str>,
+    is_video: bool,
+    timestamp_sec: f32,
+    text_lower: String,
+}
+
+#[derive(Clone)]
+struct SearchResult {
+    rank: usize,
+    score: f32,
+    file_name: String,
+    is_video: bool,
+    timestamp_sec: f32,
+    media_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct SimilarFile {
+    file_name: String,
+    is_video: bool,
+    similarity_pct: Option<f32>,
+}
+
+#[derive(Clone, Default)]
+struct SiftInfo {
+    match_file: Option<String>,
+    score: Option<f32>,
+    inliers: Option<i32>,
+    good_matches: Option<i32>,
+    inlier_ratio: Option<f32>,
+    checked: Option<bool>,
+}
+
+struct ClipTextEncoder {
+    tokenizer: Tokenizer,
+    session: Session,
+    context_len: usize,
+}
+
+struct DatabaseIndices {
+    clip_index: Arc<ClipIndex>,
+    face_index: Arc<FaceIndex>,
+    ocr_index: Arc<OcrIndex>,
+    similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    sift_info_by_file: HashMap<String, SiftInfo>,
+    sift_root_by_file: HashMap<String, String>,
+    sift_members_by_root: HashMap<String, Vec<String>>,
+    encoder: ClipTextEncoder,
+}
+
+async fn load_clip_index(db_dir: &Path, table_name: &str) -> Result<ClipIndex> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "is_video",
+            "skip_processing",
+            "clip_groups",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut entries = Vec::new();
+    let mut dim = None;
+    let mut seen_files = std::collections::HashSet::new();
+
+    for batch in batches {
+        parse_batch(&batch, &mut entries, &mut dim, &mut seen_files)?;
+    }
+
+    let dim = dim.ok_or_else(|| anyhow!("no clip vectors found in table {table_name}"))?;
+    Ok(ClipIndex {
+        entries,
+        dim,
+        file_count: seen_files.len(),
+    })
+}
+
+async fn load_face_index(db_dir: &Path, table_name: &str) -> Result<FaceIndex> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "is_video",
+            "skip_processing",
+            "face_groups",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut entries = Vec::new();
+    let mut seen_files = HashSet::new();
+    for batch in batches {
+        parse_face_batch(&batch, &mut entries, &mut seen_files)?;
+    }
+    Ok(FaceIndex {
+        entries,
+        file_count: seen_files.len(),
+    })
+}
+
+async fn load_ocr_index(db_dir: &Path, table_name: &str) -> Result<OcrIndex> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "is_video",
+            "skip_processing",
+            "ocr_groups",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut entries = Vec::new();
+    let mut seen_files = HashSet::new();
+    for batch in batches {
+        parse_ocr_batch(&batch, &mut entries, &mut seen_files)?;
+    }
+    Ok(OcrIndex {
+        entries,
+        file_count: seen_files.len(),
+    })
+}
+
+async fn load_similar_map(
+    db_dir: &Path,
+    table_name: &str,
+) -> Result<HashMap<String, Vec<SimilarFile>>> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "is_video",
+            "dedupe_match_file",
+            "dedupe_similarity_pct",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut map: HashMap<String, Vec<SimilarFile>> = HashMap::new();
+
+    for batch in batches {
+        let file_names = string_col(&batch, "file_name")?;
+        let is_video = bool_col(&batch, "is_video")?;
+        let dedupe_match = string_col(&batch, "dedupe_match_file")?;
+        let similarity_col = batch.column_by_name("dedupe_similarity_pct");
+
+        for row in 0..batch.num_rows() {
+            if dedupe_match.is_null(row) || file_names.is_null(row) {
+                continue;
+            }
+            let master = dedupe_match.value(row).to_string();
+            let similar_file = file_names.value(row).to_string();
+            if master == similar_file {
+                continue;
+            }
+            let similarity_pct = similarity_col.and_then(|col| float_value(col.as_ref(), row));
+            map.entry(master).or_default().push(SimilarFile {
+                file_name: similar_file,
+                is_video: bool_value(is_video, row).unwrap_or(false),
+                similarity_pct,
+            });
+        }
+    }
+
+    for values in map.values_mut() {
+        values.sort_by(|a, b| {
+            b.similarity_pct
+                .unwrap_or(f32::NEG_INFINITY)
+                .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                .unwrap_or(Ordering::Equal)
+        });
+    }
+    Ok(map)
+}
+
+async fn load_sift_info_map(db_dir: &Path, table_name: &str) -> Result<HashMap<String, SiftInfo>> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "sift_match_file",
+            "sift_match_score",
+            "sift_match_inliers",
+            "sift_match_good_matches",
+            "sift_match_inlier_ratio",
+            "sift_match_checked",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut map: HashMap<String, SiftInfo> = HashMap::new();
+
+    for batch in batches {
+        let file_names = string_col(&batch, "file_name")?;
+        let sift_match_file = string_col(&batch, "sift_match_file")?;
+        let sift_score = batch.column_by_name("sift_match_score");
+        let sift_inliers = batch.column_by_name("sift_match_inliers");
+        let sift_good = batch.column_by_name("sift_match_good_matches");
+        let sift_ratio = batch.column_by_name("sift_match_inlier_ratio");
+        let sift_checked = bool_col(&batch, "sift_match_checked")?;
+
+        for row in 0..batch.num_rows() {
+            if file_names.is_null(row) {
+                continue;
+            }
+            let file_name = file_names.value(row).to_string();
+            let match_file = if sift_match_file.is_null(row) {
+                None
+            } else {
+                Some(sift_match_file.value(row).to_string())
+            };
+            let inliers = sift_inliers.and_then(|col| {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value(row))
+                    }
+                } else {
+                    None
+                }
+            });
+            let good_matches = sift_good.and_then(|col| {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value(row))
+                    }
+                } else {
+                    None
+                }
+            });
+            map.insert(
+                file_name,
+                SiftInfo {
+                    match_file,
+                    score: sift_score.and_then(|col| float_value(col.as_ref(), row)),
+                    inliers,
+                    good_matches,
+                    inlier_ratio: sift_ratio.and_then(|col| float_value(col.as_ref(), row)),
+                    checked: bool_value(sift_checked, row),
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
+#[derive(Default)]
+struct Dsu {
+    parent: HashMap<String, String>,
+}
+
+impl Dsu {
+    fn add(&mut self, value: &str) {
+        self.parent
+            .entry(value.to_string())
+            .or_insert_with(|| value.to_string());
+    }
+
+    fn find(&mut self, value: &str) -> Option<String> {
+        let parent = self.parent.get(value)?.clone();
+        if parent == value {
+            return Some(parent);
+        }
+        let root = self.find(&parent)?;
+        self.parent.insert(value.to_string(), root.clone());
+        Some(root)
+    }
+
+    fn union(&mut self, a: &str, b: &str) {
+        self.add(a);
+        self.add(b);
+        let root_a = match self.find(a) {
+            Some(v) => v,
+            None => return,
+        };
+        let root_b = match self.find(b) {
+            Some(v) => v,
+            None => return,
+        };
+        if root_a == root_b {
+            return;
+        }
+        if root_a < root_b {
+            self.parent.insert(root_b, root_a);
+        } else {
+            self.parent.insert(root_a, root_b);
+        }
+    }
+}
+
+async fn load_sift_groups(
+    db_dir: &Path,
+    table_name: &str,
+) -> Result<(HashMap<String, String>, HashMap<String, Vec<String>>)> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "is_video",
+            "skip_processing",
+            "sift_match_file",
+            "sift_match_score",
+            "sift_match_inliers",
+            "sift_match_inlier_ratio",
+            "sift_match_checked",
+        ]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut master_images = HashSet::new();
+    let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
+
+    for batch in batches {
+        let file_names = string_col(&batch, "file_name")?;
+        let is_video = bool_col(&batch, "is_video")?;
+        let skip_processing = bool_col(&batch, "skip_processing")?;
+        let sift_match_file = string_col(&batch, "sift_match_file")?;
+        let sift_checked = bool_col(&batch, "sift_match_checked")?;
+
+        for row in 0..batch.num_rows() {
+            if file_names.is_null(row) {
+                continue;
+            }
+            if bool_value(is_video, row).unwrap_or(false) {
+                continue;
+            }
+            if bool_value(skip_processing, row) == Some(true) {
+                continue;
+            }
+            let file_name = file_names.value(row).to_string();
+            master_images.insert(file_name.clone());
+
+            if sift_match_file.is_null(row) {
+                continue;
+            }
+            if bool_value(sift_checked, row) != Some(true) {
+                continue;
+            }
+            let target = sift_match_file.value(row).to_string();
+            if target == file_name {
+                continue;
+            }
+            direct_root_by_file.insert(file_name, target);
+        }
+    }
+
+    let mut dsu = Dsu::default();
+    for file_name in &master_images {
+        dsu.add(file_name.as_str());
+    }
+    for (file_name, target) in &direct_root_by_file {
+        if !master_images.contains(file_name.as_str()) || !master_images.contains(target.as_str()) {
+            continue;
+        }
+        dsu.union(file_name.as_str(), target.as_str());
+    }
+
+    fn resolve_root(
+        name: &str,
+        direct_root_by_file: &HashMap<String, String>,
+        master_images: &HashSet<String>,
+    ) -> String {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut current = name.to_string();
+        seen.insert(current.clone());
+        loop {
+            let next = match direct_root_by_file.get(current.as_str()) {
+                Some(v) => v.clone(),
+                None => return current,
+            };
+            if !master_images.contains(next.as_str()) {
+                return current;
+            }
+            if !seen.insert(next.clone()) {
+                let mut values: Vec<String> = seen.into_iter().collect();
+                values.sort_unstable();
+                return values[0].clone();
+            }
+            current = next;
+        }
+    }
+
+    let mut sift_root_by_file: HashMap<String, String> = HashMap::new();
+    let mut sift_members_by_root: HashMap<String, Vec<String>> = HashMap::new();
+    let mut raw_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for file_name in &master_images {
+        let root = resolve_root(file_name.as_str(), &direct_root_by_file, &master_images);
+        raw_groups.entry(root).or_default().push(file_name.clone());
+    }
+    for members in raw_groups.into_values() {
+        if members.len() <= 1 {
+            continue;
+        }
+        let mut sorted_members = members;
+        sorted_members.sort_unstable();
+        let canonical = resolve_root(
+            sorted_members[0].as_str(),
+            &direct_root_by_file,
+            &master_images,
+        );
+        for member in &sorted_members {
+            sift_root_by_file.insert(member.clone(), canonical.clone());
+        }
+        sift_members_by_root.insert(canonical, sorted_members);
+    }
+
+    Ok((sift_root_by_file, sift_members_by_root))
+}
+
+fn parse_batch(
+    batch: &RecordBatch,
+    entries: &mut Vec<ClipEntry>,
+    dim: &mut Option<usize>,
+    seen_files: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    let file_names = string_col(batch, "file_name")?;
+    let is_video = bool_col(batch, "is_video")?;
+    let skip_processing = bool_col(batch, "skip_processing")?;
+    let clip_groups = list_col(batch, "clip_groups")?;
+
+    for row in 0..batch.num_rows() {
+        if bool_value(skip_processing, row) == Some(true)
+            || clip_groups.is_null(row)
+            || file_names.is_null(row)
+        {
+            continue;
+        }
+        let file_name = Arc::<str>::from(file_names.value(row));
+        let video = bool_value(is_video, row).unwrap_or(false);
+        let groups_any = clip_groups.value(row);
+        let groups = groups_any
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| anyhow!("clip_groups value is not a struct array"))?;
+        let timestamps = groups
+            .column_by_name("timestamp_sec")
+            .ok_or_else(|| anyhow!("clip_groups missing timestamp_sec"))?
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| anyhow!("timestamp_sec is not float32"))?;
+        let vectors = groups
+            .column_by_name("clip_embedding")
+            .ok_or_else(|| anyhow!("clip_groups missing clip_embedding"))?
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| anyhow!("clip_embedding is not list<float>"))?;
+
+        let mut added = false;
+        for group_idx in 0..groups.len() {
+            if vectors.is_null(group_idx) {
+                continue;
+            }
+            let vector_any = vectors.value(group_idx);
+            let vector_arr = vector_any
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("clip vector is not float32"))?;
+            if vector_arr.is_empty() {
+                continue;
+            }
+            let mut vector = Vec::with_capacity(vector_arr.len());
+            for i in 0..vector_arr.len() {
+                vector.push(vector_arr.value(i));
+            }
+            if let Some(expected) = *dim {
+                if vector.len() != expected {
+                    continue;
+                }
+            } else {
+                *dim = Some(vector.len());
+            }
+            let ts = if timestamps.is_null(group_idx) {
+                0.0
+            } else {
+                timestamps.value(group_idx)
+            };
+            entries.push(ClipEntry {
+                file_name: file_name.clone(),
+                is_video: video,
+                timestamp_sec: ts,
+                vector,
+            });
+            added = true;
+        }
+        if added {
+            seen_files.insert(file_name.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn parse_face_batch(
+    batch: &RecordBatch,
+    entries: &mut Vec<FaceEntry>,
+    seen_files: &mut HashSet<String>,
+) -> Result<()> {
+    let file_names = string_col(batch, "file_name")?;
+    let is_video = bool_col(batch, "is_video")?;
+    let skip_processing = bool_col(batch, "skip_processing")?;
+    let face_groups = list_col(batch, "face_groups")?;
+
+    for row in 0..batch.num_rows() {
+        if bool_value(skip_processing, row) == Some(true)
+            || face_groups.is_null(row)
+            || file_names.is_null(row)
+        {
+            continue;
+        }
+        let file_name = Arc::<str>::from(file_names.value(row));
+        let video = bool_value(is_video, row).unwrap_or(false);
+        let groups_any = face_groups.value(row);
+        let groups = groups_any
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| anyhow!("face_groups value is not a struct array"))?;
+        let timestamps = groups
+            .column_by_name("timestamp_sec")
+            .ok_or_else(|| anyhow!("face_groups missing timestamp_sec"))?
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| anyhow!("face timestamp_sec is not float32"))?;
+        let embeddings = groups
+            .column_by_name("face_embeddings")
+            .ok_or_else(|| anyhow!("face_groups missing face_embeddings"))?
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| anyhow!("face_embeddings is not list<list<float>>"))?;
+
+        let mut added = false;
+        for group_idx in 0..groups.len() {
+            if embeddings.is_null(group_idx) {
+                continue;
+            }
+            let faces_any = embeddings.value(group_idx);
+            let faces = faces_any
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| anyhow!("face embedding group is not list<float>"))?;
+            let ts = if timestamps.is_null(group_idx) {
+                0.0
+            } else {
+                timestamps.value(group_idx)
+            };
+            for face_idx in 0..faces.len() {
+                if faces.is_null(face_idx) {
+                    continue;
+                }
+                let vector_any = faces.value(face_idx);
+                let vector_arr = vector_any
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("face vector is not float32"))?;
+                if vector_arr.is_empty() {
+                    continue;
+                }
+                let mut vector = Vec::with_capacity(vector_arr.len());
+                for i in 0..vector_arr.len() {
+                    vector.push(vector_arr.value(i));
+                }
+                normalize_in_place(&mut vector);
+                entries.push(FaceEntry {
+                    file_name: file_name.clone(),
+                    is_video: video,
+                    timestamp_sec: ts,
+                    vector,
+                });
+                added = true;
+            }
+        }
+        if added {
+            seen_files.insert(file_name.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn parse_ocr_batch(
+    batch: &RecordBatch,
+    entries: &mut Vec<OcrEntry>,
+    seen_files: &mut HashSet<String>,
+) -> Result<()> {
+    let file_names = string_col(batch, "file_name")?;
+    let is_video = bool_col(batch, "is_video")?;
+    let skip_processing = bool_col(batch, "skip_processing")?;
+    let ocr_groups = list_col(batch, "ocr_groups")?;
+
+    for row in 0..batch.num_rows() {
+        if bool_value(skip_processing, row) == Some(true) || ocr_groups.is_null(row) || file_names.is_null(row) {
+            continue;
+        }
+        let file_name = Arc::<str>::from(file_names.value(row));
+        let video = bool_value(is_video, row).unwrap_or(false);
+        let groups_any = ocr_groups.value(row);
+        let groups = groups_any
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| anyhow!("ocr_groups value is not a struct array"))?;
+        let timestamps = groups
+            .column_by_name("timestamp_sec")
+            .ok_or_else(|| anyhow!("ocr_groups missing timestamp_sec"))?
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| anyhow!("ocr timestamp_sec is not float32"))?;
+        let text_detected = groups
+            .column_by_name("text_detected")
+            .ok_or_else(|| anyhow!("ocr_groups missing text_detected"))?
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| anyhow!("text_detected is not bool"))?;
+        let texts = groups
+            .column_by_name("text")
+            .ok_or_else(|| anyhow!("ocr_groups missing text"))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("ocr text is not string"))?;
+
+        let mut added = false;
+        for group_idx in 0..groups.len() {
+            if text_detected.is_null(group_idx) || !text_detected.value(group_idx) || texts.is_null(group_idx) {
+                continue;
+            }
+            let text = texts.value(group_idx).trim();
+            if text.is_empty() {
+                continue;
+            }
+            let ts = if timestamps.is_null(group_idx) {
+                0.0
+            } else {
+                timestamps.value(group_idx)
+            };
+            entries.push(OcrEntry {
+                file_name: file_name.clone(),
+                is_video: video,
+                timestamp_sec: ts,
+                text_lower: text.to_lowercase(),
+            });
+            added = true;
+        }
+        if added {
+            seen_files.insert(file_name.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn string_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("column {name} is not string"))
+}
+
+fn bool_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("column {name} is not bool"))
+}
+
+fn list_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ListArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("column {name} is not list"))
+}
+
+fn bool_value(array: &BooleanArray, row: usize) -> Option<bool> {
+    if array.is_null(row) {
+        None
+    } else {
+        Some(array.value(row))
+    }
+}
+
+fn float_value(array: &dyn Array, row: usize) -> Option<f32> {
+    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        }
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row) as f32)
+        }
+    } else {
+        None
+    }
+}
+
+fn valid_sift_link(info: &SiftInfo) -> bool {
+    info.checked == Some(true)
+        && info.match_file.is_some()
+        && info.inliers.unwrap_or(0) >= 10
+        && info.inlier_ratio.unwrap_or(0.0) >= 0.75
+        && info.score.unwrap_or(0.0) >= 0.0
+}
+
+impl ClipTextEncoder {
+    fn new(onnx_path: &Path, tokenizer_path: &Path, context_len: usize) -> Result<Self> {
+        let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|err| {
+            anyhow!(
+                "failed to load tokenizer {}: {err}",
+                tokenizer_path.display()
+            )
+        })?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: context_len,
+                ..Default::default()
+            }))
+            .map_err(|err| anyhow!("failed to configure tokenizer truncation: {err}"))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(context_len),
+            pad_id: 0,
+            pad_type_id: 0,
+            pad_token: "<pad>".to_string(),
+            ..Default::default()
+        }));
+        let session = Session::builder()
+            .map_err(|err| anyhow!("failed to create ONNX Runtime session builder: {err}"))?
+            .with_intra_threads(num_cpus::get().min(16))
+            .map_err(|err| anyhow!("failed to configure ONNX Runtime threads: {err}"))?
+            .commit_from_file(onnx_path)
+            .map_err(|err| anyhow!("failed to load ONNX model {}: {err}", onnx_path.display()))?;
+        Ok(Self {
+            tokenizer,
+            session,
+            context_len,
+        })
+    }
+
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|err| anyhow!("tokenization failed: {err}"))?;
+        let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+        ids.truncate(self.context_len);
+        ids.resize(self.context_len, 0);
+
+        let input = Tensor::from_array(([1usize, self.context_len], ids.into_boxed_slice()))
+            .map_err(|err| anyhow!("failed to create ONNX input tensor: {err}"))?;
+        let outputs = self
+            .session
+            .run(ort::inputs! { "input_ids" => input })
+            .map_err(|err| anyhow!("ONNX text encoder inference failed: {err}"))?;
+        let (_, data) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|err| anyhow!("failed to extract ONNX text embedding: {err}"))?;
+        let mut vector = data.to_vec();
+        normalize_in_place(&mut vector);
+        Ok(vector)
+    }
+}
+
+fn normalize_in_place(vector: &mut [f32]) {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in vector {
+            *value /= norm;
+        }
+    }
+}
+
+fn search_index(
+    index: &ClipIndex,
+    query: &[f32],
+    limit: usize,
+    video_only: bool,
+) -> Vec<SearchResult> {
+    let merged = index
+        .entries
+        .par_chunks(4096)
+        .map(|chunk| {
+            let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
+            for entry in chunk {
+                if video_only && !entry.is_video {
+                    continue;
+                }
+                let score = dot(query, &entry.vector);
+                local
+                    .entry(entry.file_name.to_string())
+                    .and_modify(|best| {
+                        if score > best.0 {
+                            *best = (score, entry.is_video, entry.timestamp_sec);
+                        }
+                    })
+                    .or_insert((score, entry.is_video, entry.timestamp_sec));
+            }
+            local
+        })
+        .reduce(HashMap::new, |mut acc, local| {
+            for (file_name, candidate) in local {
+                acc.entry(file_name)
+                    .and_modify(|best| {
+                        if candidate.0 > best.0 {
+                            *best = candidate;
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+            acc
+        });
+
+    let mut rows: Vec<_> = merged
+        .into_iter()
+        .map(
+            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+                rank: 0,
+                score,
+                file_name,
+                is_video,
+                timestamp_sec,
+                media_path: None,
+            },
+        )
+        .collect();
+
+    rows.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    rows.truncate(limit);
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    rows
+}
+
+fn search_ocr_index(
+    index: &OcrIndex,
+    query: &str,
+    limit: usize,
+    video_only: bool,
+) -> Vec<SearchResult> {
+    let query_lower = query.trim().to_lowercase();
+    if query_lower.is_empty() {
+        return Vec::new();
+    }
+    let terms: Vec<&str> = query_lower
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect();
+    let term_den = terms.len().max(1) as f32;
+
+    let merged = index
+        .entries
+        .par_chunks(4096)
+        .map(|chunk| {
+            let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
+            for entry in chunk {
+                if video_only && !entry.is_video {
+                    continue;
+                }
+                let phrase_hit = entry.text_lower.contains(query_lower.as_str());
+                let term_hits = terms
+                    .iter()
+                    .filter(|term| entry.text_lower.contains(**term))
+                    .count() as f32;
+                if !phrase_hit && term_hits <= 0.0 {
+                    continue;
+                }
+                let term_score = term_hits / term_den;
+                let score = if phrase_hit { 2.0 + term_score } else { term_score };
+                local
+                    .entry(entry.file_name.to_string())
+                    .and_modify(|best| {
+                        if score > best.0 {
+                            *best = (score, entry.is_video, entry.timestamp_sec);
+                        }
+                    })
+                    .or_insert((score, entry.is_video, entry.timestamp_sec));
+            }
+            local
+        })
+        .reduce(HashMap::new, |mut acc, local| {
+            for (file_name, candidate) in local {
+                acc.entry(file_name)
+                    .and_modify(|best| {
+                        if candidate.0 > best.0 {
+                            *best = candidate;
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+            acc
+        });
+
+    let mut rows: Vec<_> = merged
+        .into_iter()
+        .map(
+            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+                rank: 0,
+                score,
+                file_name,
+                is_video,
+                timestamp_sec,
+                media_path: None,
+            },
+        )
+        .collect();
+
+    rows.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    rows.truncate(limit);
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    rows
+}
+
+fn collapse_sift_grouped_results(
+    mut rows: Vec<SearchResult>,
+    sift_root_by_file: &HashMap<String, String>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let mut rows_by_group: HashMap<String, Vec<SearchResult>> = HashMap::new();
+    for row in rows.drain(..) {
+        let group_key = if row.is_video {
+            row.file_name.clone()
+        } else {
+            sift_root_by_file
+                .get(row.file_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| row.file_name.clone())
+        };
+        rows_by_group.entry(group_key).or_default().push(row);
+    }
+    let mut collapsed: Vec<SearchResult> = Vec::with_capacity(rows_by_group.len());
+    for (_group_key, group_rows) in rows_by_group {
+        let mut best = group_rows[0].clone();
+        for row in &group_rows[1..] {
+            if row.score > best.score {
+                best = row.clone();
+            }
+        }
+        collapsed.push(best);
+    }
+    collapsed.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    collapsed.truncate(limit);
+    for (idx, row) in collapsed.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    collapsed
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn get_db_roots() -> HashMap<String, PathBuf> {
+    let mut roots = HashMap::new();
+    roots.insert(
+        "phone".to_string(),
+        PathBuf::from("/media/lewis/1b/Phone")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Phone")),
+    );
+    roots.insert(
+        "telegram_backup".to_string(),
+        PathBuf::from("/media/lewis/1b/Telegram Backup")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Telegram Backup")),
+    );
+    roots
+}
+
+fn resolve_media_path(
+    roots: &HashMap<String, PathBuf>,
+    db_dir: &Path,
+    file_name: &str,
+    timestamp_sec: f32,
+) -> Result<PathBuf> {
+    let (collection, rel) = file_name
+        .split_once('/')
+        .ok_or_else(|| anyhow!("file_name does not contain collection id"))?;
+    let root = roots
+        .get(collection)
+        .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
+    let rel_path = Path::new(rel);
+    let source = root.join(rel_path);
+    if is_video_path(&source) {
+        if let Some(still) = resolve_video_still(root, db_dir, rel_path, timestamp_sec)? {
+            return Ok(still);
+        }
+    }
+    Ok(source)
+}
+
+fn resolve_source_path(roots: &HashMap<String, PathBuf>, file_name: &str) -> Result<PathBuf> {
+    let (collection, rel) = file_name
+        .split_once('/')
+        .ok_or_else(|| anyhow!("file_name does not contain collection id"))?;
+    let root = roots
+        .get(collection)
+        .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
+    Ok(root.join(Path::new(rel)))
+}
+
+fn is_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg")
+    )
+}
+
+fn resolve_video_still(
+    root: &Path,
+    db_dir: &Path,
+    rel_path: &Path,
+    timestamp_sec: f32,
+) -> Result<Option<PathBuf>> {
+    let scene_dir_name = format!(
+        "{}-video",
+        root.file_name().and_then(|x| x.to_str()).unwrap_or("video")
+    );
+    let mut scene_roots = Vec::with_capacity(2);
+    scene_roots.push(db_dir.join(&scene_dir_name));
+    if let Some(parent) = root.parent() {
+        scene_roots.push(parent.join(&scene_dir_name));
+    }
+    let parent = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = rel_path
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("video");
+    let suffix = rel_path
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| format!("_{}", x.to_ascii_lowercase()))
+        .unwrap_or_default();
+    for scene_root in scene_roots {
+        let video_dir = scene_root.join(parent).join(format!("{stem}{suffix}"));
+        let manifest_path = video_dir.join("manifest.json");
+        let data = match std::fs::read_to_string(&manifest_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let manifest: Value = serde_json::from_str(&data)?;
+        let frames = manifest
+            .get("frames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("manifest has no frames"))?;
+        let mut best: Option<(f32, PathBuf)> = None;
+        for frame in frames {
+            let ts = frame
+                .get("timestamp_sec")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            let image_file = match frame.get("image_file").and_then(Value::as_str) {
+                Some(value) => value,
+                None => continue,
+            };
+            let distance = (ts - timestamp_sec).abs();
+            let path = video_dir.join(image_file);
+            if best
+                .as_ref()
+                .map(|(best_dist, _)| distance < *best_dist)
+                .unwrap_or(true)
+            {
+                best = Some((distance, path));
+            }
+        }
+        if let Some((_, path)) = best {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
+    let output = Command::new("uv")
+        .current_dir("/home/lewis/Dev/imagesearch")
+        .args([
+            "run",
+            "python",
+            "tools/sift_similarity.py",
+            path_a.to_string_lossy().as_ref(),
+            path_b.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .context("failed to run sift_similarity.py")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("sift script failed: {}", stderr.trim());
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout).context("invalid sift json")?;
+    if let Some(err) = payload.get("error").and_then(Value::as_str) {
+        bail!("{err}");
+    }
+    let keypoints_a = payload
+        .get("keypoints_a")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let keypoints_b = payload
+        .get("keypoints_b")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let good = payload
+        .get("good_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let inliers = payload
+        .get("inlier_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let inlier_ratio = payload
+        .get("inlier_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let score = payload.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+    Ok(format!(
+        "SIFT Alignment: score {:.4} | inliers {} / good {} ({:.1}%) | kpA: {}, kpB: {}",
+        score,
+        inliers,
+        good,
+        inlier_ratio * 100.0,
+        keypoints_a,
+        keypoints_b
+    ))
+}
+
 struct ImageViewer {
     images: Vec<PathBuf>,
     current_index: usize,
@@ -983,6 +2208,25 @@ struct ImageViewer {
     thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
     thumbnail_active_threads: usize,
+    
+    // AI Database & Explorer States
+    explore_mode: ExploreMode,
+    db_loaded: bool,
+    db_loading: bool,
+    db_rx: Option<Receiver<Result<DatabaseIndices, String>>>,
+    db_indices: Option<DatabaseIndices>,
+    semantic_query: String,
+    semantic_limit: usize,
+    semantic_video_only: bool,
+    semantic_mode: SearchMode,
+    semantic_results: Vec<SearchResult>,
+    semantic_status: String,
+    
+    // Duplicates & SIFT states
+    compare_target: Option<PathBuf>,
+    sift_pair_overlay: Option<String>,
+    sift_running: bool,
+    sift_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl ImageViewer {
@@ -1072,10 +2316,295 @@ impl ImageViewer {
             thumbnail_rx,
             thumbnail_tx,
             thumbnail_active_threads: 0,
+            
+            // AI Explorer defaults
+            explore_mode: ExploreMode::Filesystem,
+            db_loaded: false,
+            db_loading: false,
+            db_rx: None,
+            db_indices: None,
+            semantic_query: String::new(),
+            semantic_limit: 80,
+            semantic_video_only: false,
+            semantic_mode: SearchMode::Clip,
+            semantic_results: Vec::new(),
+            semantic_status: "Ready. Enter a phrase and press Search.".to_string(),
+            
+            // SIFT defaults
+            compare_target: None,
+            sift_pair_overlay: None,
+            sift_running: false,
+            sift_rx: None,
         };
         
         viewer.update_exif();
         viewer
+    }
+
+    fn start_lazy_db_load(&mut self, ctx: &egui::Context) {
+        if self.db_loaded || self.db_loading {
+            return;
+        }
+        self.db_loading = true;
+        self.semantic_status = "Initializing ONNX Runtime and loading database indices... Please wait.".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.db_rx = Some(rx);
+        let ctx_clone = ctx.clone();
+        
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                        ctx_clone.request_repaint();
+                        return;
+                    }
+                };
+                
+            let result: Result<DatabaseIndices, anyhow::Error> = rt.block_on(async {
+                let db_dir = Path::new("/media/lewis/1b/lancedb");
+                let table_name = "media_index";
+                let onnx_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/clip_text.onnx");
+                let tokenizer_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/tokenizer.json");
+                
+                let clip_index = Arc::new(load_clip_index(db_dir, table_name).await?);
+                let face_index = Arc::new(load_face_index(db_dir, table_name).await?);
+                let ocr_index = Arc::new(load_ocr_index(db_dir, table_name).await?);
+                
+                let similar_by_master = load_similar_map(db_dir, table_name).await?;
+                let sift_info_by_file = load_sift_info_map(db_dir, table_name).await?;
+                let (sift_root_by_file, sift_members_by_root) = load_sift_groups(db_dir, table_name).await?;
+                
+                let encoder = ClipTextEncoder::new(onnx_path, tokenizer_path, 64)?;
+                
+                Ok(DatabaseIndices {
+                    clip_index,
+                    face_index,
+                    ocr_index,
+                    similar_by_master,
+                    sift_info_by_file,
+                    sift_root_by_file,
+                    sift_members_by_root,
+                    encoder,
+                })
+            });
+            
+            match result {
+                Ok(indices) => {
+                    let _ = tx.send(Ok(indices));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                }
+            }
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_db_load(&mut self) {
+        let Some(rx) = self.db_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(indices)) => {
+                self.db_indices = Some(indices);
+                self.db_loaded = true;
+                self.db_loading = false;
+                self.semantic_status = "AI Explorer Database Loaded successfully! Ready to search.".to_string();
+            }
+            Ok(Err(err)) => {
+                self.db_loading = false;
+                self.semantic_status = format!("❌ AI DB Initialization failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.db_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.db_loading = false;
+                self.semantic_status = "❌ AI DB Loader thread disconnected unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn get_db_filename_from_path(&self, path: &Path) -> Option<String> {
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        let phone_prefix = "/media/lewis/1b/Phone";
+        let telegram_prefix = "/media/lewis/1b/Telegram Backup";
+        if path_str.starts_with(phone_prefix) {
+            let rel = &path_str[phone_prefix.len()..];
+            let rel_clean = rel.trim_start_matches('/');
+            return Some(format!("phone/{}", rel_clean));
+        } else if path_str.starts_with(telegram_prefix) {
+            let rel = &path_str[telegram_prefix.len()..];
+            let rel_clean = rel.trim_start_matches('/');
+            return Some(format!("telegram_backup/{}", rel_clean));
+        }
+        
+        if let Ok(canon_path) = path.canonicalize() {
+            let canon_str = canon_path.to_string_lossy().replace('\\', "/");
+            if canon_str.starts_with(phone_prefix) {
+                let rel = &canon_str[phone_prefix.len()..];
+                let rel_clean = rel.trim_start_matches('/');
+                return Some(format!("phone/{}", rel_clean));
+            } else if canon_str.starts_with(telegram_prefix) {
+                let rel = &canon_str[telegram_prefix.len()..];
+                let rel_clean = rel.trim_start_matches('/');
+                return Some(format!("telegram_backup/{}", rel_clean));
+            }
+        }
+        None
+    }
+
+    fn grouped_master_for(&self, file_name: &str, is_video: bool) -> String {
+        if is_video {
+            return file_name.to_string();
+        }
+        if let Some(indices) = &self.db_indices {
+            indices.sift_root_by_file
+                .get(file_name)
+                .cloned()
+                .unwrap_or_else(|| file_name.to_string())
+        } else {
+            file_name.to_string()
+        }
+    }
+
+    fn search_now(&mut self) {
+        match self.semantic_mode {
+            SearchMode::Clip => self.search_clip_now(),
+            SearchMode::Ocr => self.search_ocr_now(),
+        }
+    }
+
+    fn search_clip_now(&mut self) {
+        let q = self.semantic_query.trim().to_string();
+        if q.is_empty() {
+            self.semantic_status = "Please enter a search phrase first.".to_string();
+            return;
+        }
+        let Some(indices) = &mut self.db_indices else {
+            self.semantic_status = "AI Database index is not loaded yet.".to_string();
+            return;
+        };
+
+        let started = Instant::now();
+        let query_vector = match indices.encoder.embed(&q) {
+            Ok(vec) => vec,
+            Err(err) => {
+                self.semantic_status = format!("❌ Text Embedding failed: {err}");
+                return;
+            }
+        };
+
+        if query_vector.len() != indices.clip_index.dim {
+            self.semantic_status = format!(
+                "❌ Error: Query dim {} does not match index dim {}",
+                query_vector.len(),
+                indices.clip_index.dim
+            );
+            return;
+        }
+
+        let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
+        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, self.semantic_video_only);
+        if !self.semantic_video_only {
+            results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
+        } else {
+            results.truncate(self.semantic_limit);
+        }
+        
+        let db_roots = get_db_roots();
+        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        for row in &mut results {
+            row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+        }
+
+        let took = started.elapsed().as_millis();
+        self.semantic_status = format!(
+            "✓ Found {} CLIP results in {} ms across {} index vectors",
+            results.len(),
+            took,
+            indices.clip_index.entries.len()
+        );
+        self.semantic_results = results;
+    }
+
+    fn search_ocr_now(&mut self) {
+        let q = self.semantic_query.trim().to_string();
+        if q.is_empty() {
+            self.semantic_status = "Please enter an OCR word or phrase first.".to_string();
+            return;
+        }
+        let Some(indices) = &self.db_indices else {
+            self.semantic_status = "AI Database index is not loaded yet.".to_string();
+            return;
+        };
+
+        let started = Instant::now();
+        let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
+        let mut results = search_ocr_index(&indices.ocr_index, &q, pre_limit, self.semantic_video_only);
+        if !self.semantic_video_only {
+            results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
+        } else {
+            results.truncate(self.semantic_limit);
+        }
+        
+        let db_roots = get_db_roots();
+        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        for row in &mut results {
+            row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+        }
+
+        let took = started.elapsed().as_millis();
+        self.semantic_status = format!(
+            "✓ Found {} OCR results in {} ms across {} index entries",
+            results.len(),
+            took,
+            indices.ocr_index.entries.len()
+        );
+        self.semantic_results = results;
+    }
+
+    fn start_sift_alignment(&mut self, path_a: PathBuf, path_b: PathBuf, ctx: egui::Context) {
+        if self.sift_running {
+            return;
+        }
+        self.sift_running = true;
+        self.sift_pair_overlay = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sift_rx = Some(rx);
+        
+        std::thread::spawn(move || {
+            let result = compute_sift_summary(&path_a, &path_b)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_sift_alignment(&mut self) {
+        let Some(rx) = self.sift_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(summary)) => {
+                self.sift_running = false;
+                self.sift_pair_overlay = Some(summary);
+            }
+            Ok(Err(err)) => {
+                self.sift_running = false;
+                self.sift_pair_overlay = Some(format!("❌ SIFT Alignment failed: {err}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.sift_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.sift_running = false;
+                self.sift_pair_overlay = Some("❌ SIFT calculation worker disconnected.".to_string());
+            }
+        }
     }
 
     fn start_recursive_scan(&mut self) {
@@ -1273,191 +2802,414 @@ impl ImageViewer {
         }
     }
 
-    fn show_grid_view(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical(|ui| {
+            // Top Tab switcher
             ui.horizontal(|ui| {
-                ui.heading("🖼 Native Image Gallery (Recursive)");
-                ui.add_space(12.0);
-                
-                // Search box
-                ui.label("Filter:");
-                ui.add(egui::TextEdit::singleline(&mut self.grid_filter)
-                    .hint_text("🔍 Filter by filename...")
-                    .desired_width(200.0));
-                
-                ui.add_space(12.0);
-                
-                // Status / Spinner
-                if self.grid_loading {
-                    ui.add(egui::Spinner::new().size(16.0));
-                    ui.weak("Scanning subdirectories...");
-                } else {
-                    ui.weak(format!("{} images found", self.recursive_images.len()));
-                }
+                let fs_text = egui::RichText::new("🖼 Filesystem Gallery").strong();
+                let ai_text = egui::RichText::new("🔍 AI Explorer").strong();
+                ui.selectable_value(&mut self.explore_mode, ExploreMode::Filesystem, fs_text);
+                ui.selectable_value(&mut self.explore_mode, ExploreMode::Semantic, ai_text);
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❌ Close Gallery [G]").clicked() {
                         self.show_grid = false;
                     }
-                    
-                    if ui.button("🔄 Refresh").clicked() {
-                        self.start_recursive_scan();
-                    }
                 });
             });
-            
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.separator();
             ui.add_space(8.0);
             
-            // Filter list
-            let filter = self.grid_filter.to_lowercase();
-            let filtered_images: Vec<&PathBuf> = self.recursive_images.iter()
-                .filter(|p| {
-                    if filter.is_empty() {
-                        true
+            match self.explore_mode {
+                ExploreMode::Filesystem => {
+                    // Original filesystem view
+                    ui.horizontal(|ui| {
+                        ui.heading("Local filesystem directory scan");
+                        ui.add_space(12.0);
+                        ui.label("Filter:");
+                        ui.add(egui::TextEdit::singleline(&mut self.grid_filter)
+                            .hint_text("🔍 Filter by filename...")
+                            .desired_width(200.0));
+                        ui.add_space(12.0);
+                        if self.grid_loading {
+                            ui.add(egui::Spinner::new().size(16.0));
+                            ui.weak("Scanning subdirectories...");
+                        } else {
+                            ui.weak(format!("{} images found", self.recursive_images.len()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("🔄 Refresh").clicked() {
+                                self.start_recursive_scan();
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    
+                    let filter = self.grid_filter.to_lowercase();
+                    let filtered_images: Vec<&PathBuf> = self.recursive_images.iter()
+                        .filter(|p| {
+                            if filter.is_empty() {
+                                true
+                            } else {
+                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                name.contains(&filter)
+                            }
+                        })
+                        .collect();
+                        
+                    let mut clicked_path = None;
+                    
+                    if filtered_images.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            if self.grid_loading {
+                                ui.weak("Scanning files, please wait...");
+                            } else {
+                                ui.weak("No images found matching filter.");
+                            }
+                        });
                     } else {
-                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                        name.contains(&filter)
-                    }
-                })
-                .collect();
-                
-            let mut clicked_path = None;
-            
-            if filtered_images.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    if self.grid_loading {
-                        ui.weak("Scanning files, please wait...");
-                    } else {
-                        ui.weak("No images found matching filter.");
-                    }
-                });
-            } else {
-                let available_width = ui.available_width() - 16.0;
-                let col_width = 130.0 + 12.0;
-                let cols = (available_width / col_width).floor().max(1.0) as usize;
-                let rows: Vec<&[&PathBuf]> = filtered_images.chunks(cols).collect();
+                        let available_width = ui.available_width() - 16.0;
+                        let col_width = 130.0 + 12.0;
+                        let cols = (available_width / col_width).floor().max(1.0) as usize;
+                        let rows: Vec<&[&PathBuf]> = filtered_images.chunks(cols).collect();
 
-                let row_height = 150.0 + 12.0;
-                let num_rows = rows.len();
+                        let row_height = 150.0 + 12.0;
+                        let num_rows = rows.len();
 
-                egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
-                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                    for row_idx in row_range {
-                        let row_images = rows[row_idx];
-                        ui.horizontal(|ui| {
-                            for path in row_images {
-                                let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
-                                    curr_p == *path
-                                } else {
-                                    false
-                                };
-                                
-                                let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 150.0), egui::Sense::click());
-                                let is_hovered = response.hovered();
-                                let is_clicked = response.clicked();
-                                
-                                let card_bg = if is_clicked {
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.3)
-                                } else if is_hovered {
-                                    ui.visuals().code_bg_color.gamma_multiply(1.5)
-                                } else if is_current {
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.15)
-                                } else {
-                                    ui.visuals().code_bg_color
-                                };
-                                
-                                let card_stroke = if is_current {
-                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-                                } else if is_hovered {
-                                    egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
-                                } else {
-                                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
-                                };
-                                
-                                let builder = egui::UiBuilder::new()
-                                    .max_rect(rect)
-                                    .layout(egui::Layout::top_down(egui::Align::Center))
-                                    .id_salt(*path);
-                                let mut child_ui = ui.new_child(builder);
-                                egui::Frame::NONE
-                                    .fill(card_bg)
-                                    .stroke(card_stroke)
-                                    .inner_margin(8.0)
-                                    .corner_radius(6.0)
-                                    .show(&mut child_ui, |ui| {
-                                        ui.vertical_centered(|ui| {
-                                            if let Some(texture) = self.thumbnail_textures.get(*path) {
-                                                ui.add(
-                                                    egui::Image::from_texture(texture)
-                                                        .max_size(egui::vec2(110.0, 110.0))
-                                                        .maintain_aspect_ratio(true)
-                                                );
-                                            } else if self.thumbnail_failed.contains(*path) {
+                        egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
+                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                            for row_idx in row_range {
+                                let row_images = rows[row_idx];
+                                ui.horizontal(|ui| {
+                                    for path in row_images {
+                                        let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
+                                            curr_p == *path
+                                        } else {
+                                            false
+                                        };
+                                        
+                                        let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 150.0), egui::Sense::click());
+                                        let is_hovered = response.hovered();
+                                        let is_clicked = response.clicked();
+                                        
+                                        let card_bg = if is_clicked {
+                                            ui.visuals().selection.bg_fill.gamma_multiply(0.3)
+                                        } else if is_hovered {
+                                            ui.visuals().code_bg_color.gamma_multiply(1.5)
+                                        } else if is_current {
+                                            ui.visuals().selection.bg_fill.gamma_multiply(0.15)
+                                        } else {
+                                            ui.visuals().code_bg_color
+                                        };
+                                        
+                                        let card_stroke = if is_current {
+                                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+                                        } else if is_hovered {
+                                            egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
+                                        } else {
+                                            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
+                                        };
+                                        
+                                        let builder = egui::UiBuilder::new()
+                                            .max_rect(rect)
+                                            .layout(egui::Layout::top_down(egui::Align::Center))
+                                            .id_salt(*path);
+                                        let mut child_ui = ui.new_child(builder);
+                                        egui::Frame::NONE
+                                            .fill(card_bg)
+                                            .stroke(card_stroke)
+                                            .inner_margin(8.0)
+                                            .corner_radius(6.0)
+                                            .show(&mut child_ui, |ui| {
                                                 ui.vertical_centered(|ui| {
-                                                    ui.add_space(40.0);
-                                                    ui.weak("⚠️ Failed");
-                                                    ui.add_space(40.0);
-                                                });
-                                            } else {
-                                                ui.vertical_centered(|ui| {
-                                                    ui.add_space(45.0);
-                                                    ui.add(egui::Spinner::new().size(20.0));
-                                                    ui.add_space(45.0);
-                                                });
-                                                
-                                                if !self.thumbnail_loading.contains(*path) && self.thumbnail_active_threads < 4 {
-                                                    self.thumbnail_loading.insert((*path).clone());
-                                                    self.thumbnail_active_threads += 1;
-                                                    let path_clone = (*path).clone();
-                                                    let tx_clone = self.thumbnail_tx.clone();
-                                                    let ctx_clone = ui.ctx().clone();
-                                                    std::thread::spawn(move || {
-                                                        if let Ok(img) = image::open(&path_clone) {
-                                                            let thumb = img.thumbnail(128, 128);
-                                                            let size = [thumb.width() as usize, thumb.height() as usize];
-                                                            let pixels = thumb.to_rgba8().into_raw();
-                                                            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                                            let _ = tx_clone.send((path_clone, color_img));
-                                                            ctx_clone.request_repaint();
-                                                        } else {
-                                                            let empty_img = egui::ColorImage::new([0, 0], Vec::new());
-                                                            let _ = tx_clone.send((path_clone, empty_img));
-                                                            ctx_clone.request_repaint();
+                                                    if let Some(texture) = self.thumbnail_textures.get(*path) {
+                                                        ui.add(
+                                                            egui::Image::from_texture(texture)
+                                                                .max_size(egui::vec2(110.0, 110.0))
+                                                                .maintain_aspect_ratio(true)
+                                                        );
+                                                    } else if self.thumbnail_failed.contains(*path) {
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.add_space(40.0);
+                                                            ui.weak("⚠️ Failed");
+                                                            ui.add_space(40.0);
+                                                        });
+                                                    } else {
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.add_space(45.0);
+                                                            ui.add(egui::Spinner::new().size(20.0));
+                                                            ui.add_space(45.0);
+                                                        });
+                                                        
+                                                        if !self.thumbnail_loading.contains(*path) && self.thumbnail_active_threads < 4 {
+                                                            self.thumbnail_loading.insert((*path).clone());
+                                                            self.thumbnail_active_threads += 1;
+                                                            let path_clone = (*path).clone();
+                                                            let tx_clone = self.thumbnail_tx.clone();
+                                                            let ctx_clone = ui.ctx().clone();
+                                                            std::thread::spawn(move || {
+                                                                if let Ok(img) = image::open(&path_clone) {
+                                                                    let thumb = img.thumbnail(128, 128);
+                                                                    let size = [thumb.width() as usize, thumb.height() as usize];
+                                                                    let pixels = thumb.to_rgba8().into_raw();
+                                                                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                                    let _ = tx_clone.send((path_clone, color_img));
+                                                                    ctx_clone.request_repaint();
+                                                                } else {
+                                                                    let empty_img = egui::ColorImage::new([0, 0], Vec::new());
+                                                                    let _ = tx_clone.send((path_clone, empty_img));
+                                                                    ctx_clone.request_repaint();
+                                                                }
+                                                            });
                                                         }
-                                                    });
-                                                }
-                                            }
+                                                    }
+                                                    
+                                                    ui.add_space(6.0);
+                                                    
+                                                    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                                    let label_text = egui::RichText::new(filename)
+                                                        .size(11.0)
+                                                        .line_height(Some(13.0));
+                                                    ui.add(egui::Label::new(label_text).truncate());
+                                                });
+                                            });
                                             
-                                            ui.add_space(6.0);
-                                            
-                                            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                            let label_text = egui::RichText::new(filename)
-                                                .size(11.0)
-                                                .line_height(Some(13.0));
-                                            ui.add(egui::Label::new(label_text).truncate());
-                                        });
-                                    });
-                                    
-                                if is_clicked {
-                                    clicked_path = Some((*path).clone());
-                                }
+                                        if is_clicked {
+                                            clicked_path = Some((*path).clone());
+                                        }
+                                    }
+                                });
                             }
                         });
                     }
-                });
-            }
-            
-            if let Some(path) = clicked_path {
-                self.images = self.recursive_images.clone();
-                self.current_index = self.images.iter().position(|p| p == &path).unwrap_or(0);
-                self.show_grid = false;
-                self.back_target_is_gallery = true;
-                self.zoom = 1.0;
-                self.offset = egui::Vec2::ZERO;
-                self.update_exif();
-                ui.ctx().request_repaint();
+                    
+                    if let Some(path) = clicked_path {
+                        self.images = self.recursive_images.clone();
+                        self.current_index = self.images.iter().position(|p| p == &path).unwrap_or(0);
+                        self.show_grid = false;
+                        self.back_target_is_gallery = true;
+                        self.zoom = 1.0;
+                        self.offset = egui::Vec2::ZERO;
+                        self.update_exif();
+                        ui.ctx().request_repaint();
+                    }
+                }
+                
+                ExploreMode::Semantic => {
+                    // Semantic Explorer View
+                    if !self.db_loaded {
+                        self.start_lazy_db_load(ctx);
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add(egui::Spinner::new().size(36.0));
+                                ui.add_space(16.0);
+                                ui.heading("Lazy-loading AI Database Models & ONNX session...");
+                                ui.weak("Initializing standard text encoders and reading index maps. This happens fully in the background.");
+                            });
+                        });
+                    } else {
+                        // DB Loaded! Render AI Search Bar Controls
+                        ui.horizontal(|ui| {
+                            ui.heading("🔍 AI Explorer");
+                            ui.add_space(16.0);
+                            
+                            // Mode switches
+                            ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "🔍 AI Search");
+                            ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "📝 OCR Search");
+                            ui.add_space(8.0);
+                            
+                            // Query input text box
+                            let hint = match self.semantic_mode {
+                                SearchMode::Clip => "Describe the photo (e.g., 'a cat laying on a keyboard')",
+                                SearchMode::Ocr => "Type word/text found inside the image",
+                            };
+                            let search_resp = ui.add(egui::TextEdit::singleline(&mut self.semantic_query)
+                                .hint_text(hint)
+                                .desired_width(320.0));
+                            let enter_pressed = search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            
+                            ui.add_space(8.0);
+                            ui.add(egui::Slider::new(&mut self.semantic_limit, 1..=500).text("Limit"));
+                            ui.checkbox(&mut self.semantic_video_only, "Videos only");
+                            
+                            if ui.button("🔍 Search").clicked() || enter_pressed {
+                                self.search_now();
+                            }
+                        });
+                        ui.add_space(6.0);
+                        
+                        // Status line with a nice look
+                        ui.horizontal(|ui| {
+                            ui.weak(&self.semantic_status);
+                        });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        
+                        if self.semantic_results.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.weak("No results found. Type a description and click Search!");
+                            });
+                        } else {
+                            let available_width = ui.available_width() - 16.0;
+                            let col_width = 130.0 + 12.0;
+                            let cols = (available_width / col_width).floor().max(1.0) as usize;
+                            
+                            let mut clicked_result_idx = None;
+                            
+                            // Chunk row results
+                            let rows: Vec<&[SearchResult]> = self.semantic_results.chunks(cols).collect();
+                            let row_height = 160.0 + 12.0;
+                            let num_rows = rows.len();
+                            
+                            egui::ScrollArea::vertical().id_salt("semantic_gallery_scroll").show_rows(ui, row_height, num_rows, |ui, row_range| {
+                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                                for row_idx in row_range {
+                                    let row_items = rows[row_idx];
+                                    ui.horizontal(|ui| {
+                                        for item in row_items {
+                                            let Some(path) = &item.media_path else {
+                                                continue;
+                                            };
+                                            
+                                            let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
+                                                curr_p == path
+                                            } else {
+                                                false
+                                            };
+                                            
+                                            let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 160.0), egui::Sense::click());
+                                            let is_hovered = response.hovered();
+                                            let is_clicked = response.clicked();
+                                            
+                                            let card_bg = if is_clicked {
+                                                ui.visuals().selection.bg_fill.gamma_multiply(0.3)
+                                            } else if is_hovered {
+                                                ui.visuals().code_bg_color.gamma_multiply(1.5)
+                                            } else if is_current {
+                                                ui.visuals().selection.bg_fill.gamma_multiply(0.15)
+                                            } else {
+                                                ui.visuals().code_bg_color
+                                            };
+                                            
+                                            let card_stroke = if is_current {
+                                                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+                                            } else if is_hovered {
+                                                egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
+                                            } else {
+                                                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
+                                            };
+                                            
+                                            let builder = egui::UiBuilder::new()
+                                                .max_rect(rect)
+                                                .layout(egui::Layout::top_down(egui::Align::Center))
+                                                .id_salt(path);
+                                            let mut child_ui = ui.new_child(builder);
+                                            egui::Frame::NONE
+                                                .fill(card_bg)
+                                                .stroke(card_stroke)
+                                                .inner_margin(8.0)
+                                                .corner_radius(6.0)
+                                                .show(&mut child_ui, |ui| {
+                                                    ui.vertical_centered(|ui| {
+                                                        if let Some(texture) = self.thumbnail_textures.get(path) {
+                                                            ui.add(
+                                                                egui::Image::from_texture(texture)
+                                                                    .max_size(egui::vec2(110.0, 110.0))
+                                                                    .maintain_aspect_ratio(true)
+                                                            );
+                                                        } else if self.thumbnail_failed.contains(path) {
+                                                            ui.vertical_centered(|ui| {
+                                                                ui.add_space(40.0);
+                                                                ui.weak("⚠️ Failed");
+                                                                ui.add_space(40.0);
+                                                            });
+                                                        } else {
+                                                            ui.vertical_centered(|ui| {
+                                                                ui.add_space(45.0);
+                                                                ui.add(egui::Spinner::new().size(20.0));
+                                                                ui.add_space(45.0);
+                                                            });
+                                                            
+                                                            if !self.thumbnail_loading.contains(path) && self.thumbnail_active_threads < 4 {
+                                                                self.thumbnail_loading.insert(path.clone());
+                                                                self.thumbnail_active_threads += 1;
+                                                                let path_clone = path.clone();
+                                                                let tx_clone = self.thumbnail_tx.clone();
+                                                                let ctx_clone = ui.ctx().clone();
+                                                                std::thread::spawn(move || {
+                                                                    if let Ok(img) = image::open(&path_clone) {
+                                                                        let thumb = img.thumbnail(128, 128);
+                                                                        let size = [thumb.width() as usize, thumb.height() as usize];
+                                                                        let pixels = thumb.to_rgba8().into_raw();
+                                                                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                                        let _ = tx_clone.send((path_clone, color_img));
+                                                                        ctx_clone.request_repaint();
+                                                                    } else {
+                                                                        let empty_img = egui::ColorImage::new([0, 0], Vec::new());
+                                                                        let _ = tx_clone.send((path_clone, empty_img));
+                                                                        ctx_clone.request_repaint();
+                                                                    }
+                                                                });
+                                                            }
+                                                        }
+                                                        
+                                                        ui.add_space(4.0);
+                                                        
+                                                        // Draw match score or OCR badge
+                                                        match self.semantic_mode {
+                                                            SearchMode::Clip => {
+                                                                let pct = (item.score * 100.0).clamp(0.0, 100.0);
+                                                                ui.colored_label(
+                                                                    egui::Color32::from_rgb(100, 200, 100),
+                                                                    format!("{:.0}% Match", pct)
+                                                                );
+                                                            }
+                                                            SearchMode::Ocr => {
+                                                                ui.colored_label(
+                                                                    egui::Color32::from_rgb(100, 180, 255),
+                                                                    "📝 OCR Match"
+                                                                );
+                                                            }
+                                                        }
+                                                        
+                                                        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                                        let label_text = egui::RichText::new(filename)
+                                                            .size(10.0)
+                                                            .line_height(Some(12.0));
+                                                        ui.add(egui::Label::new(label_text).truncate());
+                                                    });
+                                                });
+                                                
+                                            if is_clicked {
+                                                // Find index of clicked item in results
+                                                if let Some(pos) = self.semantic_results.iter().position(|r| r.media_path.as_ref() == Some(path)) {
+                                                    clicked_result_idx = Some(pos);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            
+                            if let Some(idx) = clicked_result_idx {
+                                // Transition to single view mode and lock arrow navigations to search pool
+                                let active_paths: Vec<PathBuf> = self.semantic_results.iter()
+                                    .filter_map(|r| r.media_path.clone())
+                                    .collect();
+                                self.images = active_paths;
+                                self.current_index = idx;
+                                self.show_grid = false;
+                                self.back_target_is_gallery = true;
+                                self.zoom = 1.0;
+                                self.offset = egui::Vec2::ZERO;
+                                self.update_exif();
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -1470,6 +3222,9 @@ impl eframe::App for ImageViewer {
                 *lock = Some(ctx.clone());
             }
         }
+
+        self.poll_db_load();
+        self.poll_sift_alignment();
 
         while let Ok((path, color_image)) = self.thumbnail_rx.try_recv() {
             if color_image.size[0] == 0 {
@@ -1649,6 +3404,7 @@ impl eframe::App for ImageViewer {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.side_panel_mode, SidePanelMode::Layout, "📂 Binary Layout");
                     ui.selectable_value(&mut self.side_panel_mode, SidePanelMode::Exif, "🏷 Raw EXIF");
+                    ui.selectable_value(&mut self.side_panel_mode, SidePanelMode::Duplicates, "👥 Duplicates");
                     
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("❌").clicked() {
@@ -1772,6 +3528,131 @@ impl eframe::App for ImageViewer {
                             }
                         });
                     }
+                    SidePanelMode::Duplicates => {
+                        if !self.db_loaded {
+                            self.start_lazy_db_load(ui.ctx());
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(20.0);
+                                ui.add(egui::Spinner::new().size(24.0));
+                                ui.add_space(12.0);
+                                ui.weak("Loading database index to scan duplicates...");
+                            });
+                        } else if let Some(path) = self.images.get(self.current_index).cloned() {
+                            let filename_opt = self.get_db_filename_from_path(&path);
+                            if let Some(filename) = filename_opt {
+                                let indices = self.db_indices.as_ref().unwrap();
+                                let is_video = is_video_path(&path);
+                                let root_key = self.grouped_master_for(&filename, is_video);
+                                
+                                // Fetch SIFT members in this group
+                                let mut sift_members = indices.sift_members_by_root
+                                    .get(&root_key)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                
+                                // Also fetch direct roots if not grouped
+                                if sift_members.is_empty() {
+                                    if let Some(direct) = indices.sift_root_by_file.get(&filename) {
+                                        sift_members = indices.sift_members_by_root
+                                            .get(direct)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                    }
+                                }
+                                
+                                // Fetch all pHash similars
+                                let phash_similars = indices.similar_by_master
+                                    .get(&filename)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                
+                                ui.heading("👥 Duplicate Matches");
+                                ui.add_space(4.0);
+                                ui.weak(format!("Current: {}", filename));
+                                ui.add_space(8.0);
+                                
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    // 1. SIFT Cluster Members (Duplicates)
+                                    if !sift_members.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "✓ SIFT Duplicate Cluster");
+                                            ui.weak(format!("({} files)", sift_members.len()));
+                                        });
+                                        ui.add_space(4.0);
+                                        
+                                        let roots = get_db_roots();
+                                        for member in &sift_members {
+                                            if member == &filename {
+                                                continue;
+                                            }
+                                            let member_path_res = resolve_source_path(&roots, member);
+                                            if let Ok(m_path) = member_path_res {
+                                                ui.horizontal(|ui| {
+                                                    ui.monospace(member.split_once('/').map(|x| x.1).unwrap_or(member));
+                                                    
+                                                    let is_active_compare = self.compare_target.as_ref() == Some(&m_path);
+                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                        if is_active_compare {
+                                                            self.compare_target = None;
+                                                            self.sift_pair_overlay = None;
+                                                        } else {
+                                                            self.compare_target = Some(m_path.clone());
+                                                            self.start_sift_alignment(path.clone(), m_path.clone(), ui.ctx().clone());
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        ui.add_space(12.0);
+                                        ui.separator();
+                                        ui.add_space(12.0);
+                                    }
+                                    
+                                    // 2. pHash Similars (Similarity Map)
+                                    if !phash_similars.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "🔗 Similar Images (pHash)");
+                                            ui.weak(format!("({} files)", phash_similars.len()));
+                                        });
+                                        ui.add_space(4.0);
+                                        
+                                        let roots = get_db_roots();
+                                        for sim in &phash_similars {
+                                            let sim_path_res = resolve_source_path(&roots, &sim.file_name);
+                                            if let Ok(s_path) = sim_path_res {
+                                                ui.horizontal(|ui| {
+                                                    let pct_str = sim.similarity_pct
+                                                        .map(|v| format!("{:.0}%", v))
+                                                        .unwrap_or_else(|| "n/a".to_string());
+                                                    ui.weak(format!("[{}]", pct_str));
+                                                    ui.monospace(sim.file_name.split_once('/').map(|x| x.1).unwrap_or(&sim.file_name));
+                                                    
+                                                    let is_active_compare = self.compare_target.as_ref() == Some(&s_path);
+                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                        if is_active_compare {
+                                                            self.compare_target = None;
+                                                            self.sift_pair_overlay = None;
+                                                        } else {
+                                                            self.compare_target = Some(s_path.clone());
+                                                            self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    } else if sift_members.is_empty() {
+                                        ui.weak("No duplicates or similar files found in database.");
+                                    }
+                                });
+                            } else {
+                                ui.weak("Current file is not indexed in the database (not in Phone or Telegram Backup folders).");
+                            }
+                        } else {
+                            ui.weak("No image loaded.");
+                        }
+                    }
                 }
             });
 
@@ -1855,14 +3736,78 @@ impl eframe::App for ImageViewer {
                     });
                 });
 
-                // Calculate image rect
-                let base_size = rect.size();
-                let draw_size = base_size * self.zoom;
-                let draw_pos = rect.center() + self.offset - draw_size / 2.0;
-                let draw_rect = egui::Rect::from_min_size(draw_pos, draw_size);
-                
-                // Use ui.put to place the image widget
-                ui.put(draw_rect, egui::Image::new(uri).maintain_aspect_ratio(true).show_loading_spinner(false));
+                if let Some(ref compare_path) = self.compare_target {
+                    let left_uri = format!("file://{}", path.to_string_lossy());
+                    let right_uri = format!("file://{}", compare_path.to_string_lossy());
+                    
+                    let avail_size = ui.available_size();
+                    let half_w = (avail_size.x / 2.0 - 12.0).max(10.0);
+                    let h = (avail_size.y - 120.0).max(10.0); // leave space for SIFT overlay
+                    
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(half_w, h),
+                            egui::Image::new(left_uri)
+                                .maintain_aspect_ratio(true)
+                                .show_loading_spinner(true)
+                        );
+                        
+                        ui.add_space(12.0);
+                        
+                        ui.add_sized(
+                            egui::vec2(half_w, h),
+                            egui::Image::new(right_uri)
+                                .maintain_aspect_ratio(true)
+                                .show_loading_spinner(true)
+                        );
+                    });
+                    
+                    // Draw SIFT alignment info overlay at the bottom of the central viewport
+                    let summary_text = if self.sift_running {
+                        "⌛ Calculating SIFT correspondence alignment...".to_string()
+                    } else if let Some(summary) = &self.sift_pair_overlay {
+                        summary.clone()
+                    } else {
+                        "SIFT alignment not calculated.".to_string()
+                    };
+                    
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_black_alpha(190))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 180, 255).gamma_multiply(0.4)))
+                            .inner_margin(12.0)
+                            .corner_radius(8.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "👥 SIFT Matcher Status");
+                                    ui.separator();
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(summary_text)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(egui::Color32::WHITE)
+                                    ));
+                                    
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("❌ Close comparison").clicked() {
+                                            self.compare_target = None;
+                                            self.sift_pair_overlay = None;
+                                        }
+                                    });
+                                });
+                            });
+                    });
+                } else {
+                    // Calculate image rect
+                    let base_size = rect.size();
+                    let draw_size = base_size * self.zoom;
+                    let draw_pos = rect.center() + self.offset - draw_size / 2.0;
+                    let draw_rect = egui::Rect::from_min_size(draw_pos, draw_size);
+                    
+                    // Use ui.put to place the image widget
+                    ui.put(draw_rect, egui::Image::new(uri).maintain_aspect_ratio(true).show_loading_spinner(false));
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("No image loaded");
