@@ -1081,10 +1081,8 @@ fn resolve_root(
     direct_root_by_file: &HashMap<String, String>,
     master_images: &HashSet<String>,
 ) -> String {
-    let mut seen: HashSet<String> = HashSet::new();
     let mut current = name.to_string();
-    seen.insert(current.clone());
-    loop {
+    for _ in 0..16 {
         let next = match direct_root_by_file.get(current.as_str()) {
             Some(v) => v.clone(),
             None => return current,
@@ -1092,13 +1090,12 @@ fn resolve_root(
         if !master_images.contains(next.as_str()) {
             return current;
         }
-        if !seen.insert(next.clone()) {
-            let mut values: Vec<String> = seen.into_iter().collect();
-            values.sort_unstable();
-            return values[0].clone();
+        if next == current {
+            return current;
         }
         current = next;
     }
+    current
 }
 
 async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<UnifiedDbData> {
