@@ -1821,6 +1821,75 @@ fn search_ocr_index(
     rows
 }
 
+const FACE_MATCH_MIN_SCORE: f32 = 0.35;
+
+fn search_face_index(
+    index: &FaceIndex,
+    query_vectors: &[Vec<f32>],
+    limit: usize,
+    min_score: f32,
+) -> Vec<SearchResult> {
+    if query_vectors.is_empty() {
+        return Vec::new();
+    }
+    let merged = index
+        .entries
+        .par_chunks(4096)
+        .map(|chunk| {
+            let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
+            for entry in chunk {
+                let score = query_vectors
+                    .iter()
+                    .map(|query| dot(query, &entry.vector))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if score < min_score {
+                    continue;
+                }
+                local
+                    .entry(entry.file_name.to_string())
+                    .and_modify(|best| {
+                        if score > best.0 {
+                            *best = (score, entry.is_video, entry.timestamp_sec);
+                        }
+                    })
+                    .or_insert((score, entry.is_video, entry.timestamp_sec));
+            }
+            local
+        })
+        .reduce(HashMap::new, |mut acc, local| {
+            for (file_name, candidate) in local {
+                acc.entry(file_name)
+                    .and_modify(|best| {
+                        if candidate.0 > best.0 {
+                            *best = candidate;
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+            acc
+        });
+
+    let mut rows: Vec<_> = merged
+        .into_iter()
+        .map(
+            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+                rank: 0,
+                score,
+                file_name,
+                is_video,
+                timestamp_sec,
+                media_path: None,
+            },
+        )
+        .collect();
+    rows.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    rows.truncate(limit);
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    rows
+}
+
 fn collapse_sift_grouped_results(
     mut rows: Vec<SearchResult>,
     sift_root_by_file: &HashMap<String, String>,
@@ -2911,6 +2980,8 @@ impl ImageViewer {
                             let cols = (available_width / col_width).floor().max(1.0) as usize;
                             
                             let mut clicked_result_idx = None;
+                            let mut clicked_similar = None;
+                            let mut clicked_person = None;
                             
                             // Chunk row results
                             let rows: Vec<&[SearchResult]> = self.semantic_results.chunks(cols).collect();
@@ -2934,6 +3005,54 @@ impl ImageViewer {
                                             };
                                             
                                             let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 160.0), egui::Sense::click());
+                                            response.context_menu(|ui| {
+                                                if ui.button("📂 Open parent folder").clicked() {
+                                                    if let Some(parent) = path.parent() {
+                                                        let _ = std::process::Command::new("xdg-open")
+                                                            .arg(parent)
+                                                            .spawn();
+                                                    }
+                                                    ui.close();
+                                                }
+                                                if ui.button("📋 Copy image").clicked() {
+                                                    let path_clone = path.clone();
+                                                    let ctx = ui.ctx().clone();
+                                                    std::thread::spawn(move || {
+                                                        if let Ok(img) = image::open(&path_clone) {
+                                                            let rgba = img.to_rgba8();
+                                                            let (width, height) = rgba.dimensions();
+                                                            let color = egui::ColorImage::from_rgba_unmultiplied(
+                                                                [width as usize, height as usize],
+                                                                rgba.as_raw(),
+                                                            );
+                                                            ctx.copy_image(color);
+                                                        }
+                                                    });
+                                                    ui.close();
+                                                }
+                                                if ui.button("📋 Copy full path").clicked() {
+                                                    ui.ctx().copy_text(path.to_string_lossy().to_string());
+                                                    ui.close();
+                                                }
+                                                if item.is_video {
+                                                    if ui.button("🎬 Open in mpv").clicked() {
+                                                        let _ = std::process::Command::new("mpv")
+                                                            .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
+                                                            .arg(path)
+                                                            .spawn();
+                                                        ui.close();
+                                                    }
+                                                }
+                                                ui.separator();
+                                                if ui.button("🔍 Show most similar").clicked() {
+                                                    clicked_similar = Some(item.clone());
+                                                    ui.close();
+                                                }
+                                                if ui.button("👥 Show more of this person").clicked() {
+                                                    clicked_person = Some(item.file_name.clone());
+                                                    ui.close();
+                                                }
+                                            });
                                             let is_hovered = response.hovered();
                                             let is_clicked = response.clicked();
                                             
@@ -3061,11 +3180,159 @@ impl ImageViewer {
                                 self.update_exif();
                                 ui.ctx().request_repaint();
                             }
+                            if let Some(item) = clicked_similar {
+                                self.show_most_similar_clip(&item);
+                                ui.ctx().request_repaint();
+                            }
+                            if let Some(name) = clicked_person {
+                                self.show_more_of_this_person(&name);
+                                ui.ctx().request_repaint();
+                            }
                         }
                     }
                 }
             }
         });
+    }
+
+    fn clip_vector_for_result(&self, row: &SearchResult) -> Option<Vec<f32>> {
+        let Some(indices) = &self.db_indices else {
+            return None;
+        };
+        let mut best: Option<(&ClipEntry, f32)> = None;
+        for entry in &indices.clip_index.entries {
+            if entry.file_name.as_ref() != row.file_name.as_str() {
+                continue;
+            }
+            let dt = (entry.timestamp_sec - row.timestamp_sec).abs();
+            match best {
+                Some((_current, best_dt)) if dt >= best_dt => {}
+                _ => best = Some((entry, dt)),
+            }
+        }
+        best.map(|(entry, _)| entry.vector.clone())
+    }
+
+    fn show_most_similar_clip(&mut self, row: &SearchResult) {
+        let Some(indices) = &self.db_indices else {
+            return;
+        };
+        let Some(query_vector) = self.clip_vector_for_result(row) else {
+            self.semantic_status = format!("no CLIP vector found for {}", row.file_name);
+            return;
+        };
+        if query_vector.len() != indices.clip_index.dim {
+            self.semantic_status = format!(
+                "source vector dim {} does not match index dim {}",
+                query_vector.len(),
+                indices.clip_index.dim
+            );
+            return;
+        }
+        let started = Instant::now();
+        let pre_limit = (self.semantic_limit.saturating_mul(12)).max(self.semantic_limit + 32);
+        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, false);
+        results.retain(|candidate| candidate.file_name != row.file_name);
+        results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
+        
+        let db_roots = get_db_roots();
+        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        for candidate in &mut results {
+            candidate.media_path =
+                resolve_media_path(&db_roots, db_dir, &candidate.file_name, candidate.timestamp_sec).ok();
+        }
+        let took = started.elapsed().as_millis();
+        self.semantic_status = format!(
+            "✓ Found {} CLIP-similar results in {} ms for {}",
+            results.len(),
+            took,
+            row.file_name
+        );
+        self.semantic_results = results;
+    }
+
+    fn face_vectors_for_file(indices: &DatabaseIndices, file_name: &str) -> Vec<Vec<f32>> {
+        indices.face_index
+            .entries
+            .iter()
+            .filter(|entry| entry.file_name.as_ref() == file_name)
+            .map(|entry| entry.vector.clone())
+            .collect()
+    }
+
+    fn related_files_for_face_seed(indices: &DatabaseIndices, file_name: &str) -> Vec<String> {
+        let mut related = Vec::new();
+        let mut seen = HashSet::new();
+        if seen.insert(file_name.to_string()) {
+            related.push(file_name.to_string());
+        }
+
+        let root = if let Some(canonical) = indices.sift_root_by_file.get(file_name) {
+            canonical.clone()
+        } else {
+            file_name.to_string()
+        };
+        
+        if let Some(members) = indices.sift_members_by_root.get(root.as_str()) {
+            for member in members {
+                if seen.insert(member.clone()) {
+                    related.push(member.clone());
+                }
+                if let Some(children) = indices.similar_by_master.get(member.as_str()) {
+                    for child in children {
+                        if !child.is_video && seen.insert(child.file_name.clone()) {
+                            related.push(child.file_name.clone());
+                        }
+                    }
+                }
+            }
+        } else if let Some(children) = indices.similar_by_master.get(file_name) {
+            for child in children {
+                if !child.is_video && seen.insert(child.file_name.clone()) {
+                    related.push(child.file_name.clone());
+                }
+            }
+        }
+
+        related
+    }
+
+    fn show_more_of_this_person(&mut self, file_name: &str) {
+        let Some(indices) = &self.db_indices else {
+            return;
+        };
+        let related_files = Self::related_files_for_face_seed(indices, file_name);
+        let mut query_faces = Vec::new();
+        for related in &related_files {
+            query_faces.extend(Self::face_vectors_for_file(indices, related));
+        }
+        if query_faces.is_empty() {
+            self.semantic_status = format!(
+                "No stored face vectors for {file_name} or {} related file(s)",
+                related_files.len().saturating_sub(1)
+            );
+            self.semantic_results = Vec::new();
+            return;
+        }
+        let started = Instant::now();
+        let mut results =
+            search_face_index(&indices.face_index, &query_faces, 500, FACE_MATCH_MIN_SCORE);
+        results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, 500);
+        
+        let db_roots = get_db_roots();
+        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        for row in &mut results {
+            row.media_path =
+                resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+        }
+        let took = started.elapsed().as_millis();
+        self.semantic_status = format!(
+            "✓ Found {} person results in {} ms using {} query face vector(s)",
+            results.len(),
+            took,
+            query_faces.len()
+        );
+        self.semantic_results = results;
     }
 }
 
