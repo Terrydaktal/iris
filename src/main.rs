@@ -1066,7 +1066,42 @@ struct DatabaseIndices {
     encoder: ClipTextEncoder,
 }
 
-async fn load_clip_index(db_dir: &Path, table_name: &str) -> Result<ClipIndex> {
+struct UnifiedDbData {
+    clip_index: ClipIndex,
+    face_index: FaceIndex,
+    ocr_index: OcrIndex,
+    similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    sift_info_by_file: HashMap<String, SiftInfo>,
+    sift_root_by_file: HashMap<String, String>,
+    sift_members_by_root: HashMap<String, Vec<String>>,
+}
+
+fn resolve_root(
+    name: &str,
+    direct_root_by_file: &HashMap<String, String>,
+    master_images: &HashSet<String>,
+) -> String {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = name.to_string();
+    seen.insert(current.clone());
+    loop {
+        let next = match direct_root_by_file.get(current.as_str()) {
+            Some(v) => v.clone(),
+            None => return current,
+        };
+        if !master_images.contains(next.as_str()) {
+            return current;
+        }
+        if !seen.insert(next.clone()) {
+            let mut values: Vec<String> = seen.into_iter().collect();
+            values.sort_unstable();
+            return values[0].clone();
+        }
+        current = next;
+    }
+}
+
+async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<UnifiedDbData> {
     let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
         .execute()
         .await?;
@@ -1078,108 +1113,50 @@ async fn load_clip_index(db_dir: &Path, table_name: &str) -> Result<ClipIndex> {
             "is_video",
             "skip_processing",
             "clip_groups",
-        ]))
-        .execute()
-        .await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-
-    let mut entries = Vec::new();
-    let mut dim = None;
-    let mut seen_files = std::collections::HashSet::new();
-
-    for batch in batches {
-        parse_batch(&batch, &mut entries, &mut dim, &mut seen_files)?;
-    }
-
-    let dim = dim.ok_or_else(|| anyhow!("no clip vectors found in table {table_name}"))?;
-    Ok(ClipIndex {
-        entries,
-        dim,
-        file_count: seen_files.len(),
-    })
-}
-
-async fn load_face_index(db_dir: &Path, table_name: &str) -> Result<FaceIndex> {
-    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-    let table = db.open_table(table_name).execute().await?;
-    let stream = table
-        .query()
-        .select(Select::columns(&[
-            "file_name",
-            "is_video",
-            "skip_processing",
             "face_groups",
-        ]))
-        .execute()
-        .await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-
-    let mut entries = Vec::new();
-    let mut seen_files = HashSet::new();
-    for batch in batches {
-        parse_face_batch(&batch, &mut entries, &mut seen_files)?;
-    }
-    Ok(FaceIndex {
-        entries,
-        file_count: seen_files.len(),
-    })
-}
-
-async fn load_ocr_index(db_dir: &Path, table_name: &str) -> Result<OcrIndex> {
-    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-    let table = db.open_table(table_name).execute().await?;
-    let stream = table
-        .query()
-        .select(Select::columns(&[
-            "file_name",
-            "is_video",
-            "skip_processing",
             "ocr_groups",
-        ]))
-        .execute()
-        .await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-
-    let mut entries = Vec::new();
-    let mut seen_files = HashSet::new();
-    for batch in batches {
-        parse_ocr_batch(&batch, &mut entries, &mut seen_files)?;
-    }
-    Ok(OcrIndex {
-        entries,
-        file_count: seen_files.len(),
-    })
-}
-
-async fn load_similar_map(
-    db_dir: &Path,
-    table_name: &str,
-) -> Result<HashMap<String, Vec<SimilarFile>>> {
-    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-    let table = db.open_table(table_name).execute().await?;
-    let stream = table
-        .query()
-        .select(Select::columns(&[
-            "file_name",
-            "is_video",
             "dedupe_match_file",
             "dedupe_similarity_pct",
+            "sift_match_file",
+            "sift_match_score",
+            "sift_match_inliers",
+            "sift_match_good_matches",
+            "sift_match_inlier_ratio",
+            "sift_match_checked",
         ]))
         .execute()
         .await?;
     let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    let mut map: HashMap<String, Vec<SimilarFile>> = HashMap::new();
 
-    for batch in batches {
-        let file_names = string_col(&batch, "file_name")?;
-        let is_video = bool_col(&batch, "is_video")?;
-        let dedupe_match = string_col(&batch, "dedupe_match_file")?;
+    let mut clip_entries = Vec::new();
+    let mut clip_dim = None;
+    let mut clip_seen = HashSet::new();
+    
+    let mut face_entries = Vec::new();
+    let mut face_seen = HashSet::new();
+    
+    let mut ocr_entries = Vec::new();
+    let mut ocr_seen = HashSet::new();
+
+    let mut similar_by_master: HashMap<String, Vec<SimilarFile>> = HashMap::new();
+    let mut sift_info_by_file: HashMap<String, SiftInfo> = HashMap::new();
+    let mut master_images = HashSet::new();
+    let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
+
+    for batch in &batches {
+        // Parse Clip
+        parse_batch(batch, &mut clip_entries, &mut clip_dim, &mut clip_seen)?;
+        
+        // Parse Face
+        parse_face_batch(batch, &mut face_entries, &mut face_seen)?;
+        
+        // Parse OCR
+        parse_ocr_batch(batch, &mut ocr_entries, &mut ocr_seen)?;
+
+        // Parse Similar
+        let file_names = string_col(batch, "file_name")?;
+        let is_video = bool_col(batch, "is_video")?;
+        let dedupe_match = string_col(batch, "dedupe_match_file")?;
         let similarity_col = batch.column_by_name("dedupe_similarity_pct");
 
         for row in 0..batch.num_rows() {
@@ -1192,54 +1169,21 @@ async fn load_similar_map(
                 continue;
             }
             let similarity_pct = similarity_col.and_then(|col| float_value(col.as_ref(), row));
-            map.entry(master).or_default().push(SimilarFile {
+            similar_by_master.entry(master).or_default().push(SimilarFile {
                 file_name: similar_file,
                 is_video: bool_value(is_video, row).unwrap_or(false),
                 similarity_pct,
             });
         }
-    }
 
-    for values in map.values_mut() {
-        values.sort_by(|a, b| {
-            b.similarity_pct
-                .unwrap_or(f32::NEG_INFINITY)
-                .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
-                .unwrap_or(Ordering::Equal)
-        });
-    }
-    Ok(map)
-}
-
-async fn load_sift_info_map(db_dir: &Path, table_name: &str) -> Result<HashMap<String, SiftInfo>> {
-    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-    let table = db.open_table(table_name).execute().await?;
-    let stream = table
-        .query()
-        .select(Select::columns(&[
-            "file_name",
-            "sift_match_file",
-            "sift_match_score",
-            "sift_match_inliers",
-            "sift_match_good_matches",
-            "sift_match_inlier_ratio",
-            "sift_match_checked",
-        ]))
-        .execute()
-        .await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    let mut map: HashMap<String, SiftInfo> = HashMap::new();
-
-    for batch in batches {
-        let file_names = string_col(&batch, "file_name")?;
-        let sift_match_file = string_col(&batch, "sift_match_file")?;
+        // Parse Sift Info & Groups
+        let sift_match_file = string_col(batch, "sift_match_file")?;
         let sift_score = batch.column_by_name("sift_match_score");
         let sift_inliers = batch.column_by_name("sift_match_inliers");
         let sift_good = batch.column_by_name("sift_match_good_matches");
         let sift_ratio = batch.column_by_name("sift_match_inlier_ratio");
-        let sift_checked = bool_col(&batch, "sift_match_checked")?;
+        let sift_checked = bool_col(batch, "sift_match_checked")?;
+        let skip_processing = bool_col(batch, "skip_processing")?;
 
         for row in 0..batch.num_rows() {
             if file_names.is_null(row) {
@@ -1273,8 +1217,8 @@ async fn load_sift_info_map(db_dir: &Path, table_name: &str) -> Result<HashMap<S
                     None
                 }
             });
-            map.insert(
-                file_name,
+            sift_info_by_file.insert(
+                file_name.clone(),
                 SiftInfo {
                     match_file,
                     score: sift_score.and_then(|col| float_value(col.as_ref(), row)),
@@ -1284,100 +1228,14 @@ async fn load_sift_info_map(db_dir: &Path, table_name: &str) -> Result<HashMap<S
                     checked: bool_value(sift_checked, row),
                 },
             );
-        }
-    }
-    Ok(map)
-}
 
-#[derive(Default)]
-struct Dsu {
-    parent: HashMap<String, String>,
-}
-
-impl Dsu {
-    fn add(&mut self, value: &str) {
-        self.parent
-            .entry(value.to_string())
-            .or_insert_with(|| value.to_string());
-    }
-
-    fn find(&mut self, value: &str) -> Option<String> {
-        let parent = self.parent.get(value)?.clone();
-        if parent == value {
-            return Some(parent);
-        }
-        let root = self.find(&parent)?;
-        self.parent.insert(value.to_string(), root.clone());
-        Some(root)
-    }
-
-    fn union(&mut self, a: &str, b: &str) {
-        self.add(a);
-        self.add(b);
-        let root_a = match self.find(a) {
-            Some(v) => v,
-            None => return,
-        };
-        let root_b = match self.find(b) {
-            Some(v) => v,
-            None => return,
-        };
-        if root_a == root_b {
-            return;
-        }
-        if root_a < root_b {
-            self.parent.insert(root_b, root_a);
-        } else {
-            self.parent.insert(root_a, root_b);
-        }
-    }
-}
-
-async fn load_sift_groups(
-    db_dir: &Path,
-    table_name: &str,
-) -> Result<(HashMap<String, String>, HashMap<String, Vec<String>>)> {
-    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
-        .execute()
-        .await?;
-    let table = db.open_table(table_name).execute().await?;
-    let stream = table
-        .query()
-        .select(Select::columns(&[
-            "file_name",
-            "is_video",
-            "skip_processing",
-            "sift_match_file",
-            "sift_match_score",
-            "sift_match_inliers",
-            "sift_match_inlier_ratio",
-            "sift_match_checked",
-        ]))
-        .execute()
-        .await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-
-    let mut master_images = HashSet::new();
-    let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
-
-    for batch in batches {
-        let file_names = string_col(&batch, "file_name")?;
-        let is_video = bool_col(&batch, "is_video")?;
-        let skip_processing = bool_col(&batch, "skip_processing")?;
-        let sift_match_file = string_col(&batch, "sift_match_file")?;
-        let sift_checked = bool_col(&batch, "sift_match_checked")?;
-
-        for row in 0..batch.num_rows() {
-            if file_names.is_null(row) {
-                continue;
-            }
+            // SIFT grouping collection
             if bool_value(is_video, row).unwrap_or(false) {
                 continue;
             }
             if bool_value(skip_processing, row) == Some(true) {
                 continue;
             }
-            let file_name = file_names.value(row).to_string();
             master_images.insert(file_name.clone());
 
             if sift_match_file.is_null(row) {
@@ -1394,42 +1252,33 @@ async fn load_sift_groups(
         }
     }
 
-    let mut dsu = Dsu::default();
-    for file_name in &master_images {
-        dsu.add(file_name.as_str());
-    }
-    for (file_name, target) in &direct_root_by_file {
-        if !master_images.contains(file_name.as_str()) || !master_images.contains(target.as_str()) {
-            continue;
-        }
-        dsu.union(file_name.as_str(), target.as_str());
+    let clip_dim = clip_dim.unwrap_or(512);
+    let clip_index = ClipIndex {
+        entries: clip_entries,
+        dim: clip_dim,
+        file_count: clip_seen.len(),
+    };
+
+    let face_index = FaceIndex {
+        entries: face_entries,
+        file_count: face_seen.len(),
+    };
+
+    let ocr_index = OcrIndex {
+        entries: ocr_entries,
+        file_count: ocr_seen.len(),
+    };
+
+    for values in similar_by_master.values_mut() {
+        values.sort_by(|a, b| {
+            b.similarity_pct
+                .unwrap_or(f32::NEG_INFINITY)
+                .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                .unwrap_or(Ordering::Equal)
+        });
     }
 
-    fn resolve_root(
-        name: &str,
-        direct_root_by_file: &HashMap<String, String>,
-        master_images: &HashSet<String>,
-    ) -> String {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut current = name.to_string();
-        seen.insert(current.clone());
-        loop {
-            let next = match direct_root_by_file.get(current.as_str()) {
-                Some(v) => v.clone(),
-                None => return current,
-            };
-            if !master_images.contains(next.as_str()) {
-                return current;
-            }
-            if !seen.insert(next.clone()) {
-                let mut values: Vec<String> = seen.into_iter().collect();
-                values.sort_unstable();
-                return values[0].clone();
-            }
-            current = next;
-        }
-    }
-
+    // Build SIFT groups using resolve_root
     let mut sift_root_by_file: HashMap<String, String> = HashMap::new();
     let mut sift_members_by_root: HashMap<String, Vec<String>> = HashMap::new();
     let mut raw_groups: HashMap<String, Vec<String>> = HashMap::new();
@@ -1454,7 +1303,15 @@ async fn load_sift_groups(
         sift_members_by_root.insert(canonical, sorted_members);
     }
 
-    Ok((sift_root_by_file, sift_members_by_root))
+    Ok(UnifiedDbData {
+        clip_index,
+        face_index,
+        ocr_index,
+        similar_by_master,
+        sift_info_by_file,
+        sift_root_by_file,
+        sift_members_by_root,
+    })
 }
 
 fn parse_batch(
@@ -2369,24 +2226,21 @@ impl ImageViewer {
                 let onnx_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/clip_text.onnx");
                 let tokenizer_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/tokenizer.json");
                 
-                let clip_index = Arc::new(load_clip_index(db_dir, table_name).await?);
-                let face_index = Arc::new(load_face_index(db_dir, table_name).await?);
-                let ocr_index = Arc::new(load_ocr_index(db_dir, table_name).await?);
-                
-                let similar_by_master = load_similar_map(db_dir, table_name).await?;
-                let sift_info_by_file = load_sift_info_map(db_dir, table_name).await?;
-                let (sift_root_by_file, sift_members_by_root) = load_sift_groups(db_dir, table_name).await?;
-                
-                let encoder = ClipTextEncoder::new(onnx_path, tokenizer_path, 64)?;
+                let db_fut = load_all_database_indices(db_dir, table_name);
+                let encoder_fut = async {
+                    ClipTextEncoder::new(onnx_path, tokenizer_path, 64)
+                };
+
+                let (db_data, encoder) = tokio::try_join!(db_fut, encoder_fut)?;
                 
                 Ok(DatabaseIndices {
-                    clip_index,
-                    face_index,
-                    ocr_index,
-                    similar_by_master,
-                    sift_info_by_file,
-                    sift_root_by_file,
-                    sift_members_by_root,
+                    clip_index: Arc::new(db_data.clip_index),
+                    face_index: Arc::new(db_data.face_index),
+                    ocr_index: Arc::new(db_data.ocr_index),
+                    similar_by_master: db_data.similar_by_master,
+                    sift_info_by_file: db_data.sift_info_by_file,
+                    sift_root_by_file: db_data.sift_root_by_file,
+                    sift_members_by_root: db_data.sift_members_by_root,
                     encoder,
                 })
             });
