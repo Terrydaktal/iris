@@ -1060,9 +1060,11 @@ struct DatabaseIndices {
     face_index: Arc<FaceIndex>,
     ocr_index: Arc<OcrIndex>,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    phash_master_by_file: HashMap<String, String>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
+    basename_to_db_filename: HashMap<String, String>,
     encoder: ClipTextEncoder,
 }
 
@@ -1071,6 +1073,7 @@ struct UnifiedDbData {
     face_index: FaceIndex,
     ocr_index: OcrIndex,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    phash_master_by_file: HashMap<String, String>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
@@ -1136,6 +1139,7 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
     let mut ocr_seen = HashSet::new();
 
     let mut similar_by_master: HashMap<String, Vec<SimilarFile>> = HashMap::new();
+    let mut phash_master_by_file: HashMap<String, String> = HashMap::new();
     let mut sift_info_by_file: HashMap<String, SiftInfo> = HashMap::new();
     let mut master_images = HashSet::new();
     let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
@@ -1166,11 +1170,12 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
                 continue;
             }
             let similarity_pct = similarity_col.and_then(|col| float_value(col.as_ref(), row));
-            similar_by_master.entry(master).or_default().push(SimilarFile {
-                file_name: similar_file,
+            similar_by_master.entry(master.clone()).or_default().push(SimilarFile {
+                file_name: similar_file.clone(),
                 is_video: bool_value(is_video, row).unwrap_or(false),
                 similarity_pct,
             });
+            phash_master_by_file.insert(similar_file, master);
         }
 
         // Parse Sift Info & Groups
@@ -1305,6 +1310,7 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
         face_index,
         ocr_index,
         similar_by_master,
+        phash_master_by_file,
         sift_info_by_file,
         sift_root_by_file,
         sift_members_by_root,
@@ -2152,6 +2158,46 @@ struct ImageViewer {
     sift_rx: Option<Receiver<Result<String, String>>>,
 }
 
+fn file_resolution_and_size(path: &Path) -> String {
+    let size_label = match std::fs::metadata(path) {
+        Ok(meta) => {
+            let bytes = meta.len();
+            const KB: u64 = 1024;
+            const MB: u64 = KB * 1024;
+            const GB: u64 = MB * 1024;
+            if bytes >= GB {
+                format!("{:.2} GB", bytes as f64 / GB as f64)
+            } else if bytes >= MB {
+                format!("{:.2} MB", bytes as f64 / MB as f64)
+            } else if bytes >= KB {
+                format!("{:.2} KB", bytes as f64 / KB as f64)
+            } else {
+                format!("{} B", bytes)
+            }
+        }
+        Err(_) => "n/a".to_string(),
+    };
+    match image::image_dimensions(path) {
+        Ok((w, h)) => format!("{}x{} | {}", w, h, size_label),
+        Err(_) => size_label,
+    }
+}
+
+fn sift_info_line(sift_info_by_file: &HashMap<String, SiftInfo>, file_name: &str) -> String {
+    let Some(info) = sift_info_by_file.get(file_name) else {
+        return "SIFT: n/a".to_string();
+    };
+    if !valid_sift_link(info) {
+        return "SIFT: no valid link".to_string();
+    }
+    format!(
+        "SIFT: score {:.2}, inliers {}, ratio {:.2}",
+        info.score.unwrap_or(0.0),
+        info.inliers.unwrap_or(0),
+        info.inlier_ratio.unwrap_or(0.0)
+    )
+}
+
 impl ImageViewer {
     fn new(path: PathBuf, rx: Receiver<PathBuf>, ctx_shared: Arc<Mutex<Option<egui::Context>>>) -> Self {
         let path = path.canonicalize().unwrap_or(path);
@@ -2299,14 +2345,42 @@ impl ImageViewer {
 
                 let (db_data, encoder) = tokio::try_join!(db_fut, encoder_fut)?;
                 
+                let mut basename_to_db_filename = HashMap::new();
+                for entry in &db_data.clip_index.entries {
+                    if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| entry.file_name.to_string());
+                    }
+                }
+                for key in db_data.phash_master_by_file.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+                for key in db_data.similar_by_master.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+                for key in db_data.sift_info_by_file.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+
                 Ok(DatabaseIndices {
                     clip_index: Arc::new(db_data.clip_index),
                     face_index: Arc::new(db_data.face_index),
                     ocr_index: Arc::new(db_data.ocr_index),
                     similar_by_master: db_data.similar_by_master,
+                    phash_master_by_file: db_data.phash_master_by_file,
                     sift_info_by_file: db_data.sift_info_by_file,
                     sift_root_by_file: db_data.sift_root_by_file,
                     sift_members_by_root: db_data.sift_members_by_root,
+                    basename_to_db_filename,
                     encoder,
                 })
             });
@@ -2349,32 +2423,109 @@ impl ImageViewer {
     }
 
     fn get_db_filename_from_path(&self, path: &Path) -> Option<String> {
-        let path_str = path.to_string_lossy().replace('\\', "/");
-        let phone_prefix = "/media/lewis/1b/Phone";
-        let telegram_prefix = "/media/lewis/1b/Telegram Backup";
-        if path_str.starts_with(phone_prefix) {
-            let rel = &path_str[phone_prefix.len()..];
-            let rel_clean = rel.trim_start_matches('/');
-            return Some(format!("phone/{}", rel_clean));
-        } else if path_str.starts_with(telegram_prefix) {
-            let rel = &path_str[telegram_prefix.len()..];
-            let rel_clean = rel.trim_start_matches('/');
-            return Some(format!("telegram_backup/{}", rel_clean));
+        let roots = get_db_roots();
+        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        
+        for (col_id, root_path) in &roots {
+            let root_canon = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
+            if let Ok(rel) = canon_path.strip_prefix(&root_canon) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
+            }
+            if let Ok(rel) = path.strip_prefix(root_path) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
+            }
         }
         
-        if let Ok(canon_path) = path.canonicalize() {
-            let canon_str = canon_path.to_string_lossy().replace('\\', "/");
-            if canon_str.starts_with(phone_prefix) {
-                let rel = &canon_str[phone_prefix.len()..];
-                let rel_clean = rel.trim_start_matches('/');
-                return Some(format!("phone/{}", rel_clean));
-            } else if canon_str.starts_with(telegram_prefix) {
-                let rel = &canon_str[telegram_prefix.len()..];
-                let rel_clean = rel.trim_start_matches('/');
-                return Some(format!("telegram_backup/{}", rel_clean));
+        // Fallback to substring matching if prefix checks fail
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        for (col_id, root_path) in &roots {
+            let root_str = root_path.to_string_lossy().replace('\\', "/");
+            if path_str.starts_with(&root_str) {
+                let rel = &path_str[root_str.len()..];
+                return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
+            }
+            if let Ok(root_canon) = root_path.canonicalize() {
+                let root_canon_str = root_canon.to_string_lossy().replace('\\', "/");
+                if path_str.starts_with(&root_canon_str) {
+                    let rel = &path_str[root_canon_str.len()..];
+                    return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
+                }
             }
         }
         None
+    }
+
+    fn draw_thumbnail_async(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        side_thumb: f32,
+    ) {
+        if let Some(texture) = self.thumbnail_textures.get(path) {
+            ui.add(
+                egui::Image::from_texture(texture)
+                    .max_size(egui::vec2(side_thumb, side_thumb))
+                    .maintain_aspect_ratio(true)
+            );
+        } else if self.thumbnail_failed.contains(path) {
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(side_thumb, side_thumb),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_gray(30),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⚠️ Error",
+                egui::FontId::proportional(10.0),
+                egui::Color32::GRAY,
+            );
+        } else {
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(side_thumb, side_thumb),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_gray(40),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⏳ Loading",
+                egui::FontId::proportional(10.0),
+                egui::Color32::GRAY,
+            );
+            
+            if !self.thumbnail_loading.contains(path) && self.thumbnail_active_threads < 8 {
+                self.thumbnail_loading.insert(path.to_path_buf());
+                self.thumbnail_active_threads += 1;
+                let path_clone = path.to_path_buf();
+                let tx_clone = self.thumbnail_tx.clone();
+                let ctx_clone = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    if let Ok(img) = image::open(&path_clone) {
+                        let thumb = img.thumbnail(128, 128);
+                        let size = [thumb.width() as usize, thumb.height() as usize];
+                        let pixels = thumb.to_rgba8().into_raw();
+                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                        let _ = tx_clone.send((path_clone, color_img));
+                        ctx_clone.request_repaint();
+                    } else {
+                        let empty_img = egui::ColorImage::new([0, 0], Vec::new());
+                        let _ = tx_clone.send((path_clone, empty_img));
+                        ctx_clone.request_repaint();
+                    }
+                });
+            }
+        }
     }
 
     fn grouped_master_for(&self, file_name: &str, is_video: bool) -> String {
@@ -3688,30 +3839,101 @@ impl eframe::App for ImageViewer {
                             let filename_opt = self.get_db_filename_from_path(&path);
                             if let Some(filename) = filename_opt {
                                 let indices = self.db_indices.as_ref().unwrap();
-                                let is_video = is_video_path(&path);
-                                let root_key = self.grouped_master_for(&filename, is_video);
+                                
+                                // Resolve master file if this is a pHash duplicate/similar
+                                let master_file_name = indices.phash_master_by_file
+                                    .get(&filename)
+                                    .cloned()
+                                    .unwrap_or_else(|| filename.clone());
+                                
+                                // Find SIFT master
+                                let sift_master = indices.sift_root_by_file
+                                    .get(&master_file_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| master_file_name.clone());
                                 
                                 // Fetch SIFT members in this group
-                                let mut sift_members = indices.sift_members_by_root
-                                    .get(&root_key)
+                                let sift_members = indices.sift_members_by_root
+                                    .get(&sift_master)
                                     .cloned()
                                     .unwrap_or_default();
                                 
-                                // Also fetch direct roots if not grouped
-                                if sift_members.is_empty() {
-                                    if let Some(direct) = indices.sift_root_by_file.get(&filename) {
-                                        sift_members = indices.sift_members_by_root
-                                            .get(direct)
-                                            .cloned()
-                                            .unwrap_or_default();
+                                let sift_evidence_members: Vec<String> = sift_members
+                                    .iter()
+                                    .filter(|member| {
+                                        indices.sift_info_by_file
+                                            .get(member.as_str())
+                                            .is_some_and(valid_sift_link)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                
+                                let mut displayed_sift_members = Vec::new();
+                                let mut displayed_seen = HashSet::new();
+                                if displayed_seen.insert(filename.clone()) {
+                                    displayed_sift_members.push(filename.clone());
+                                }
+                                for member in &sift_evidence_members {
+                                    if displayed_seen.insert(member.clone()) {
+                                        displayed_sift_members.push(member.clone());
                                     }
                                 }
                                 
-                                // Fetch all pHash similars
-                                let phash_similars = indices.similar_by_master
-                                    .get(&filename)
-                                    .cloned()
-                                    .unwrap_or_default();
+                                // Combine pHash similars for all SIFT members in this group
+                                let member_sources: Vec<String> = if sift_members.is_empty() {
+                                    vec![master_file_name.clone()]
+                                } else {
+                                    sift_members.clone()
+                                };
+                                
+                                let mut combined_similars: Vec<SimilarFile> = Vec::new();
+                                let mut combined_seen = HashSet::new();
+                                for member in &member_sources {
+                                    let mut items = indices.similar_by_master
+                                        .get(member.as_str())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    items.sort_by(|a, b| {
+                                        b.similarity_pct
+                                            .unwrap_or(f32::NEG_INFINITY)
+                                            .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                                            .unwrap_or(Ordering::Equal)
+                                    });
+                                    for item in &items {
+                                        if combined_seen.insert(item.file_name.clone()) {
+                                            combined_similars.push(item.clone());
+                                        }
+                                    }
+                                }
+                                combined_similars.sort_by(|a, b| {
+                                    b.similarity_pct
+                                        .unwrap_or(f32::NEG_INFINITY)
+                                        .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                                        .unwrap_or(Ordering::Equal)
+                                });
+                                
+                                // Precompute SIFT members metadata (paths and text) to avoid borrow checker errors in the ScrollArea closure
+                                let mut displayed_sift_metadata = Vec::new();
+                                let roots = get_db_roots();
+                                for member in &displayed_sift_members {
+                                    let source_path_opt = resolve_source_path(&roots, member).ok();
+                                    let member_is_video = is_video_path(Path::new(member));
+                                    let res_size_str = source_path_opt.as_ref()
+                                        .map(|p| file_resolution_and_size(p))
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    let sift_str = sift_info_line(&indices.sift_info_by_file, member);
+                                    displayed_sift_metadata.push((member.clone(), source_path_opt, member_is_video, res_size_str, sift_str));
+                                }
+
+                                // Precompute combined similars metadata (paths and text)
+                                let mut combined_similars_metadata = Vec::new();
+                                for item in &combined_similars {
+                                    let source_path_opt = resolve_source_path(&roots, &item.file_name).ok();
+                                    let res_size_str = source_path_opt.as_ref()
+                                        .map(|p| file_resolution_and_size(p))
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    combined_similars_metadata.push((item.clone(), source_path_opt, res_size_str));
+                                }
                                 
                                 ui.heading("👥 Duplicate Matches");
                                 ui.add_space(4.0);
@@ -3719,75 +3941,162 @@ impl eframe::App for ImageViewer {
                                 ui.add_space(8.0);
                                 
                                 egui::ScrollArea::vertical().show(ui, |ui| {
+                                    let side_thumb = 90.0_f32;
+                                    
                                     // 1. SIFT Cluster Members (Duplicates)
                                     if !sift_members.is_empty() {
                                         ui.horizontal(|ui| {
                                             ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "✓ SIFT Duplicate Cluster");
                                             ui.weak(format!("({} files)", sift_members.len()));
                                         });
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         
-                                        let roots = get_db_roots();
-                                        for member in &sift_members {
-                                            if member == &filename {
-                                                continue;
-                                            }
-                                            let member_path_res = resolve_source_path(&roots, member);
-                                            if let Ok(m_path) = member_path_res {
-                                                ui.horizontal(|ui| {
-                                                    ui.monospace(member.split_once('/').map(|x| x.1).unwrap_or(member));
-                                                    
-                                                    let is_active_compare = self.compare_target.as_ref() == Some(&m_path);
-                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                        if is_active_compare {
-                                                            self.compare_target = None;
-                                                            self.sift_pair_overlay = None;
-                                                        } else {
-                                                            self.compare_target = Some(m_path.clone());
-                                                            self.start_sift_alignment(path.clone(), m_path.clone(), ui.ctx().clone());
+                                        for (member, source_path_opt, member_is_video, res_size_str, sift_str) in &displayed_sift_metadata {
+                                            ui.horizontal(|ui| {
+                                                // Left: Thumbnail preview
+                                                if let Some(s_path) = source_path_opt.as_ref() {
+                                                    self.draw_thumbnail_async(ui, s_path, side_thumb);
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(side_thumb, side_thumb),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                                }
+                                                
+                                                // Right: Info and buttons
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.colored_label(
+                                                            if *member_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                            if *member_is_video { "📹 Video" } else { "🖼 Image" }
+                                                        );
+                                                        if member == &filename {
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                         }
-                                                    }
+                                                    });
+                                                    
+                                                    ui.weak(res_size_str);
+                                                    ui.weak(sift_str);
+                                                    
+                                                    let display_name = member.split_once('/').map(|x| x.1).unwrap_or(member);
+                                                    ui.monospace(display_name);
+                                                    
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(s_path) = source_path_opt.as_ref() {
+                                                            if member != &filename {
+                                                                if ui.button("👁 View").clicked() {
+                                                                    if let Some(pos) = self.images.iter().position(|p| p == s_path) {
+                                                                        self.current_index = pos;
+                                                                    } else {
+                                                                        self.images.insert(self.current_index + 1, s_path.clone());
+                                                                        self.current_index += 1;
+                                                                    }
+                                                                    self.show_grid = false;
+                                                                    self.update_exif();
+                                                                }
+                                                            }
+                                                            
+                                                            let is_active_compare = self.compare_target.as_ref() == Some(s_path);
+                                                            let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                            if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                                if is_active_compare {
+                                                                    self.compare_target = None;
+                                                                    self.sift_pair_overlay = None;
+                                                                } else {
+                                                                    self.compare_target = Some(s_path.clone());
+                                                                    self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 });
-                                            }
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(8.0);
                                         }
-                                        ui.add_space(12.0);
-                                        ui.separator();
-                                        ui.add_space(12.0);
+                                        ui.add_space(8.0);
                                     }
                                     
                                     // 2. pHash Similars (Similarity Map)
-                                    if !phash_similars.is_empty() {
+                                    if !combined_similars.is_empty() {
                                         ui.horizontal(|ui| {
                                             ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "🔗 Similar Images (pHash)");
-                                            ui.weak(format!("({} files)", phash_similars.len()));
+                                            ui.weak(format!("({} files)", combined_similars.len()));
                                         });
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         
-                                        let roots = get_db_roots();
-                                        for sim in &phash_similars {
-                                            let sim_path_res = resolve_source_path(&roots, &sim.file_name);
-                                            if let Ok(s_path) = sim_path_res {
-                                                ui.horizontal(|ui| {
-                                                    let pct_str = sim.similarity_pct
-                                                        .map(|v| format!("{:.0}%", v))
-                                                        .unwrap_or_else(|| "n/a".to_string());
-                                                    ui.weak(format!("[{}]", pct_str));
-                                                    ui.monospace(sim.file_name.split_once('/').map(|x| x.1).unwrap_or(&sim.file_name));
-                                                    
-                                                    let is_active_compare = self.compare_target.as_ref() == Some(&s_path);
-                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                        if is_active_compare {
-                                                            self.compare_target = None;
-                                                            self.sift_pair_overlay = None;
-                                                        } else {
-                                                            self.compare_target = Some(s_path.clone());
-                                                            self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                        for (item, source_path_opt, res_size_str) in &combined_similars_metadata {
+                                            let item_is_video = item.is_video;
+                                            
+                                            ui.horizontal(|ui| {
+                                                // Left: Thumbnail preview
+                                                if let Some(s_path) = source_path_opt.as_ref() {
+                                                    self.draw_thumbnail_async(ui, s_path, side_thumb);
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(side_thumb, side_thumb),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                                }
+                                                
+                                                // Right: Info and buttons
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.colored_label(
+                                                            if item_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                            if item_is_video { "📹 Video" } else { "🖼 Image" }
+                                                        );
+                                                        if item.file_name == filename {
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                         }
-                                                    }
+                                                    });
+                                                    
+                                                    let similarity_label = item.similarity_pct
+                                                        .map(|v| format!("pHash similarity {:.2}%", v))
+                                                        .unwrap_or_else(|| "pHash similarity n/a".to_string());
+                                                    ui.colored_label(egui::Color32::from_rgb(100, 180, 255), similarity_label);
+                                                    
+                                                    ui.weak(res_size_str);
+                                                    
+                                                    let display_name = item.file_name.split_once('/').map(|x| x.1).unwrap_or(&item.file_name);
+                                                    ui.monospace(display_name);
+                                                    
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(s_path) = source_path_opt.as_ref() {
+                                                            if item.file_name != filename {
+                                                                if ui.button("👁 View").clicked() {
+                                                                    if let Some(pos) = self.images.iter().position(|p| p == s_path) {
+                                                                        self.current_index = pos;
+                                                                    } else {
+                                                                        self.images.insert(self.current_index + 1, s_path.clone());
+                                                                        self.current_index += 1;
+                                                                    }
+                                                                    self.show_grid = false;
+                                                                    self.update_exif();
+                                                                }
+                                                            }
+                                                            
+                                                            let is_active_compare = self.compare_target.as_ref() == Some(s_path);
+                                                            let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                            if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                                if is_active_compare {
+                                                                    self.compare_target = None;
+                                                                    self.sift_pair_overlay = None;
+                                                                } else {
+                                                                    self.compare_target = Some(s_path.clone());
+                                                                    self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 });
-                                            }
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(8.0);
                                         }
                                     } else if sift_members.is_empty() {
                                         ui.weak("No duplicates or similar files found in database.");

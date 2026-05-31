@@ -28,11 +28,6 @@ fn get_socket_path() -> PathBuf {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: iris [--same-window | -s] [--no-daemon] <image_path>");
-        std::process::exit(1);
-    }
-
     let mut reuse_window = false;
     let mut no_daemon = false;
     let mut image_arg = None;
@@ -49,11 +44,12 @@ fn main() -> eframe::Result {
         }
     }
 
+    let mut start_on_home_page = false;
     let image_path = match image_arg {
         Some(path_str) => PathBuf::from(&path_str).canonicalize().unwrap_or_else(|_| PathBuf::from(&path_str)),
         None => {
-            eprintln!("Usage: iris [--same-window | -s] [--no-daemon] <image_path>");
-            std::process::exit(1);
+            start_on_home_page = true;
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }
     };
 
@@ -151,7 +147,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let rx_taken = rx_shared_clone.lock().unwrap().take().unwrap();
-            Ok(Box::new(ImageViewer::new(image_path_clone, rx_taken, ctx_shared_clone)))
+            Ok(Box::new(ImageViewer::new(image_path_clone, rx_taken, ctx_shared_clone, start_on_home_page)))
         }),
     );
 
@@ -164,7 +160,7 @@ fn main() -> eframe::Result {
             Box::new(move |cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 let rx_taken = rx_shared.lock().unwrap().take().unwrap();
-                Ok(Box::new(ImageViewer::new(image_path, rx_taken, ctx_shared)))
+                Ok(Box::new(ImageViewer::new(image_path, rx_taken, ctx_shared, start_on_home_page)))
             }),
         );
     }
@@ -958,7 +954,8 @@ fn collect_images_recursive(dir: &Path, tx: &std::sync::mpsc::Sender<PathBuf>, v
                 collect_images_recursive(&path, tx, visited);
             } else if path.is_file() {
                 let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg") {
+                if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg" |
+                            "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg") {
                     if let Ok(canon) = path.canonicalize() {
                         let _ = tx.send(canon);
                     } else {
@@ -970,14 +967,9 @@ fn collect_images_recursive(dir: &Path, tx: &std::sync::mpsc::Sender<PathBuf>, v
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum ExploreMode {
-    Filesystem,
-    Semantic,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchMode {
+    Filename,
     Clip,
     Ocr,
 }
@@ -1060,9 +1052,11 @@ struct DatabaseIndices {
     face_index: Arc<FaceIndex>,
     ocr_index: Arc<OcrIndex>,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    phash_master_by_file: HashMap<String, String>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
+    basename_to_db_filename: HashMap<String, String>,
     encoder: ClipTextEncoder,
 }
 
@@ -1071,6 +1065,7 @@ struct UnifiedDbData {
     face_index: FaceIndex,
     ocr_index: OcrIndex,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    phash_master_by_file: HashMap<String, String>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
@@ -1136,6 +1131,7 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
     let mut ocr_seen = HashSet::new();
 
     let mut similar_by_master: HashMap<String, Vec<SimilarFile>> = HashMap::new();
+    let mut phash_master_by_file: HashMap<String, String> = HashMap::new();
     let mut sift_info_by_file: HashMap<String, SiftInfo> = HashMap::new();
     let mut master_images = HashSet::new();
     let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
@@ -1166,11 +1162,12 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
                 continue;
             }
             let similarity_pct = similarity_col.and_then(|col| float_value(col.as_ref(), row));
-            similar_by_master.entry(master).or_default().push(SimilarFile {
-                file_name: similar_file,
+            similar_by_master.entry(master.clone()).or_default().push(SimilarFile {
+                file_name: similar_file.clone(),
                 is_video: bool_value(is_video, row).unwrap_or(false),
                 similarity_pct,
             });
+            phash_master_by_file.insert(similar_file, master);
         }
 
         // Parse Sift Info & Groups
@@ -1305,6 +1302,7 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
         face_index,
         ocr_index,
         similar_by_master,
+        phash_master_by_file,
         sift_info_by_file,
         sift_root_by_file,
         sift_members_by_root,
@@ -1680,14 +1678,19 @@ fn search_index(
     query: &[f32],
     limit: usize,
     video_only: bool,
+    folder_filter: &str,
 ) -> Vec<SearchResult> {
     let merged = index
         .entries
         .par_chunks(4096)
         .map(|chunk| {
+            let db_roots = get_db_roots();
             let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
             for entry in chunk {
                 if video_only && !entry.is_video {
+                    continue;
+                }
+                if !folder_filter.is_empty() && !file_matches_folder(&entry.file_name, folder_filter, &db_roots) {
                     continue;
                 }
                 let score = dot(query, &entry.vector);
@@ -1742,6 +1745,7 @@ fn search_ocr_index(
     query: &str,
     limit: usize,
     video_only: bool,
+    folder_filter: &str,
 ) -> Vec<SearchResult> {
     let query_lower = query.trim().to_lowercase();
     if query_lower.is_empty() {
@@ -1757,9 +1761,13 @@ fn search_ocr_index(
         .entries
         .par_chunks(4096)
         .map(|chunk| {
+            let db_roots = get_db_roots();
             let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
             for entry in chunk {
                 if video_only && !entry.is_video {
+                    continue;
+                }
+                if !folder_filter.is_empty() && !file_matches_folder(&entry.file_name, folder_filter, &db_roots) {
                     continue;
                 }
                 let phrase_hit = entry.text_lower.contains(query_lower.as_str());
@@ -1927,20 +1935,54 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn get_db_roots() -> HashMap<String, PathBuf> {
-    let mut roots = HashMap::new();
-    roots.insert(
-        "phone".to_string(),
-        PathBuf::from("/media/lewis/1b/Phone")
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Phone")),
-    );
-    roots.insert(
-        "telegram_backup".to_string(),
-        PathBuf::from("/media/lewis/1b/Telegram Backup")
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Telegram Backup")),
-    );
-    roots
+    static ROOTS: std::sync::OnceLock<HashMap<String, PathBuf>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots = HashMap::new();
+        roots.insert(
+            "phone".to_string(),
+            PathBuf::from("/media/lewis/1b/Phone")
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Phone")),
+        );
+        roots.insert(
+            "telegram_backup".to_string(),
+            PathBuf::from("/media/lewis/1b/Telegram Backup")
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Telegram Backup")),
+        );
+        roots
+    }).clone()
+}
+
+fn file_matches_folder(file_name: &str, folder: &str, db_roots: &HashMap<String, PathBuf>) -> bool {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return true;
+    }
+    let normalized_file = file_name.replace('\\', "/").to_lowercase();
+    let normalized_folder = folder.replace('\\', "/").to_lowercase();
+    if normalized_file.contains(&normalized_folder) {
+        return true;
+    }
+    let folder_path = Path::new(folder);
+    if let Ok(canon_folder) = folder_path.canonicalize() {
+        if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
+            if let Ok(canon_source) = source_path.canonicalize() {
+                if canon_source.starts_with(&canon_folder) {
+                    return true;
+                }
+            }
+            if source_path.starts_with(folder_path) {
+                return true;
+            }
+        }
+    } else if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
+        let source_str = source_path.to_string_lossy().replace('\\', "/").to_lowercase();
+        if source_str.contains(&normalized_folder) {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_media_path(
@@ -1973,6 +2015,70 @@ fn resolve_source_path(roots: &HashMap<String, PathBuf>, file_name: &str) -> Res
         .get(collection)
         .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
     Ok(root.join(Path::new(rel)))
+}
+
+fn db_filename_from_video_still_path(path: &Path) -> Option<String> {
+    let path_str = path.to_string_lossy();
+    if !path_str.contains("-video") && !path_str.contains("lancedb") {
+        return None;
+    }
+    
+    let db_dir = Path::new("/media/lewis/1b/lancedb");
+    
+    let rel = path.strip_prefix(db_dir).ok().map(|p| p.to_path_buf()).or_else(|| {
+        let canon_path = path.canonicalize().ok()?;
+        let canon_db = db_dir.canonicalize().ok()?;
+        canon_path.strip_prefix(canon_db).ok().map(|p| p.to_path_buf())
+    })?;
+    
+    let components: Vec<_> = rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    
+    if components.len() < 3 {
+        return None;
+    }
+    
+    let first = &components[0];
+    if !first.ends_with("-video") {
+        return None;
+    }
+    let collection_id = &first[..first.len() - "-video".len()];
+    
+    let video_dir_name = &components[components.len() - 2];
+    let (stem, ext) = video_dir_name.rsplit_once('_')?;
+    
+    let mut rel_parts = Vec::new();
+    for part in &components[1..components.len() - 2] {
+        rel_parts.push(part.as_str());
+    }
+    let reconstructed_video_filename = format!("{}.{}", stem, ext);
+    rel_parts.push(&reconstructed_video_filename);
+    
+    Some(format!("{}/{}", collection_id, rel_parts.join("/")))
+}
+
+fn open_in_dolphin_or_fallback(file_path: &Path) {
+    let path = file_path.to_path_buf();
+    std::thread::spawn(move || {
+        let success = if let Ok(mut child) = std::process::Command::new("dolphin")
+            .arg("--select")
+            .arg(&path)
+            .spawn()
+        {
+            child.wait().map(|s| s.success()).unwrap_or(false)
+        } else {
+            false
+        };
+        
+        if !success {
+            if let Some(parent) = path.parent() {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(parent)
+                    .spawn();
+            }
+        }
+    });
 }
 
 fn is_video_path(path: &Path) -> bool {
@@ -2133,12 +2239,13 @@ struct ImageViewer {
     thumbnail_active_threads: usize,
     
     // AI Database & Explorer States
-    explore_mode: ExploreMode,
     db_loaded: bool,
     db_loading: bool,
+    db_failed: bool,
     db_rx: Option<Receiver<Result<DatabaseIndices, String>>>,
     db_indices: Option<DatabaseIndices>,
     semantic_query: String,
+    semantic_folder: String,
     semantic_limit: usize,
     semantic_video_only: bool,
     semantic_mode: SearchMode,
@@ -2150,61 +2257,200 @@ struct ImageViewer {
     sift_pair_overlay: Option<String>,
     sift_running: bool,
     sift_rx: Option<Receiver<Result<String, String>>>,
+
+    // Maps resolved media_path → database file_name for AI search results.
+    // Avoids reverse-mapping video stills back to collection paths.
+    db_filename_by_path: HashMap<PathBuf, String>,
+
+    // Cache resolved video still paths to avoid redundant manifest.json reads on the UI thread
+    video_still_cache: std::cell::RefCell<HashMap<PathBuf, PathBuf>>,
+
+    // Cache computed resolution and size strings to avoid heavy sync disk I/O on the UI thread
+    resolution_size_cache: std::cell::RefCell<HashMap<PathBuf, String>>,
+
+    // Cache resolved database filenames to avoid synchronous path canonicalization on the UI thread
+    db_filename_cache: std::cell::RefCell<HashMap<PathBuf, Option<String>>>,
+
+    // Home Page states
+    show_home_page: bool,
+    home_current_dir: Option<PathBuf>,
+    home_selected_dir: Option<PathBuf>,
+}
+
+fn file_resolution_and_size(path: &Path) -> String {
+    let size_label = match std::fs::metadata(path) {
+        Ok(meta) => {
+            let bytes = meta.len();
+            const KB: u64 = 1024;
+            const MB: u64 = KB * 1024;
+            const GB: u64 = MB * 1024;
+            if bytes >= GB {
+                format!("{:.2} GB", bytes as f64 / GB as f64)
+            } else if bytes >= MB {
+                format!("{:.2} MB", bytes as f64 / MB as f64)
+            } else if bytes >= KB {
+                format!("{:.2} KB", bytes as f64 / KB as f64)
+            } else {
+                format!("{} B", bytes)
+            }
+        }
+        Err(_) => "n/a".to_string(),
+    };
+    match image::image_dimensions(path) {
+        Ok((w, h)) => format!("{}x{} | {}", w, h, size_label),
+        Err(_) => size_label,
+    }
+}
+
+fn sift_info_line(sift_info_by_file: &HashMap<String, SiftInfo>, file_name: &str) -> String {
+    let Some(info) = sift_info_by_file.get(file_name) else {
+        return "SIFT: n/a".to_string();
+    };
+    if !valid_sift_link(info) {
+        return "SIFT: no valid link".to_string();
+    }
+    format!(
+        "SIFT: score {:.2}, inliers {}, ratio {:.2}",
+        info.score.unwrap_or(0.0),
+        info.inliers.unwrap_or(0),
+        info.inlier_ratio.unwrap_or(0.0)
+    )
+}
+
+fn get_system_disks() -> Vec<PathBuf> {
+    let mut disks = Vec::new();
+    let mut seen = HashSet::new();
+    
+    // 1. Root directory is always a disk
+    let root = PathBuf::from("/");
+    seen.insert(root.clone());
+    disks.push(root);
+    
+    // 2. Check for username to scan user-specific media directories
+    let usernames = vec![
+        std::env::var("USER").unwrap_or_default(),
+        std::env::var("USERNAME").unwrap_or_default(),
+        "lewis".to_string(), // explicit check for current user since it's standard
+    ];
+    
+    let mut scan_paths = vec![
+        PathBuf::from("/media"),
+        PathBuf::from("/mnt"),
+    ];
+    
+    for user in usernames {
+        if !user.is_empty() {
+            scan_paths.push(PathBuf::from(format!("/media/{}", user)));
+            scan_paths.push(PathBuf::from(format!("/run/media/{}", user)));
+        }
+    }
+    
+    // Add user home directory as a top-level shortcut
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        if home_path.is_dir() {
+            let canon = home_path.canonicalize().unwrap_or(home_path);
+            if seen.insert(canon.clone()) {
+                disks.push(canon);
+            }
+        }
+    }
+    
+    for path in scan_paths {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        let canon = entry_path.canonicalize().unwrap_or(entry_path);
+                        if seen.insert(canon.clone()) {
+                            disks.push(canon);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort so it is deterministic
+    disks.sort();
+    disks
+}
+
+fn is_path_ai_backed(path: &Path) -> bool {
+    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let db_roots = get_db_roots();
+    for root in db_roots.values() {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if canon_path.starts_with(&canon_root) {
+            return true;
+        }
+    }
+    false
 }
 
 impl ImageViewer {
-    fn new(path: PathBuf, rx: Receiver<PathBuf>, ctx_shared: Arc<Mutex<Option<egui::Context>>>) -> Self {
+    fn new(
+        path: PathBuf,
+        rx: Receiver<PathBuf>,
+        ctx_shared: Arc<Mutex<Option<egui::Context>>>,
+        start_on_home_page: bool,
+    ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
         let open_target = path.clone();
 
         let mut images = Vec::new();
-        let flat_loading = true;
+        let flat_loading = !start_on_home_page;
         let flat_images_shared = Arc::new(Mutex::new(None));
 
-        if path.is_dir() {
-            let shared = flat_images_shared.clone();
-            let parent_absolute = path.clone();
-            std::thread::spawn(move || {
-                let mut collected = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let p = entry.path();
-                        if p.is_file() {
-                            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                            if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg") {
-                                collected.push(p);
+        if !start_on_home_page {
+            if path.is_dir() {
+                let shared = flat_images_shared.clone();
+                let parent_absolute = path.clone();
+                std::thread::spawn(move || {
+                    let mut collected = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let p = entry.path();
+                            if p.is_file() {
+                                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg" |
+                                            "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg") {
+                                    collected.push(p);
+                                }
                             }
                         }
                     }
-                }
-                collected.sort();
-                if let Ok(mut lock) = shared.lock() {
-                    *lock = Some(collected);
-                }
-            });
-        } else {
-            images.push(path.clone());
-            let shared = flat_images_shared.clone();
-            let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let parent_absolute = parent.canonicalize().unwrap_or(parent);
-            std::thread::spawn(move || {
-                let mut collected = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let p = entry.path();
-                        if p.is_file() {
-                            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                            if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg") {
-                                collected.push(p);
+                    collected.sort();
+                    if let Ok(mut lock) = shared.lock() {
+                        *lock = Some(collected);
+                    }
+                });
+            } else {
+                images.push(path.clone());
+                let shared = flat_images_shared.clone();
+                let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                let parent_absolute = parent.canonicalize().unwrap_or(parent);
+                std::thread::spawn(move || {
+                    let mut collected = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let p = entry.path();
+                            if p.is_file() {
+                                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg" |
+                                            "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "mpg" | "mpeg") {
+                                    collected.push(p);
+                                }
                             }
                         }
                     }
-                }
-                collected.sort();
-                if let Ok(mut lock) = shared.lock() {
-                    *lock = Some(collected);
-                }
-            });
+                    collected.sort();
+                    if let Ok(mut lock) = shared.lock() {
+                        *lock = Some(collected);
+                    }
+                });
+            }
         }
 
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel::<(PathBuf, egui::ColorImage)>();
@@ -2241,15 +2487,16 @@ impl ImageViewer {
             thumbnail_active_threads: 0,
             
             // AI Explorer defaults
-            explore_mode: ExploreMode::Filesystem,
             db_loaded: false,
             db_loading: false,
+            db_failed: false,
             db_rx: None,
             db_indices: None,
             semantic_query: String::new(),
+            semantic_folder: String::new(),
             semantic_limit: 80,
             semantic_video_only: false,
-            semantic_mode: SearchMode::Clip,
+            semantic_mode: SearchMode::Filename,
             semantic_results: Vec::new(),
             semantic_status: "Ready. Enter a phrase and press Search.".to_string(),
             
@@ -2258,14 +2505,24 @@ impl ImageViewer {
             sift_pair_overlay: None,
             sift_running: false,
             sift_rx: None,
+
+            db_filename_by_path: HashMap::new(),
+            video_still_cache: std::cell::RefCell::new(HashMap::new()),
+            resolution_size_cache: std::cell::RefCell::new(HashMap::new()),
+            db_filename_cache: std::cell::RefCell::new(HashMap::new()),
+            show_home_page: start_on_home_page,
+            home_current_dir: None,
+            home_selected_dir: None,
         };
         
-        viewer.update_exif();
+        if !start_on_home_page {
+            viewer.update_exif();
+        }
         viewer
     }
 
     fn start_lazy_db_load(&mut self, ctx: &egui::Context) {
-        if self.db_loaded || self.db_loading {
+        if self.db_loaded || self.db_loading || self.db_failed {
             return;
         }
         self.db_loading = true;
@@ -2299,14 +2556,42 @@ impl ImageViewer {
 
                 let (db_data, encoder) = tokio::try_join!(db_fut, encoder_fut)?;
                 
+                let mut basename_to_db_filename = HashMap::new();
+                for entry in &db_data.clip_index.entries {
+                    if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| entry.file_name.to_string());
+                    }
+                }
+                for key in db_data.phash_master_by_file.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+                for key in db_data.similar_by_master.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+                for key in db_data.sift_info_by_file.keys() {
+                    if let Some(fname) = Path::new(key).file_name() {
+                        let base = fname.to_string_lossy().to_lowercase();
+                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
+                    }
+                }
+
                 Ok(DatabaseIndices {
                     clip_index: Arc::new(db_data.clip_index),
                     face_index: Arc::new(db_data.face_index),
                     ocr_index: Arc::new(db_data.ocr_index),
                     similar_by_master: db_data.similar_by_master,
+                    phash_master_by_file: db_data.phash_master_by_file,
                     sift_info_by_file: db_data.sift_info_by_file,
                     sift_root_by_file: db_data.sift_root_by_file,
                     sift_members_by_root: db_data.sift_members_by_root,
+                    basename_to_db_filename,
                     encoder,
                 })
             });
@@ -2336,6 +2621,7 @@ impl ImageViewer {
             }
             Ok(Err(err)) => {
                 self.db_loading = false;
+                self.db_failed = true;
                 self.semantic_status = format!("❌ AI DB Initialization failed: {err}");
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2343,38 +2629,223 @@ impl ImageViewer {
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.db_loading = false;
+                self.db_failed = true;
                 self.semantic_status = "❌ AI DB Loader thread disconnected unexpectedly.".to_string();
             }
         }
     }
 
     fn get_db_filename_from_path(&self, path: &Path) -> Option<String> {
-        let path_str = path.to_string_lossy().replace('\\', "/");
-        let phone_prefix = "/media/lewis/1b/Phone";
-        let telegram_prefix = "/media/lewis/1b/Telegram Backup";
-        if path_str.starts_with(phone_prefix) {
-            let rel = &path_str[phone_prefix.len()..];
-            let rel_clean = rel.trim_start_matches('/');
-            return Some(format!("phone/{}", rel_clean));
-        } else if path_str.starts_with(telegram_prefix) {
-            let rel = &path_str[telegram_prefix.len()..];
-            let rel_clean = rel.trim_start_matches('/');
-            return Some(format!("telegram_backup/{}", rel_clean));
+        let roots = get_db_roots();
+        
+        // Fast path 1: folder component substring match (extremely robust against mount path/canonicalize differences like /media vs /run/media)
+        for (col_id, _root_path) in &roots {
+            let folder_name = match col_id.as_str() {
+                "phone" => "Phone",
+                "telegram_backup" => "Telegram Backup",
+                _ => col_id.as_str(),
+            };
+            
+            let path_norm = path.to_string_lossy().replace('\\', "/");
+            let path_lower = path_norm.to_lowercase();
+            let match_str_lower = format!("/{}/", folder_name.to_lowercase());
+            if let Some(pos) = path_lower.find(&match_str_lower) {
+                let rel = &path_norm[pos + match_str_lower.len()..];
+                return Some(format!("{}/{}", col_id, rel));
+            }
         }
         
-        if let Ok(canon_path) = path.canonicalize() {
-            let canon_str = canon_path.to_string_lossy().replace('\\', "/");
-            if canon_str.starts_with(phone_prefix) {
-                let rel = &canon_str[phone_prefix.len()..];
-                let rel_clean = rel.trim_start_matches('/');
-                return Some(format!("phone/{}", rel_clean));
-            } else if canon_str.starts_with(telegram_prefix) {
-                let rel = &canon_str[telegram_prefix.len()..];
-                let rel_clean = rel.trim_start_matches('/');
-                return Some(format!("telegram_backup/{}", rel_clean));
+        // Fast path 2: try raw strip prefix first WITHOUT touching the disk or canonicalizing!
+        for (col_id, root_path) in &roots {
+            if let Ok(rel) = path.strip_prefix(root_path) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
+            }
+        }
+        
+        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        
+        // Primary: prefix-strip against known roots (canonicalized and raw)
+        for (col_id, root_path) in &roots {
+            let root_canon = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
+            if let Ok(rel) = canon_path.strip_prefix(&root_canon) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
+            }
+            if let Ok(rel) = path.strip_prefix(root_path) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
+            }
+        }
+        
+        // Secondary: substring matching (handles trailing-slash edge cases)
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        for (col_id, root_path) in &roots {
+            let root_str = root_path.to_string_lossy().replace('\\', "/");
+            if path_str.starts_with(&root_str) {
+                let rel = &path_str[root_str.len()..];
+                return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
+            }
+            if let Ok(root_canon) = root_path.canonicalize() {
+                let root_canon_str = root_canon.to_string_lossy().replace('\\', "/");
+                if path_str.starts_with(&root_canon_str) {
+                    let rel = &path_str[root_canon_str.len()..];
+                    return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
+                }
+            }
+        }
+
+        // Tertiary: basename lookup in loaded index.
+        // Handles images opened from arbitrary folders (e.g. pHash similar previews)
+        // that still exist in the DB under a different root path.
+        if let Some(indices) = &self.db_indices {
+            if let Some(fname) = path.file_name() {
+                let base = fname.to_string_lossy().to_lowercase();
+                if let Some(resolved) = indices.basename_to_db_filename.get(&base) {
+                    return Some(resolved.clone());
+                }
             }
         }
         None
+    }
+
+    /// Look up the database filename for a given filesystem path.
+    /// Checks the cached `db_filename_by_path` map first (populated from AI search results),
+    /// then falls back to the path-prefix heuristic in `get_db_filename_from_path`.
+    fn resolve_db_filename(&self, path: &Path) -> Option<String> {
+        // Fast path 1: exact match from AI search results (handles video stills, etc.)
+        if let Some(name) = self.db_filename_by_path.get(path) {
+            return Some(name.clone());
+        }
+        if let Some(name) = db_filename_from_video_still_path(path) {
+            return Some(name);
+        }
+        // Fast path 2: Check the cache to avoid synchronous disk canonicalization and linear scans
+        if let Some(cached) = self.db_filename_cache.borrow().get(path) {
+            return cached.clone();
+        }
+        // Fallback: derive from filesystem path vs collection roots
+        let resolved = self.get_db_filename_from_path(path);
+        // Cache the result (even if None) to avoid repeating this heavy calculation
+        self.db_filename_cache.borrow_mut().insert(path.to_path_buf(), resolved.clone());
+        resolved
+    }
+
+    fn resolve_actual_path(&self, path: &Path) -> PathBuf {
+        if let Some(db_name) = self.resolve_db_filename(path) {
+            let roots = get_db_roots();
+            if let Ok(src_path) = resolve_source_path(&roots, &db_name) {
+                return src_path;
+            }
+        }
+        path.to_path_buf()
+    }
+
+    fn get_thumbnail_path(&self, path: &Path) -> PathBuf {
+        if is_video_path(path) {
+            // Check cache first to avoid synchronous disk I/O on UI thread
+            if let Some(cached) = self.video_still_cache.borrow().get(path) {
+                return cached.clone();
+            }
+
+            if let Some(file_name) = self.resolve_db_filename(path) {
+                let db_dir = Path::new("/media/lewis/1b/lancedb");
+                let db_roots = get_db_roots();
+                if let Some((collection, rel)) = file_name.split_once('/') {
+                    if let Some(root) = db_roots.get(collection) {
+                        let rel_path = Path::new(rel);
+                        if let Ok(Some(still)) = resolve_video_still(root, db_dir, rel_path, 0.0) {
+                            self.video_still_cache.borrow_mut().insert(path.to_path_buf(), still.clone());
+                            return still;
+                        }
+                    }
+                }
+            }
+        }
+        path.to_path_buf()
+    }
+    fn get_file_resolution_and_size(&self, path: &Path) -> String {
+        if let Some(cached) = self.resolution_size_cache.borrow().get(path) {
+            return cached.clone();
+        }
+        let result = file_resolution_and_size(path);
+        self.resolution_size_cache.borrow_mut().insert(path.to_path_buf(), result.clone());
+        result
+    }
+
+
+    fn draw_thumbnail_async(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        side_thumb: f32,
+    ) {
+        let resolved_path = self.get_thumbnail_path(path);
+        if let Some(texture) = self.thumbnail_textures.get(&resolved_path) {
+            ui.add(
+                egui::Image::from_texture(texture)
+                    .max_size(egui::vec2(side_thumb, side_thumb))
+                    .maintain_aspect_ratio(true)
+            );
+        } else if self.thumbnail_failed.contains(&resolved_path) {
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(side_thumb, side_thumb),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_gray(30),
+            );
+            let text = if is_video_path(path) { "📹 Video" } else { "⚠️ Error" };
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(10.0),
+                egui::Color32::GRAY,
+            );
+        } else {
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(side_thumb, side_thumb),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_gray(40),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⏳ Loading",
+                egui::FontId::proportional(10.0),
+                egui::Color32::GRAY,
+            );
+            
+            let max_threads = num_cpus::get().max(4);
+            if !self.thumbnail_loading.contains(&resolved_path) && self.thumbnail_active_threads < max_threads {
+                self.thumbnail_loading.insert(resolved_path.to_path_buf());
+                self.thumbnail_active_threads += 1;
+                let path_clone = resolved_path.to_path_buf();
+                let tx_clone = self.thumbnail_tx.clone();
+                let ctx_clone = ui.ctx().clone();
+                rayon::spawn(move || {
+                    if let Ok(img) = image::open(&path_clone) {
+                        let thumb = img.thumbnail(128, 128);
+                        let size = [thumb.width() as usize, thumb.height() as usize];
+                        let pixels = thumb.to_rgba8().into_raw();
+                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                        let _ = tx_clone.send((path_clone, color_img));
+                        ctx_clone.request_repaint();
+                    } else {
+                        let empty_img = egui::ColorImage::new([0, 0], Vec::new());
+                        let _ = tx_clone.send((path_clone, empty_img));
+                        ctx_clone.request_repaint();
+                    }
+                });
+            }
+        }
     }
 
     fn grouped_master_for(&self, file_name: &str, is_video: bool) -> String {
@@ -2393,6 +2864,7 @@ impl ImageViewer {
 
     fn search_now(&mut self) {
         match self.semantic_mode {
+            SearchMode::Filename => {}
             SearchMode::Clip => self.search_clip_now(),
             SearchMode::Ocr => self.search_ocr_now(),
         }
@@ -2428,7 +2900,7 @@ impl ImageViewer {
         }
 
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, self.semantic_video_only);
+        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, self.semantic_video_only, &self.semantic_folder);
         if !self.semantic_video_only {
             results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         } else {
@@ -2439,6 +2911,9 @@ impl ImageViewer {
         let db_dir = Path::new("/media/lewis/1b/lancedb");
         for row in &mut results {
             row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+            if let Some(path) = &row.media_path {
+                self.db_filename_by_path.insert(path.clone(), row.file_name.clone());
+            }
         }
 
         let took = started.elapsed().as_millis();
@@ -2464,7 +2939,7 @@ impl ImageViewer {
 
         let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_ocr_index(&indices.ocr_index, &q, pre_limit, self.semantic_video_only);
+        let mut results = search_ocr_index(&indices.ocr_index, &q, pre_limit, self.semantic_video_only, &self.semantic_folder);
         if !self.semantic_video_only {
             results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         } else {
@@ -2475,6 +2950,9 @@ impl ImageViewer {
         let db_dir = Path::new("/media/lewis/1b/lancedb");
         for row in &mut results {
             row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+            if let Some(path) = &row.media_path {
+                self.db_filename_by_path.insert(path.clone(), row.file_name.clone());
+            }
         }
 
         let took = started.elapsed().as_millis();
@@ -2722,15 +3200,38 @@ impl ImageViewer {
         }
     }
 
+    fn current_folder_has_db_mappings(&self) -> bool {
+        let roots = get_db_roots();
+        let start_dir = if self.open_target.is_dir() {
+            self.open_target.clone()
+        } else {
+            self.open_target.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        };
+        if let Ok(canon_start) = start_dir.canonicalize() {
+            for col_path in roots.values() {
+                if let Ok(col_canon) = col_path.canonicalize() {
+                    if canon_start.starts_with(&col_canon) || col_canon.starts_with(&canon_start) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        struct GalleryItem {
+            path: PathBuf,
+            is_video: bool,
+            score_label: Option<String>,
+            timestamp_sec: f32,
+            db_filename: Option<String>,
+        }
+
         ui.vertical(|ui| {
-            // Top Tab switcher
+            // Title and Close
             ui.horizontal(|ui| {
-                let fs_text = egui::RichText::new("🖼 Filesystem Gallery").strong();
-                let ai_text = egui::RichText::new("🔍 AI Explorer").strong();
-                ui.selectable_value(&mut self.explore_mode, ExploreMode::Filesystem, fs_text);
-                ui.selectable_value(&mut self.explore_mode, ExploreMode::Semantic, ai_text);
-                
+                ui.heading("🖼 Folder Gallery & AI Explorer");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❌ Close Gallery [G]").clicked() {
                         self.show_grid = false;
@@ -2741,174 +3242,446 @@ impl ImageViewer {
             ui.separator();
             ui.add_space(8.0);
             
-            match self.explore_mode {
-                ExploreMode::Filesystem => {
-                    // Original filesystem view
-                    ui.horizontal(|ui| {
-                        ui.heading("Local filesystem directory scan");
-                        ui.add_space(12.0);
-                        ui.label("Filter:");
-                        ui.add(egui::TextEdit::singleline(&mut self.grid_filter)
-                            .hint_text("🔍 Filter by filename...")
-                            .desired_width(200.0));
-                        ui.add_space(12.0);
-                        if self.grid_loading {
-                            ui.add(egui::Spinner::new().size(16.0));
-                            ui.weak("Scanning subdirectories...");
-                        } else {
-                            ui.weak(format!("{} images found", self.recursive_images.len()));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("🔄 Refresh").clicked() {
-                                self.start_recursive_scan();
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
+            // Dynamic Database Mapping Check & Auto Lazy Load
+            let has_db = self.current_folder_has_db_mappings();
+            if (self.semantic_mode == SearchMode::Clip || self.semantic_mode == SearchMode::Ocr) && !self.db_loaded && !self.db_loading {
+                self.start_lazy_db_load(ctx);
+            }
+
+            // Toolbar Controls
+            ui.horizontal(|ui| {
+                ui.label("Search Mode:");
+                ui.selectable_value(&mut self.semantic_mode, SearchMode::Filename, "📁 Filename");
+                
+                ui.add_enabled_ui(has_db, |ui| {
+                    let clip_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "🔍 AI Description");
+                    if !has_db {
+                        clip_btn.on_hover_text("AI Search is only available for Phone or Telegram Backup folders.");
+                    }
+                    let ocr_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "📝 OCR Text");
+                    if !has_db {
+                        ocr_btn.on_hover_text("OCR Search is only available for Phone or Telegram Backup folders.");
+                    }
+                });
+                
+                ui.add_space(12.0);
+                ui.checkbox(&mut self.semantic_video_only, "📹 Videos only");
+                
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🔄 Refresh").clicked() {
+                        self.start_recursive_scan();
+                    }
+                });
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                let hint = match self.semantic_mode {
+                    SearchMode::Filename => "🔍 Filter by filename...",
+                    SearchMode::Clip => "Describe the photo (e.g. 'a cat laying on a keyboard')",
+                    SearchMode::Ocr => "Type word/text found inside the image",
+                };
+
+                if self.semantic_mode == SearchMode::Filename {
+                    ui.label("Filter:");
+                    ui.add(egui::TextEdit::singleline(&mut self.grid_filter)
+                        .hint_text(hint)
+                        .desired_width(280.0));
+                } else {
+                    ui.label("Query:");
+                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.semantic_query)
+                        .hint_text(hint)
+                        .desired_width(280.0));
+                    let enter_pressed = search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     
-                    let filter = self.grid_filter.to_lowercase();
-                    let filtered_images: Vec<&PathBuf> = self.recursive_images.iter()
-                        .filter(|p| {
-                            if filter.is_empty() {
-                                true
-                            } else {
-                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                name.contains(&filter)
-                            }
-                        })
-                        .collect();
+                    ui.add_space(8.0);
+                    ui.add(egui::Slider::new(&mut self.semantic_limit, 1..=500).text("Limit"));
+                    
+                    ui.add_space(8.0);
+                    if ui.button("🔍 Search").clicked() || enter_pressed {
+                        let start_dir = if self.open_target.is_dir() {
+                            self.open_target.clone()
+                        } else {
+                            self.open_target.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+                        };
+                        self.semantic_folder = start_dir.to_string_lossy().to_string();
                         
+                        if !self.db_loaded {
+                            self.start_lazy_db_load(ctx);
+                        } else {
+                            self.search_now();
+                        }
+                    }
+                }
+            });
+            ui.add_space(8.0);
+
+            // Real-time Filename Filtering
+            let filter = self.grid_filter.to_lowercase();
+            let filtered_images: Vec<usize> = self.recursive_images.iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    if self.semantic_video_only && !is_video_path(p) {
+                        return false;
+                    }
+                    if self.semantic_mode == SearchMode::Filename && !filter.is_empty() {
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                        name.contains(&filter)
+                    } else {
+                        true
+                    }
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+
+            let is_active_semantic_search = match self.semantic_mode {
+                SearchMode::Filename => false,
+                SearchMode::Clip | SearchMode::Ocr => !self.semantic_query.trim().is_empty(),
+            };
+
+            // Status message label
+            ui.horizontal(|ui| {
+                if is_active_semantic_search {
+                    ui.weak(&self.semantic_status);
+                } else if self.grid_loading {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.weak("Scanning subdirectories...");
+                } else {
+                    let label = if self.semantic_video_only { "videos" } else { "items" };
+                    ui.weak(format!("{} {} found in this folder", filtered_images.len(), label));
+                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            if self.db_loading && is_active_semantic_search {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add(egui::Spinner::new().size(36.0));
+                        ui.add_space(16.0);
+                        ui.heading("Lazy-loading AI Database Models & ONNX session...");
+                        ui.weak("Initializing standard text encoders and reading index maps. This happens fully in the background.");
+                    });
+                });
+            } else {
+                // Populate unified Gallery Items (only if active semantic search is active)
+                let mut gallery_items: Vec<GalleryItem> = Vec::new();
+                if is_active_semantic_search {
+                    for item in &self.semantic_results {
+                        if let Some(path) = &item.media_path {
+                            gallery_items.push(GalleryItem {
+                                path: path.clone(),
+                                is_video: item.is_video,
+                                score_label: Some(match self.semantic_mode {
+                                    SearchMode::Clip => format!("{:.0}% Match", (item.score * 100.0).clamp(0.0, 100.0)),
+                                    SearchMode::Ocr => "📝 OCR Match".to_string(),
+                                    _ => String::new(),
+                                }),
+                                timestamp_sec: item.timestamp_sec,
+                                db_filename: Some(item.file_name.clone()),
+                            });
+                        }
+                    }
+                }
+
+                let num_items = if is_active_semantic_search {
+                    gallery_items.len()
+                } else {
+                    filtered_images.len()
+                };
+
+                if num_items == 0 {
+                    ui.centered_and_justified(|ui| {
+                        if self.grid_loading {
+                            ui.weak("Scanning files, please wait...");
+                        } else {
+                            ui.weak("No files found matching filter or query.");
+                        }
+                    });
+                } else {
+                    let available_width = ui.available_width() - 16.0;
+                    let col_width = 130.0 + 12.0;
+                    let cols = (available_width / col_width).floor().max(1.0) as usize;
+                    let num_rows = (num_items + cols - 1) / cols;
+
+                    let row_height = 160.0 + 12.0;
+
                     let mut clicked_path = None;
                     let mut single_clicked_path = None;
-                    
-                    if filtered_images.is_empty() {
-                        ui.centered_and_justified(|ui| {
-                            if self.grid_loading {
-                                ui.weak("Scanning files, please wait...");
-                            } else {
-                                ui.weak("No images found matching filter.");
-                            }
-                        });
-                    } else {
-                        let available_width = ui.available_width() - 16.0;
-                        let col_width = 130.0 + 12.0;
-                        let cols = (available_width / col_width).floor().max(1.0) as usize;
-                        let rows: Vec<&[&PathBuf]> = filtered_images.chunks(cols).collect();
+                    let mut clicked_similar = None;
+                    let mut clicked_person = None;
 
-                        let row_height = 150.0 + 12.0;
-                        let num_rows = rows.len();
-
-                        egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
-                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                            for row_idx in row_range {
-                                let row_images = rows[row_idx];
-                                ui.horizontal(|ui| {
-                                    for path in row_images {
-                                        let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
-                                            curr_p == *path
-                                        } else {
-                                            false
+                    egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
+                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                        for row_idx in row_range {
+                            ui.horizontal(|ui| {
+                                let start_idx = row_idx * cols;
+                                let end_idx = (start_idx + cols).min(num_items);
+                                for item_idx in start_idx..end_idx {
+                                    let temp_item;
+                                    let item = if is_active_semantic_search {
+                                        &gallery_items[item_idx]
+                                    } else {
+                                        let global_idx = filtered_images[item_idx];
+                                        let p = &self.recursive_images[global_idx];
+                                        let is_vid = is_video_path(p);
+                                        let db_name = self.resolve_db_filename(p);
+                                        temp_item = GalleryItem {
+                                            path: p.clone(),
+                                            is_video: is_vid,
+                                            score_label: None,
+                                            timestamp_sec: 0.0,
+                                            db_filename: db_name,
                                         };
-                                        
-                                        let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 150.0), egui::Sense::click());
-                                        let is_hovered = response.hovered();
-                                        let is_clicked = response.clicked();
-                                        
-                                        let card_bg = if is_clicked {
-                                            ui.visuals().selection.bg_fill.gamma_multiply(0.3)
-                                        } else if is_hovered {
-                                            ui.visuals().code_bg_color.gamma_multiply(1.5)
-                                        } else if is_current {
-                                            ui.visuals().selection.bg_fill.gamma_multiply(0.15)
-                                        } else {
-                                            ui.visuals().code_bg_color
-                                        };
-                                        
-                                        let card_stroke = if is_current {
-                                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-                                        } else if is_hovered {
-                                            egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
-                                        } else {
-                                            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
-                                        };
-                                        
-                                        let builder = egui::UiBuilder::new()
-                                            .max_rect(rect)
-                                            .layout(egui::Layout::top_down(egui::Align::Center))
-                                            .id_salt(*path);
-                                        let mut child_ui = ui.new_child(builder);
-                                        egui::Frame::NONE
-                                            .fill(card_bg)
-                                            .stroke(card_stroke)
-                                            .inner_margin(8.0)
-                                            .corner_radius(6.0)
-                                            .show(&mut child_ui, |ui| {
-                                                ui.vertical_centered(|ui| {
-                                                    if let Some(texture) = self.thumbnail_textures.get(*path) {
-                                                        ui.add(
-                                                            egui::Image::from_texture(texture)
-                                                                .max_size(egui::vec2(110.0, 110.0))
-                                                                .maintain_aspect_ratio(true)
-                                                        );
-                                                    } else if self.thumbnail_failed.contains(*path) {
-                                                        ui.vertical_centered(|ui| {
-                                                            ui.add_space(40.0);
-                                                            ui.weak("⚠️ Failed");
-                                                            ui.add_space(40.0);
-                                                        });
-                                                    } else {
-                                                        ui.vertical_centered(|ui| {
-                                                            ui.add_space(45.0);
-                                                            ui.add(egui::Spinner::new().size(20.0));
-                                                            ui.add_space(45.0);
-                                                        });
-                                                        
-                                                        if !self.thumbnail_loading.contains(*path) && self.thumbnail_active_threads < 4 {
-                                                            self.thumbnail_loading.insert((*path).clone());
-                                                            self.thumbnail_active_threads += 1;
-                                                            let path_clone = (*path).clone();
-                                                            let tx_clone = self.thumbnail_tx.clone();
-                                                            let ctx_clone = ui.ctx().clone();
-                                                            std::thread::spawn(move || {
-                                                                if let Ok(img) = image::open(&path_clone) {
-                                                                    let thumb = img.thumbnail(128, 128);
-                                                                    let size = [thumb.width() as usize, thumb.height() as usize];
-                                                                    let pixels = thumb.to_rgba8().into_raw();
-                                                                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                                                    let _ = tx_clone.send((path_clone, color_img));
-                                                                    ctx_clone.request_repaint();
-                                                                } else {
-                                                                    let empty_img = egui::ColorImage::new([0, 0], Vec::new());
-                                                                    let _ = tx_clone.send((path_clone, empty_img));
-                                                                    ctx_clone.request_repaint();
-                                                                }
-                                                            });
-                                                        }
-                                                    }
-                                                    
-                                                    ui.add_space(6.0);
-                                                    
-                                                    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                                    let label_text = egui::RichText::new(filename)
-                                                        .size(11.0)
-                                                        .line_height(Some(13.0));
-                                                    ui.add(egui::Label::new(label_text).truncate());
-                                                });
-                                            });
-                                            
-                                        if response.double_clicked() {
-                                            clicked_path = Some((*path).clone());
-                                        } else if response.clicked() {
-                                            single_clicked_path = Some((*path).clone());
+                                        &temp_item
+                                    };
+                                    let path = &item.path;
+                                    let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
+                                        curr_p == path
+                                    } else {
+                                        false
+                                    };
+                                    
+                                    let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 160.0), egui::Sense::click());
+                                    
+                                    response.context_menu(|ui| {
+                                        if ui.button("📂 Open parent folder").clicked() {
+                                            let actual_path = self.resolve_actual_path(path);
+                                            open_in_dolphin_or_fallback(&actual_path);
+                                            ui.close();
                                         }
+                                        if ui.button("📋 Copy image").clicked() {
+                                            let path_clone = path.clone();
+                                            let ctx = ui.ctx().clone();
+                                            std::thread::spawn(move || {
+                                                if let Ok(img) = image::open(&path_clone) {
+                                                    let rgba = img.to_rgba8();
+                                                    let (width, height) = rgba.dimensions();
+                                                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                                                        [width as usize, height as usize],
+                                                        rgba.as_raw(),
+                                                    );
+                                                    ctx.copy_image(color);
+                                                }
+                                            });
+                                            ui.close();
+                                        }
+                                        if ui.button("📋 Copy full path").clicked() {
+                                            ui.ctx().copy_text(path.to_string_lossy().to_string());
+                                            ui.close();
+                                        }
+                                        if item.is_video {
+                                            if ui.button("🎬 Open in mpv").clicked() {
+                                                let _ = std::process::Command::new("mpv")
+                                                    .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
+                                                    .arg(path)
+                                                    .spawn();
+                                                ui.close();
+                                            }
+                                        }
+                                        if let Some(db_name) = &item.db_filename {
+                                            ui.separator();
+                                            if ui.button("🔍 Show most similar").clicked() {
+                                                let sr = SearchResult {
+                                                    rank: 0,
+                                                    score: 1.0,
+                                                    file_name: db_name.clone(),
+                                                    is_video: item.is_video,
+                                                    timestamp_sec: item.timestamp_sec,
+                                                    media_path: Some(path.clone()),
+                                                };
+                                                clicked_similar = Some(sr);
+                                                ui.close();
+                                            }
+                                            if ui.button("👥 Show more of this person").clicked() {
+                                                clicked_person = Some(db_name.clone());
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+
+                                    let is_hovered = response.hovered();
+                                    let is_clicked = response.clicked();
+                                    
+                                    let card_bg = if is_clicked {
+                                        ui.visuals().selection.bg_fill.gamma_multiply(0.3)
+                                    } else if is_hovered {
+                                        ui.visuals().code_bg_color.gamma_multiply(1.5)
+                                    } else if is_current {
+                                        ui.visuals().selection.bg_fill.gamma_multiply(0.15)
+                                    } else {
+                                        ui.visuals().code_bg_color
+                                    };
+                                    
+                                    let card_stroke = if is_current {
+                                        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+                                    } else if is_hovered {
+                                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
+                                    } else {
+                                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
+                                    };
+                                    
+                                    let builder = egui::UiBuilder::new()
+                                        .max_rect(rect)
+                                        .id_salt(path);
+                                    let mut child_ui = ui.new_child(builder);
+                                    egui::Frame::NONE
+                                        .fill(card_bg)
+                                        .stroke(card_stroke)
+                                        .inner_margin(0.0)
+                                        .corner_radius(6.0)
+                                        .show(&mut child_ui, |ui| {
+                                            let resolved_path = self.get_thumbnail_path(path);
+                                            if let Some(texture) = self.thumbnail_textures.get(&resolved_path) {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.add(
+                                                        egui::Image::from_texture(texture)
+                                                            .max_size(egui::vec2(130.0, 160.0))
+                                                            .maintain_aspect_ratio(false)
+                                                    );
+                                                });
+                                            } else if self.thumbnail_failed.contains(&resolved_path) {
+                                                ui.vertical_centered(|ui| {
+                                                    ui.add_space(55.0);
+                                                    if is_video_path(path) {
+                                                        ui.weak("📹 Video");
+                                                    } else {
+                                                        ui.weak("⚠️ Failed");
+                                                    }
+                                                });
+                                            } else {
+                                                ui.vertical_centered(|ui| {
+                                                    ui.add_space(60.0);
+                                                    ui.add(egui::Spinner::new().size(20.0));
+                                                });
+                                                
+                                                let max_threads = num_cpus::get().max(4);
+                                                if !self.thumbnail_loading.contains(&resolved_path) && self.thumbnail_active_threads < max_threads {
+                                                    self.thumbnail_loading.insert(resolved_path.clone());
+                                                    self.thumbnail_active_threads += 1;
+                                                    let path_clone = resolved_path.clone();
+                                                    let tx_clone = self.thumbnail_tx.clone();
+                                                    let ctx_clone = ui.ctx().clone();
+                                                    rayon::spawn(move || {
+                                                        if let Ok(img) = image::open(&path_clone) {
+                                                            let thumb = img.resize_to_fill(260, 320, image::imageops::FilterType::Triangle);
+                                                            let size = [thumb.width() as usize, thumb.height() as usize];
+                                                            let pixels = thumb.to_rgba8().into_raw();
+                                                            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                            let _ = tx_clone.send((path_clone, color_img));
+                                                            ctx_clone.request_repaint();
+                                                        } else {
+                                                            let empty_img = egui::ColorImage::new([0, 0], Vec::new());
+                                                            let _ = tx_clone.send((path_clone, empty_img));
+                                                            ctx_clone.request_repaint();
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        });
+
+                                    // Overlay 1: Filename banner at the bottom (semi-transparent black with rounded bottom corners)
+                                    let banner_rect = egui::Rect::from_min_max(
+                                        egui::pos2(rect.min.x, rect.max.y - 24.0),
+                                        rect.max
+                                    );
+                                    let banner_rounding = egui::CornerRadius {
+                                        nw: 0,
+                                        ne: 0,
+                                        sw: 6,
+                                        se: 6,
+                                    };
+                                    ui.painter().rect_filled(banner_rect, banner_rounding, egui::Color32::from_black_alpha(180));
+
+                                    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(banner_rect.shrink2(egui::vec2(6.0, 2.0))), |ui| {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.add(egui::Label::new(
+                                                egui::RichText::new(filename)
+                                                    .size(9.0)
+                                                    .color(egui::Color32::WHITE)
+                                            ).truncate());
+                                        });
+                                    });
+
+                                    // Overlay 2: Score / Match Badge pill overlay in the top-left
+                                    if let Some(lbl) = &item.score_label {
+                                        let badge_rect = egui::Rect::from_min_max(
+                                            egui::pos2(rect.min.x + 6.0, rect.min.y + 6.0),
+                                            egui::pos2(rect.min.x + 66.0, rect.min.y + 22.0)
+                                        );
+                                        let badge_bg = if lbl.contains("Match") && !lbl.contains("OCR") {
+                                            egui::Color32::from_rgb(16, 124, 65).gamma_multiply(0.85)
+                                        } else {
+                                            egui::Color32::from_rgb(0, 90, 158).gamma_multiply(0.85)
+                                        };
+                                        ui.painter().rect_filled(badge_rect, 4.0, badge_bg);
+                                        
+                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(badge_rect.shrink2(egui::vec2(4.0, 1.0))), |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(lbl)
+                                                        .size(8.0)
+                                                        .color(egui::Color32::WHITE)
+                                                        .strong()
+                                                );
+                                            });
+                                        });
                                     }
-                                });
-                            }
-                        });
-                    }
+
+                                    // Overlay 3: Video Indicator badge with timestamp in the top-right
+                                    if item.is_video {
+                                        let badge_text = if item.timestamp_sec > 0.0 {
+                                            let ts_mins = (item.timestamp_sec / 60.0).floor() as i32;
+                                            let ts_secs = (item.timestamp_sec % 60.0).floor() as i32;
+                                            format!("📹 {:02}:{:02}", ts_mins, ts_secs)
+                                        } else {
+                                            "📹 Video".to_string()
+                                        };
+                                        
+                                        let badge_rect = egui::Rect::from_min_max(
+                                            egui::pos2(rect.max.x - 66.0, rect.min.y + 6.0),
+                                            egui::pos2(rect.max.x - 6.0, rect.min.y + 22.0)
+                                        );
+                                        ui.painter().rect_filled(badge_rect, 4.0, egui::Color32::from_black_alpha(160));
+                                        
+                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(badge_rect.shrink2(egui::vec2(4.0, 1.0))), |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(badge_text)
+                                                        .size(8.0)
+                                                        .color(egui::Color32::WHITE)
+                                                );
+                                            });
+                                        });
+                                    }
+                                        
+                                    if response.double_clicked() {
+                                        clicked_path = Some(path.clone());
+                                    } else if response.clicked() {
+                                        single_clicked_path = Some(path.clone());
+                                    }
+                                }
+                            });
+                        }
+                    });
                     
                     if let Some(path) = clicked_path {
-                        self.images = self.recursive_images.clone();
+                        let active_paths: Vec<PathBuf> = if is_active_semantic_search {
+                            for item in &gallery_items {
+                                if let Some(db_name) = &item.db_filename {
+                                    self.db_filename_by_path.insert(item.path.clone(), db_name.clone());
+                                }
+                            }
+                            gallery_items.iter().map(|item| item.path.clone()).collect()
+                        } else {
+                            if let Some(db_name) = self.resolve_db_filename(&path) {
+                                self.db_filename_by_path.insert(path.clone(), db_name);
+                            }
+                            filtered_images.iter().map(|&idx| self.recursive_images[idx].clone()).collect()
+                        };
+                        self.images = active_paths;
                         self.current_index = self.images.iter().position(|p| p == &path).unwrap_or(0);
                         self.show_grid = false;
                         self.back_target_is_gallery = true;
@@ -2919,8 +3692,21 @@ impl ImageViewer {
                     }
                     
                     if let Some(path) = single_clicked_path {
-                        if let Some(pos) = self.recursive_images.iter().position(|p| p == &path) {
-                            self.images = self.recursive_images.clone();
+                        let active_paths: Vec<PathBuf> = if is_active_semantic_search {
+                            for item in &gallery_items {
+                                if let Some(db_name) = &item.db_filename {
+                                    self.db_filename_by_path.insert(item.path.clone(), db_name.clone());
+                                }
+                            }
+                            gallery_items.iter().map(|item| item.path.clone()).collect()
+                        } else {
+                            if let Some(db_name) = self.resolve_db_filename(&path) {
+                                self.db_filename_by_path.insert(path.clone(), db_name);
+                            }
+                            filtered_images.iter().map(|&idx| self.recursive_images[idx].clone()).collect()
+                        };
+                        if let Some(pos) = active_paths.iter().position(|p| p == &path) {
+                            self.images = active_paths;
                             self.current_index = pos;
                             self.update_exif();
                             self.show_exif = true;
@@ -2928,293 +3714,15 @@ impl ImageViewer {
                             ui.ctx().request_repaint();
                         }
                     }
-                }
-                
-                ExploreMode::Semantic => {
-                    // Semantic Explorer View
-                    if !self.db_loaded {
-                        self.start_lazy_db_load(ctx);
-                        ui.centered_and_justified(|ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add(egui::Spinner::new().size(36.0));
-                                ui.add_space(16.0);
-                                ui.heading("Lazy-loading AI Database Models & ONNX session...");
-                                ui.weak("Initializing standard text encoders and reading index maps. This happens fully in the background.");
-                            });
-                        });
-                    } else {
-                        // DB Loaded! Render AI Search Bar Controls
-                        ui.horizontal(|ui| {
-                            ui.heading("🔍 AI Explorer");
-                            ui.add_space(16.0);
-                            
-                            // Mode switches
-                            ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "🔍 AI Search");
-                            ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "📝 OCR Search");
-                            ui.add_space(8.0);
-                            
-                            // Query input text box
-                            let hint = match self.semantic_mode {
-                                SearchMode::Clip => "Describe the photo (e.g., 'a cat laying on a keyboard')",
-                                SearchMode::Ocr => "Type word/text found inside the image",
-                            };
-                            let search_resp = ui.add(egui::TextEdit::singleline(&mut self.semantic_query)
-                                .hint_text(hint)
-                                .desired_width(320.0));
-                            let enter_pressed = search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            
-                            ui.add_space(8.0);
-                            ui.add(egui::Slider::new(&mut self.semantic_limit, 1..=500).text("Limit"));
-                            ui.checkbox(&mut self.semantic_video_only, "Videos only");
-                            
-                            if ui.button("🔍 Search").clicked() || enter_pressed {
-                                self.search_now();
-                            }
-                        });
-                        ui.add_space(6.0);
-                        
-                        // Status line with a nice look
-                        ui.horizontal(|ui| {
-                            ui.weak(&self.semantic_status);
-                        });
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        
-                        if self.semantic_results.is_empty() {
-                            ui.centered_and_justified(|ui| {
-                                ui.weak("No results found. Type a description and click Search!");
-                            });
-                        } else {
-                            let available_width = ui.available_width() - 16.0;
-                            let col_width = 130.0 + 12.0;
-                            let cols = (available_width / col_width).floor().max(1.0) as usize;
-                            
-                            let mut clicked_result_idx = None;
-                            let mut single_clicked_result_idx = None;
-                            let mut clicked_similar = None;
-                            let mut clicked_person = None;
-                            
-                            // Chunk row results
-                            let rows: Vec<&[SearchResult]> = self.semantic_results.chunks(cols).collect();
-                            let row_height = 160.0 + 12.0;
-                            let num_rows = rows.len();
-                            
-                            egui::ScrollArea::vertical().id_salt("semantic_gallery_scroll").show_rows(ui, row_height, num_rows, |ui, row_range| {
-                                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                                for row_idx in row_range {
-                                    let row_items = rows[row_idx];
-                                    ui.horizontal(|ui| {
-                                        for item in row_items {
-                                            let Some(path) = &item.media_path else {
-                                                continue;
-                                            };
-                                            
-                                            let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
-                                                curr_p == path
-                                            } else {
-                                                false
-                                            };
-                                            
-                                            let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 160.0), egui::Sense::click());
-                                            response.context_menu(|ui| {
-                                                if ui.button("📂 Open parent folder").clicked() {
-                                                    if let Some(parent) = path.parent() {
-                                                        let _ = std::process::Command::new("xdg-open")
-                                                            .arg(parent)
-                                                            .spawn();
-                                                    }
-                                                    ui.close();
-                                                }
-                                                if ui.button("📋 Copy image").clicked() {
-                                                    let path_clone = path.clone();
-                                                    let ctx = ui.ctx().clone();
-                                                    std::thread::spawn(move || {
-                                                        if let Ok(img) = image::open(&path_clone) {
-                                                            let rgba = img.to_rgba8();
-                                                            let (width, height) = rgba.dimensions();
-                                                            let color = egui::ColorImage::from_rgba_unmultiplied(
-                                                                [width as usize, height as usize],
-                                                                rgba.as_raw(),
-                                                            );
-                                                            ctx.copy_image(color);
-                                                        }
-                                                    });
-                                                    ui.close();
-                                                }
-                                                if ui.button("📋 Copy full path").clicked() {
-                                                    ui.ctx().copy_text(path.to_string_lossy().to_string());
-                                                    ui.close();
-                                                }
-                                                if item.is_video {
-                                                    if ui.button("🎬 Open in mpv").clicked() {
-                                                        let _ = std::process::Command::new("mpv")
-                                                            .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
-                                                            .arg(path)
-                                                            .spawn();
-                                                        ui.close();
-                                                    }
-                                                }
-                                                ui.separator();
-                                                if ui.button("🔍 Show most similar").clicked() {
-                                                    clicked_similar = Some(item.clone());
-                                                    ui.close();
-                                                }
-                                                if ui.button("👥 Show more of this person").clicked() {
-                                                    clicked_person = Some(item.file_name.clone());
-                                                    ui.close();
-                                                }
-                                            });
-                                            let is_hovered = response.hovered();
-                                            let is_clicked = response.clicked();
-                                            
-                                            let card_bg = if is_clicked {
-                                                ui.visuals().selection.bg_fill.gamma_multiply(0.3)
-                                            } else if is_hovered {
-                                                ui.visuals().code_bg_color.gamma_multiply(1.5)
-                                            } else if is_current {
-                                                ui.visuals().selection.bg_fill.gamma_multiply(0.15)
-                                            } else {
-                                                ui.visuals().code_bg_color
-                                            };
-                                            
-                                            let card_stroke = if is_current {
-                                                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-                                            } else if is_hovered {
-                                                egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
-                                            } else {
-                                                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.3))
-                                            };
-                                            
-                                            let builder = egui::UiBuilder::new()
-                                                .max_rect(rect)
-                                                .layout(egui::Layout::top_down(egui::Align::Center))
-                                                .id_salt(path);
-                                            let mut child_ui = ui.new_child(builder);
-                                            egui::Frame::NONE
-                                                .fill(card_bg)
-                                                .stroke(card_stroke)
-                                                .inner_margin(8.0)
-                                                .corner_radius(6.0)
-                                                .show(&mut child_ui, |ui| {
-                                                    ui.vertical_centered(|ui| {
-                                                        if let Some(texture) = self.thumbnail_textures.get(path) {
-                                                            ui.add(
-                                                                egui::Image::from_texture(texture)
-                                                                    .max_size(egui::vec2(110.0, 110.0))
-                                                                    .maintain_aspect_ratio(true)
-                                                            );
-                                                        } else if self.thumbnail_failed.contains(path) {
-                                                            ui.vertical_centered(|ui| {
-                                                                ui.add_space(40.0);
-                                                                ui.weak("⚠️ Failed");
-                                                                ui.add_space(40.0);
-                                                            });
-                                                        } else {
-                                                            ui.vertical_centered(|ui| {
-                                                                ui.add_space(45.0);
-                                                                ui.add(egui::Spinner::new().size(20.0));
-                                                                ui.add_space(45.0);
-                                                            });
-                                                            
-                                                            if !self.thumbnail_loading.contains(path) && self.thumbnail_active_threads < 4 {
-                                                                self.thumbnail_loading.insert(path.clone());
-                                                                self.thumbnail_active_threads += 1;
-                                                                let path_clone = path.clone();
-                                                                let tx_clone = self.thumbnail_tx.clone();
-                                                                let ctx_clone = ui.ctx().clone();
-                                                                std::thread::spawn(move || {
-                                                                    if let Ok(img) = image::open(&path_clone) {
-                                                                        let thumb = img.thumbnail(128, 128);
-                                                                        let size = [thumb.width() as usize, thumb.height() as usize];
-                                                                        let pixels = thumb.to_rgba8().into_raw();
-                                                                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                                                        let _ = tx_clone.send((path_clone, color_img));
-                                                                        ctx_clone.request_repaint();
-                                                                    } else {
-                                                                        let empty_img = egui::ColorImage::new([0, 0], Vec::new());
-                                                                        let _ = tx_clone.send((path_clone, empty_img));
-                                                                        ctx_clone.request_repaint();
-                                                                    }
-                                                                });
-                                                            }
-                                                        }
-                                                        
-                                                        ui.add_space(4.0);
-                                                        
-                                                        // Draw match score or OCR badge
-                                                        match self.semantic_mode {
-                                                            SearchMode::Clip => {
-                                                                let pct = (item.score * 100.0).clamp(0.0, 100.0);
-                                                                ui.colored_label(
-                                                                    egui::Color32::from_rgb(100, 200, 100),
-                                                                    format!("{:.0}% Match", pct)
-                                                                );
-                                                            }
-                                                            SearchMode::Ocr => {
-                                                                ui.colored_label(
-                                                                    egui::Color32::from_rgb(100, 180, 255),
-                                                                    "📝 OCR Match"
-                                                                );
-                                                            }
-                                                        }
-                                                        
-                                                        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                                        let label_text = egui::RichText::new(filename)
-                                                            .size(10.0)
-                                                            .line_height(Some(12.0));
-                                                        ui.add(egui::Label::new(label_text).truncate());
-                                                    });
-                                                });
-                                                
-                                            if response.double_clicked() {
-                                                if let Some(pos) = self.semantic_results.iter().position(|r| r.media_path.as_ref() == Some(path)) {
-                                                    clicked_result_idx = Some(pos);
-                                                }
-                                            } else if response.clicked() {
-                                                if let Some(pos) = self.semantic_results.iter().position(|r| r.media_path.as_ref() == Some(path)) {
-                                                    single_clicked_result_idx = Some(pos);
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                            
-                            if let Some(idx) = clicked_result_idx {
-                                // Transition to single view mode and lock arrow navigations to search pool
-                                let active_paths: Vec<PathBuf> = self.semantic_results.iter()
-                                    .filter_map(|r| r.media_path.clone())
-                                    .collect();
-                                self.images = active_paths;
-                                self.current_index = idx;
-                                self.show_grid = false;
-                                self.back_target_is_gallery = true;
-                                self.zoom = 1.0;
-                                self.offset = egui::Vec2::ZERO;
-                                self.update_exif();
-                                ui.ctx().request_repaint();
-                            }
-                            if let Some(idx) = single_clicked_result_idx {
-                                let active_paths: Vec<PathBuf> = self.semantic_results.iter()
-                                    .filter_map(|r| r.media_path.clone())
-                                    .collect();
-                                self.images = active_paths;
-                                self.current_index = idx;
-                                self.update_exif();
-                                self.show_exif = true;
-                                self.side_panel_mode = SidePanelMode::Duplicates;
-                                ui.ctx().request_repaint();
-                            }
-                            if let Some(item) = clicked_similar {
-                                self.show_most_similar_clip(&item);
-                                ui.ctx().request_repaint();
-                            }
-                            if let Some(name) = clicked_person {
-                                self.show_more_of_this_person(&name);
-                                ui.ctx().request_repaint();
-                            }
-                        }
+
+                    if let Some(item) = clicked_similar {
+                        self.show_most_similar_clip(&item);
+                        ui.ctx().request_repaint();
+                    }
+
+                    if let Some(name) = clicked_person {
+                        self.show_more_of_this_person(&name);
+                        ui.ctx().request_repaint();
                     }
                 }
             }
@@ -3257,7 +3765,7 @@ impl ImageViewer {
         }
         let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(12)).max(self.semantic_limit + 32);
-        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, false);
+        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, false, "");
         results.retain(|candidate| candidate.file_name != row.file_name);
         results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         
@@ -3266,6 +3774,9 @@ impl ImageViewer {
         for candidate in &mut results {
             candidate.media_path =
                 resolve_media_path(&db_roots, db_dir, &candidate.file_name, candidate.timestamp_sec).ok();
+            if let Some(path) = &candidate.media_path {
+                self.db_filename_by_path.insert(path.clone(), candidate.file_name.clone());
+            }
         }
         let took = started.elapsed().as_millis();
         self.semantic_status = format!(
@@ -3350,6 +3861,9 @@ impl ImageViewer {
         for row in &mut results {
             row.media_path =
                 resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
+            if let Some(path) = &row.media_path {
+                self.db_filename_by_path.insert(path.clone(), row.file_name.clone());
+            }
         }
         let took = started.elapsed().as_millis();
         self.semantic_status = format!(
@@ -3373,6 +3887,19 @@ impl eframe::App for ImageViewer {
         self.poll_db_load();
         self.poll_sift_alignment();
 
+        if !self.db_loaded && !self.db_loading {
+            let is_ai = if let Some(p) = self.images.get(self.current_index) {
+                is_path_ai_backed(p)
+            } else if is_path_ai_backed(&self.open_target) {
+                true
+            } else {
+                false
+            };
+            if is_ai {
+                self.start_lazy_db_load(ctx);
+            }
+        }
+
         while let Ok((path, color_image)) = self.thumbnail_rx.try_recv() {
             if color_image.size[0] == 0 {
                 self.thumbnail_failed.insert(path.clone());
@@ -3391,6 +3918,7 @@ impl eframe::App for ImageViewer {
 
         if let Ok(new_path) = self.rx.try_recv() {
             self.open_image_path(new_path);
+            self.show_home_page = false;
             ctx.request_repaint();
         }
 
@@ -3446,54 +3974,75 @@ impl eframe::App for ImageViewer {
         // Keyboard handling
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
-                if !self.show_grid {
-                    if i.key_pressed(egui::Key::ArrowRight) {
-                        self.next_image();
+                if !self.show_home_page {
+                    if !self.show_grid {
+                        if i.key_pressed(egui::Key::ArrowRight) {
+                            self.next_image();
+                        }
+                        if i.key_pressed(egui::Key::ArrowLeft) {
+                            self.prev_image();
+                        }
+                        if i.key_pressed(egui::Key::F) {
+                            self.zoom = 1.0;
+                            self.offset = egui::Vec2::ZERO;
+                        }
+                        if i.key_pressed(egui::Key::Num0) {
+                            self.zoom = 1.0;
+                            self.offset = egui::Vec2::ZERO;
+                        }
                     }
-                    if i.key_pressed(egui::Key::ArrowLeft) {
-                        self.prev_image();
+                    if i.key_pressed(egui::Key::G) {
+                        self.show_grid = !self.show_grid;
+                        if self.show_grid && self.recursive_images.is_empty() {
+                            self.start_recursive_scan();
+                        }
                     }
-                    if i.key_pressed(egui::Key::F) {
-                        self.zoom = 1.0;
-                        self.offset = egui::Vec2::ZERO;
+                    if i.key_pressed(egui::Key::E) {
+                        let show_layout_active = self.show_exif && self.side_panel_mode == SidePanelMode::Layout;
+                        if show_layout_active {
+                            self.show_exif = false;
+                        } else {
+                            self.show_exif = true;
+                            self.side_panel_mode = SidePanelMode::Layout;
+                        }
                     }
-                    if i.key_pressed(egui::Key::Num0) {
-                        self.zoom = 1.0;
-                        self.offset = egui::Vec2::ZERO;
-                    }
-                }
-                if i.key_pressed(egui::Key::G) {
-                    self.show_grid = !self.show_grid;
-                    if self.show_grid && self.recursive_images.is_empty() {
-                        self.start_recursive_scan();
-                    }
-                }
-                if i.key_pressed(egui::Key::E) {
-                    let show_layout_active = self.show_exif && self.side_panel_mode == SidePanelMode::Layout;
-                    if show_layout_active {
-                        self.show_exif = false;
-                    } else {
-                        self.show_exif = true;
-                        self.side_panel_mode = SidePanelMode::Layout;
+                    if i.key_pressed(egui::Key::Backspace) {
+                        self.show_home_page = true;
                     }
                 }
                 if i.key_pressed(egui::Key::Q) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.show_grid {
-                        self.show_grid = false;
+                    if self.show_home_page {
+                        if self.home_current_dir.is_some() {
+                            self.home_current_dir = None;
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    } else if self.show_grid {
+                        self.show_home_page = true;
                     } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.show_grid = true;
                     }
                 }
             });
         }
 
-        // Top bar
+        if self.show_home_page {
+            self.show_home_page_view(ctx);
+            return;
+        }
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Iris");
+                ui.separator();
+                
+                if ui.button("🏠 Filesystem").clicked() {
+                    self.show_home_page = true;
+                }
+                
                 ui.separator();
                 if let Some(path) = self.images.get(self.current_index) {
                     let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
@@ -3677,124 +4226,381 @@ impl eframe::App for ImageViewer {
                     }
                     SidePanelMode::Duplicates => {
                         if !self.db_loaded {
-                            self.start_lazy_db_load(ui.ctx());
+                            if !self.db_failed && !self.db_loading {
+                                self.start_lazy_db_load(ui.ctx());
+                            }
                             ui.vertical_centered(|ui| {
                                 ui.add_space(20.0);
-                                ui.add(egui::Spinner::new().size(24.0));
-                                ui.add_space(12.0);
-                                ui.weak("Loading database index to scan duplicates...");
+                                if self.db_failed {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), &self.semantic_status);
+                                } else {
+                                    ui.add(egui::Spinner::new().size(24.0));
+                                    ui.add_space(12.0);
+                                    ui.weak("Loading database index to scan duplicates...");
+                                }
                             });
                         } else if let Some(path) = self.images.get(self.current_index).cloned() {
-                            let filename_opt = self.get_db_filename_from_path(&path);
+                            let filename_opt = self.resolve_db_filename(&path);
                             if let Some(filename) = filename_opt {
                                 let indices = self.db_indices.as_ref().unwrap();
-                                let is_video = is_video_path(&path);
-                                let root_key = self.grouped_master_for(&filename, is_video);
+                                
+                                // Check if the current file is a video in the DB
+                                let current_is_video = is_video_path(Path::new(&filename));
+                                
+                                // Resolve grouped master like clip_viewer:
+                                // videos → file_name directly (no SIFT for videos)
+                                // images → sift_root_by_file → phash_master → sift_root
+                                let master_file_name = if current_is_video {
+                                    filename.clone()
+                                } else {
+                                    let phash_master = indices.phash_master_by_file
+                                        .get(&filename)
+                                        .cloned()
+                                        .unwrap_or_else(|| filename.clone());
+                                    indices.sift_root_by_file
+                                        .get(&phash_master)
+                                        .cloned()
+                                        .unwrap_or(phash_master)
+                                };
                                 
                                 // Fetch SIFT members in this group
-                                let mut sift_members = indices.sift_members_by_root
-                                    .get(&root_key)
+                                let sift_members = indices.sift_members_by_root
+                                    .get(&master_file_name)
                                     .cloned()
                                     .unwrap_or_default();
                                 
-                                // Also fetch direct roots if not grouped
-                                if sift_members.is_empty() {
-                                    if let Some(direct) = indices.sift_root_by_file.get(&filename) {
-                                        sift_members = indices.sift_members_by_root
-                                            .get(direct)
-                                            .cloned()
-                                            .unwrap_or_default();
+                                let sift_evidence_members: Vec<String> = sift_members
+                                    .iter()
+                                    .filter(|member| {
+                                        indices.sift_info_by_file
+                                            .get(member.as_str())
+                                            .is_some_and(valid_sift_link)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                
+                                let mut displayed_sift_members = Vec::new();
+                                let mut displayed_seen = HashSet::new();
+                                if displayed_seen.insert(filename.clone()) {
+                                    displayed_sift_members.push(filename.clone());
+                                }
+                                for member in &sift_evidence_members {
+                                    if displayed_seen.insert(member.clone()) {
+                                        displayed_sift_members.push(member.clone());
                                     }
                                 }
                                 
-                                // Fetch all pHash similars
-                                let phash_similars = indices.similar_by_master
-                                    .get(&filename)
-                                    .cloned()
-                                    .unwrap_or_default();
+                                // Combine pHash/VideoHash similars for all SIFT members in this group
+                                let member_sources: Vec<String> = if sift_members.is_empty() {
+                                    vec![master_file_name.clone()]
+                                } else {
+                                    sift_members.clone()
+                                };
+                                
+                                let mut combined_similars: Vec<SimilarFile> = Vec::new();
+                                let mut combined_seen = HashSet::new();
+                                for member in &member_sources {
+                                    let mut items = indices.similar_by_master
+                                        .get(member.as_str())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    items.sort_by(|a, b| {
+                                        b.similarity_pct
+                                            .unwrap_or(f32::NEG_INFINITY)
+                                            .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                                            .unwrap_or(Ordering::Equal)
+                                    });
+                                    for item in &items {
+                                        if combined_seen.insert(item.file_name.clone()) {
+                                            combined_similars.push(item.clone());
+                                        }
+                                    }
+                                }
+                                combined_similars.sort_by(|a, b| {
+                                    b.similarity_pct
+                                        .unwrap_or(f32::NEG_INFINITY)
+                                        .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                                        .unwrap_or(Ordering::Equal)
+                                });
+                                
+                                // Precompute SIFT members metadata
+                                // source_path = original file (video/image), preview_path = video still or image
+                                let mut displayed_sift_metadata = Vec::new();
+                                let roots = get_db_roots();
+                                for member in &displayed_sift_members {
+                                    let source_path_opt = resolve_source_path(&roots, member).ok();
+                                    let preview_path_opt = source_path_opt.as_ref().map(|p| self.get_thumbnail_path(p));
+                                    let member_is_video = source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
+                                    let res_size_str = source_path_opt.as_ref()
+                                        .map(|p| self.get_file_resolution_and_size(p))
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    let sift_str = sift_info_line(&indices.sift_info_by_file, member);
+                                    displayed_sift_metadata.push((member.clone(), source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str));
+                                }
+
+                                // Precompute combined similars metadata
+                                let mut combined_similars_metadata = Vec::new();
+                                for item in &combined_similars {
+                                    let source_path_opt = resolve_source_path(&roots, &item.file_name).ok();
+                                    let preview_path_opt = source_path_opt.as_ref().map(|p| self.get_thumbnail_path(p));
+                                    let item_is_video = source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
+                                    let res_size_str = source_path_opt.as_ref()
+                                        .map(|p| self.get_file_resolution_and_size(p))
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    combined_similars_metadata.push((item.clone(), source_path_opt, preview_path_opt, item_is_video, res_size_str));
+                                }
                                 
                                 ui.heading("👥 Duplicate Matches");
                                 ui.add_space(4.0);
                                 ui.weak(format!("Current: {}", filename));
+                                ui.add_space(2.0);
+                                ui.weak(format!("pHash/VideoHash similar count: {}", combined_similars.len()));
                                 ui.add_space(8.0);
                                 
                                 egui::ScrollArea::vertical().show(ui, |ui| {
+                                    let side_thumb = 90.0_f32;
+                                    
+                                    // 0. Active File / Current Selection
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "★ Current Selection");
+                                    });
+                                    ui.add_space(6.0);
+                                    
+                                    let active_resolved = self.get_thumbnail_path(&path);
+                                    let active_is_video = is_video_path(&path);
+                                    let active_actual = self.resolve_actual_path(&path);
+                                    
+                                    ui.horizontal(|ui| {
+                                        // Left: Thumbnail preview
+                                        self.draw_thumbnail_async(ui, &active_resolved, side_thumb);
+                                        
+                                        // Right: Info and buttons
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    if active_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                    if active_is_video { "📹 Video" } else { "🖼 Image" }
+                                                );
+                                                ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
+                                            });
+                                            
+                                            let res_size_str = format!("{} • {}", self.current_dimensions, self.current_file_size);
+                                            ui.weak(&res_size_str);
+                                            
+                                            let display_name = filename.split_once('/').map(|x| x.1).unwrap_or(&filename);
+                                            ui.monospace(display_name);
+                                            
+                                            ui.horizontal(|ui| {
+                                                if ui.button("📂 Open Folder").clicked() {
+                                                    open_in_dolphin_or_fallback(&active_actual);
+                                                }
+                                                if active_is_video {
+                                                    if ui.button("▶ Open in mpv").clicked() {
+                                                        let _ = std::process::Command::new("mpv")
+                                                            .arg(&active_actual)
+                                                            .spawn();
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    
                                     // 1. SIFT Cluster Members (Duplicates)
                                     if !sift_members.is_empty() {
                                         ui.horizontal(|ui| {
                                             ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "✓ SIFT Duplicate Cluster");
                                             ui.weak(format!("({} files)", sift_members.len()));
                                         });
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         
-                                        let roots = get_db_roots();
-                                        for member in &sift_members {
-                                            if member == &filename {
-                                                continue;
-                                            }
-                                            let member_path_res = resolve_source_path(&roots, member);
-                                            if let Ok(m_path) = member_path_res {
-                                                ui.horizontal(|ui| {
-                                                    ui.monospace(member.split_once('/').map(|x| x.1).unwrap_or(member));
-                                                    
-                                                    let is_active_compare = self.compare_target.as_ref() == Some(&m_path);
-                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                        if is_active_compare {
-                                                            self.compare_target = None;
-                                                            self.sift_pair_overlay = None;
-                                                        } else {
-                                                            self.compare_target = Some(m_path.clone());
-                                                            self.start_sift_alignment(path.clone(), m_path.clone(), ui.ctx().clone());
+                                        for (member, source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str) in &displayed_sift_metadata {
+                                            ui.horizontal(|ui| {
+                                                // Left: Thumbnail preview (use preview_path for video stills)
+                                                let thumb_path = preview_path_opt.as_ref().or(source_path_opt.as_ref());
+                                                if let Some(t_path) = thumb_path {
+                                                    self.draw_thumbnail_async(ui, t_path, side_thumb);
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(side_thumb, side_thumb),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                                }
+                                                
+                                                // Right: Info and buttons
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.colored_label(
+                                                            if *member_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                            if *member_is_video { "📹 Video" } else { "🖼 Image" }
+                                                        );
+                                                        if member == &filename {
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                         }
-                                                    }
+                                                    });
+                                                    
+                                                    ui.weak(res_size_str);
+                                                    ui.weak(sift_str);
+                                                    
+                                                    let display_name = member.split_once('/').map(|x| x.1).unwrap_or(member);
+                                                    ui.monospace(display_name);
+                                                    
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(s_path) = source_path_opt.as_ref() {
+                                                            if ui.button("📂 Open Folder").clicked() {
+                                                                open_in_dolphin_or_fallback(s_path);
+                                                            }
+                                                            if member != &filename {
+                                                                if *member_is_video {
+                                                                    // Open video in mpv
+                                                                    if ui.button("▶ Open in mpv").clicked() {
+                                                                        let _ = std::process::Command::new("mpv")
+                                                                            .arg(s_path)
+                                                                            .spawn();
+                                                                    }
+                                                                } else {
+                                                                    // View image in the viewer
+                                                                    if ui.button("👁 View").clicked() {
+                                                                        if let Some(pos) = self.images.iter().position(|p| p == s_path) {
+                                                                            self.current_index = pos;
+                                                                        } else {
+                                                                            self.images.insert(self.current_index + 1, s_path.clone());
+                                                                            self.db_filename_by_path.insert(s_path.clone(), member.clone());
+                                                                            self.current_index += 1;
+                                                                        }
+                                                                        self.show_grid = false;
+                                                                        self.update_exif();
+                                                                    }
+                                                                }
+                                                            }
+                                                            
+                                                            if !*member_is_video {
+                                                                let is_active_compare = self.compare_target.as_ref() == Some(s_path);
+                                                                let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                                if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                                    if is_active_compare {
+                                                                        self.compare_target = None;
+                                                                        self.sift_pair_overlay = None;
+                                                                    } else {
+                                                                        self.compare_target = Some(s_path.clone());
+                                                                        self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 });
-                                            }
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(8.0);
                                         }
-                                        ui.add_space(12.0);
-                                        ui.separator();
-                                        ui.add_space(12.0);
+                                        ui.add_space(8.0);
                                     }
                                     
-                                    // 2. pHash Similars (Similarity Map)
-                                    if !phash_similars.is_empty() {
+                                    // 2. pHash/VideoHash Similars
+                                    if !combined_similars.is_empty() {
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "🔗 Similar Images (pHash)");
-                                            ui.weak(format!("({} files)", phash_similars.len()));
+                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "🔗 Similar Files (pHash/VideoHash)");
+                                            ui.weak(format!("({} files)", combined_similars.len()));
                                         });
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         
-                                        let roots = get_db_roots();
-                                        for sim in &phash_similars {
-                                            let sim_path_res = resolve_source_path(&roots, &sim.file_name);
-                                            if let Ok(s_path) = sim_path_res {
-                                                ui.horizontal(|ui| {
-                                                    let pct_str = sim.similarity_pct
-                                                        .map(|v| format!("{:.0}%", v))
-                                                        .unwrap_or_else(|| "n/a".to_string());
-                                                    ui.weak(format!("[{}]", pct_str));
-                                                    ui.monospace(sim.file_name.split_once('/').map(|x| x.1).unwrap_or(&sim.file_name));
-                                                    
-                                                    let is_active_compare = self.compare_target.as_ref() == Some(&s_path);
-                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                        if is_active_compare {
-                                                            self.compare_target = None;
-                                                            self.sift_pair_overlay = None;
-                                                        } else {
-                                                            self.compare_target = Some(s_path.clone());
-                                                            self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                        for (item, source_path_opt, preview_path_opt, item_is_video, res_size_str) in &combined_similars_metadata {
+                                            ui.horizontal(|ui| {
+                                                // Left: Thumbnail preview (use preview_path for video stills)
+                                                let thumb_path = preview_path_opt.as_ref().or(source_path_opt.as_ref());
+                                                if let Some(t_path) = thumb_path {
+                                                    self.draw_thumbnail_async(ui, t_path, side_thumb);
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(side_thumb, side_thumb),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                                }
+                                                
+                                                // Right: Info and buttons
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.colored_label(
+                                                            if *item_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                            if *item_is_video { "📹 Video" } else { "🖼 Image" }
+                                                        );
+                                                        if item.file_name == filename {
+                                                            ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                         }
-                                                    }
+                                                    });
+                                                    
+                                                    let similarity_label = item.similarity_pct
+                                                        .map(|v| format!("similarity {:.2}%", v))
+                                                        .unwrap_or_else(|| "similarity n/a".to_string());
+                                                    ui.colored_label(egui::Color32::from_rgb(100, 180, 255), similarity_label);
+                                                    
+                                                    ui.weak(res_size_str);
+                                                    
+                                                    let display_name = item.file_name.split_once('/').map(|x| x.1).unwrap_or(&item.file_name);
+                                                    ui.monospace(display_name);
+                                                    
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(s_path) = source_path_opt.as_ref() {
+                                                            if ui.button("📂 Open Folder").clicked() {
+                                                                open_in_dolphin_or_fallback(s_path);
+                                                            }
+                                                            if item.file_name != filename {
+                                                                if *item_is_video {
+                                                                    // Open video in mpv
+                                                                    if ui.button("▶ Open in mpv").clicked() {
+                                                                        let _ = std::process::Command::new("mpv")
+                                                                            .arg(s_path)
+                                                                            .spawn();
+                                                                    }
+                                                                } else {
+                                                                    // View image in the viewer
+                                                                    if ui.button("👁 View").clicked() {
+                                                                        if let Some(pos) = self.images.iter().position(|p| p == s_path) {
+                                                                            self.current_index = pos;
+                                                                        } else {
+                                                                            self.images.insert(self.current_index + 1, s_path.clone());
+                                                                            self.db_filename_by_path.insert(s_path.clone(), item.file_name.clone());
+                                                                            self.current_index += 1;
+                                                                        }
+                                                                        self.show_grid = false;
+                                                                        self.update_exif();
+                                                                    }
+                                                                }
+                                                            }
+                                                            
+                                                            if !*item_is_video {
+                                                                let is_active_compare = self.compare_target.as_ref() == Some(s_path);
+                                                                let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                                if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                                    if is_active_compare {
+                                                                        self.compare_target = None;
+                                                                        self.sift_pair_overlay = None;
+                                                                    } else {
+                                                                        self.compare_target = Some(s_path.clone());
+                                                                        self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 });
-                                            }
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(8.0);
                                         }
                                     } else if sift_members.is_empty() {
                                         ui.weak("No duplicates or similar files found in database.");
                                     }
                                 });
                             } else {
-                                ui.weak("Current file is not indexed in the database (not in Phone or Telegram Backup folders).");
+                                ui.weak("Current file is not indexed in the database.");
                             }
                         } else {
                             ui.weak("No image loaded.");
@@ -3811,21 +4617,22 @@ impl eframe::App for ImageViewer {
             if self.show_grid {
                 self.show_grid_view(ui, ctx);
             } else {
-                if let Some(path) = self.images.get(self.current_index) {
-                let uri = format!("file://{}", path.to_string_lossy());
+                if let Some(path) = self.images.get(self.current_index).cloned() {
+                let resolved_path = self.get_thumbnail_path(&path);
+                let uri = format!("file://{}", resolved_path.to_string_lossy());
                 
                 // Click and Drag to pan (allocated first to allow zoom-to-mouse math using rect)
                 let (rect, response) = ui.allocate_at_least(ui.available_size(), egui::Sense::click_and_drag());
                 if response.dragged() {
                     self.offset += response.drag_delta();
                 }
-
+ 
                 // Middle click to recentre and fit
                 if response.middle_clicked() {
                     self.zoom = 1.0;
                     self.offset = egui::Vec2::ZERO;
                 }
-
+ 
                 // Interaction / Zoom
                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
@@ -3839,15 +4646,21 @@ impl eframe::App for ImageViewer {
                     
                     self.zoom *= zoom_factor;
                 }
-
+ 
                 // Right click context menu to copy path, image, or recenter
                 response.context_menu(|ui| {
+                    if ui.button("📂 Open parent folder").clicked() {
+                        let actual_path = self.resolve_actual_path(&path);
+                        open_in_dolphin_or_fallback(&actual_path);
+                        ui.close();
+                    }
                     if ui.button("📋 Copy Image Path").clicked() {
                         ui.ctx().copy_text(path.to_string_lossy().to_string());
                         ui.close();
                     }
                     if ui.button("🖼 Copy Image").clicked() {
-                        if let Ok(img) = image::open(path) {
+                        let resolved_path = self.get_thumbnail_path(&path);
+                        if let Ok(img) = image::open(&resolved_path) {
                             let size = [img.width() as usize, img.height() as usize];
                             let img_rgba = img.to_rgba8();
                             let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -3884,8 +4697,10 @@ impl eframe::App for ImageViewer {
                 });
 
                 if let Some(ref compare_path) = self.compare_target {
-                    let left_uri = format!("file://{}", path.to_string_lossy());
-                    let right_uri = format!("file://{}", compare_path.to_string_lossy());
+                    let left_resolved = self.get_thumbnail_path(&path);
+                    let right_resolved = self.get_thumbnail_path(compare_path);
+                    let left_uri = format!("file://{}", left_resolved.to_string_lossy());
+                    let right_uri = format!("file://{}", right_resolved.to_string_lossy());
                     
                     let avail_size = ui.available_size();
                     let half_w = (avail_size.x / 2.0 - 12.0).max(10.0);
@@ -3966,5 +4781,234 @@ impl eframe::App for ImageViewer {
         if self.flat_loading || self.grid_loading {
             ctx.request_repaint();
         }
+    }
+}
+
+impl ImageViewer {
+    fn get_subdirectories(&self, path: &Path) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if p.is_dir() {
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if !name.starts_with('.') {
+                            dirs.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        dirs.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+            let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+            a_name.cmp(&b_name)
+        });
+        dirs
+    }
+
+    fn show_home_page_view(&mut self, ctx: &egui::Context) {
+        let current_dir_opt = self.home_current_dir.clone();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(8.0);
+            
+            // Dolphin-like location toolbar at the top
+            ui.horizontal(|ui| {
+                // 1. Up Button
+                let has_parent = current_dir_opt.is_some();
+                let up_btn = ui.add_enabled_ui(has_parent, |ui| {
+                    ui.add(egui::Button::new("⬆ Up").min_size(egui::vec2(50.0, 26.0)))
+                });
+                
+                if has_parent && up_btn.inner.clicked() {
+                    if let Some(ref current_dir) = current_dir_opt {
+                        self.home_current_dir = current_dir.parent().map(|p| p.to_path_buf());
+                        self.home_selected_dir = None;
+                    }
+                }
+                
+                ui.add_space(4.0);
+                
+                // 2. Path Display Location Bar (matches standard Dolphin address bar)
+                let path_str = match &current_dir_opt {
+                    Some(p) => p.to_string_lossy().to_string(),
+                    None => "/".to_string(), // Root disks
+                };
+                
+                egui::Frame::NONE
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                    .inner_margin(egui::vec2(8.0, 4.0))
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width() - 170.0);
+                        ui.label(egui::RichText::new(&path_str).monospace().size(13.0));
+                    });
+                
+                // 3. Open button on the right
+                let target_dir = self.home_selected_dir.clone().or(current_dir_opt.clone());
+                let has_target = target_dir.is_some();
+                
+                let open_btn = ui.add_enabled_ui(has_target, |ui| {
+                    ui.add(egui::Button::new(
+                        egui::RichText::new("Open Folder")
+                            .strong()
+                            .color(egui::Color32::WHITE)
+                    )
+                    .fill(ui.visuals().selection.bg_fill)
+                    .min_size(egui::vec2(100.0, 26.0)))
+                });
+                
+                if has_target && open_btn.inner.clicked() {
+                    if let Some(dir) = target_dir {
+                        self.open_image_path(dir.clone());
+                        self.show_home_page = false;
+                        self.show_grid = true;
+                        self.start_recursive_scan();
+                    }
+                }
+            });
+            
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            
+            // Pane container frame (high density desktop file pane)
+            egui::Frame::NONE
+                .fill(ui.visuals().extreme_bg_color)
+                .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                .inner_margin(2.0)
+                .corner_radius(4.0)
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height() - 6.0);
+                    
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut items = Vec::new();
+                        let is_disk_level = current_dir_opt.is_none();
+                        
+                        if is_disk_level {
+                            for disk in get_system_disks() {
+                                items.push((disk, true));
+                            }
+                        } else {
+                            if let Some(ref current_dir) = current_dir_opt {
+                                for sub in self.get_subdirectories(current_dir) {
+                                    items.push((sub, false));
+                                }
+                            }
+                        }
+                        
+                        if items.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(40.0);
+                                ui.weak("This folder contains no subfolders.");
+                                ui.add_space(40.0);
+                            });
+                        } else {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 1.0); // Dense desktop list spacing
+                                
+                                for (item_path, is_disk) in items {
+                                    let name = if is_disk {
+                                        if item_path == PathBuf::from("/") {
+                                            "System Root (/)".to_string()
+                                        } else if item_path.to_string_lossy().contains("/home/") {
+                                            format!("Home ({})", item_path.file_name().and_then(|n| n.to_str()).unwrap_or("User"))
+                                        } else {
+                                            item_path.file_name()
+                                                .and_then(|n| n.to_str())
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| item_path.to_string_lossy().to_string())
+                                        }
+                                    } else {
+                                        item_path.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("")
+                                            .to_string()
+                                    };
+                                    
+                                    let is_ai = is_path_ai_backed(&item_path);
+                                    let is_selected = self.home_selected_dir.as_ref() == Some(&item_path);
+                                    
+                                    // Allocate dense row rect
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 26.0),
+                                        egui::Sense::click()
+                                    );
+                                    
+                                    if response.double_clicked() {
+                                        self.home_current_dir = Some(item_path.clone());
+                                        self.home_selected_dir = None;
+                                    } else if response.clicked() {
+                                        self.home_selected_dir = Some(item_path.clone());
+                                    }
+                                    
+                                    // Draw row background selection/hover highlight
+                                    let row_bg = if is_selected {
+                                        ui.visuals().selection.bg_fill
+                                    } else if response.hovered() {
+                                        ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.2)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    
+                                    if row_bg != egui::Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(rect, 2.0, row_bg);
+                                    }
+                                    
+                                    // Render columns inside the row
+                                    ui.allocate_ui_at_rect(rect.shrink2(egui::vec2(8.0, 2.0)), |ui| {
+                                        ui.horizontal(|ui| {
+                                            let icon = if is_disk {
+                                                "💾"
+                                            } else {
+                                                "📁"
+                                            };
+                                            
+                                            let text_color = if is_selected {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                ui.visuals().widgets.noninteractive.text_color()
+                                            };
+                                            
+                                            ui.label(egui::RichText::new(icon).size(14.0));
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new(&name).color(text_color));
+                                            
+                                            // Push column 2 to the right
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let type_str = if is_disk {
+                                                    if item_path == PathBuf::from("/") {
+                                                        "System Disk"
+                                                    } else if item_path.to_string_lossy().contains("/home/") {
+                                                        "User Directory"
+                                                    } else {
+                                                        "Disk Partition"
+                                                    }
+                                                } else if is_ai {
+                                                    "Folder (AI-Indexed)"
+                                                } else {
+                                                    "Folder"
+                                                };
+                                                
+                                                let type_color = if is_selected {
+                                                    egui::Color32::WHITE
+                                                } else if is_ai {
+                                                    egui::Color32::from_rgb(140, 160, 255) // clean blue-violet for AI indexing
+                                                } else {
+                                                    ui.visuals().weak_text_color()
+                                                };
+                                                
+                                                ui.label(egui::RichText::new(type_str).color(type_color).size(11.0));
+                                            });
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
+        });
     }
 }
