@@ -1,130 +1,134 @@
 # Iris
 
-Iris is a Rust desktop app for browsing local image and video folders, checking metadata, and searching a collection by filename, description, or OCR text.
+Iris is a Rust desktop app for browsing local images/videos, inspecting metadata, and searching indexed media by filename, description, or OCR text.
 
-## What it does
-
-- folder gallery and single-image viewer
-- filename filtering in the gallery
-- description search and OCR text search backed by local LanceDB indices
-- EXIF inspection and a binary layout view
-- duplicate and similarity tools based on SIFT, pHash, and VideoHash metadata
-- home-page folder browser when the app starts without a path
-
-## Repository Layout
+## Project Structure
 
 ```text
 .
-├── Cargo.lock
 ├── Cargo.toml
+├── Cargo.lock
 ├── README.md
-├── clip_viewer_ref.rs
-├── icon.png
 ├── iris.desktop
+├── icon.png
 ├── make_transparent.py
+├── clip_viewer_ref.rs
 ├── src
-│   ├── bin
-│   │   └── make_transparent.rs
-│   └── main.rs
-└── target                      # generated build output
+│   ├── main.rs
+│   └── bin
+│       └── make_transparent.rs
+└── tools
+    └── on_demand_embeddings.py
 ```
 
-## Files and Outputs
+## What Each File Does
 
 ### `src/main.rs`
 
-- Purpose: main GUI application.
+- Main GUI application.
 - Inputs:
-  - command line arguments: `iris [--same-window|-s|--reuse-window|-r] [--new-window|-n] [--no-daemon] [PATH]`
-  - optional UNIX socket messages from other Iris processes
-  - media files from the selected folder or folder tree
-  - EXIF output from `exiftool`
-  - local description/OCR index and model files
+  - CLI args: `iris [--same-window|-s|--reuse-window|-r] [--new-window|-n] [--no-daemon] [PATH]`
+  - Filesystem media under the opened path.
+  - LanceDB tables (`media_index`, optional `collection_roots`).
+  - External tools: `exiftool`, `ffprobe`, `mpv`, and optional `dolphin`.
+  - Python tooling in `imagesearch` for SIFT diagnostics and on-demand CLIP/face embeddings.
 - Outputs:
-  - the desktop GUI window
-  - gallery and detail views
-  - layout, EXIF, and duplicate side panels
-  - optional folder opens through `dolphin`
-  - optional video opens through `mpv`
+  - Interactive gallery/viewer UI.
+  - Similarity and OCR/description search results.
+  - EXIF/raw metadata and ffprobe output for videos.
+
+### `tools/on_demand_embeddings.py`
+
+- Helper used by Iris when a file does not already have stored vectors.
+- Inputs:
+  - `--image <path>`
+  - `--clip` and/or `--faces`
+- Output:
+  - JSON payload on stdout:
+    - `{"ok": true, "clip_embedding": [...], "face_embeddings": [[...], ...]}`
+    - or `{"ok": false, "error": "..."}`
+- Runtime dependency:
+  - Imports model/runtime code from the `imagesearch` project directory.
 
 ### `src/bin/make_transparent.rs`
 
-- Purpose: small Rust utility for turning a light icon source into a transparent PNG.
-- Input: hardcoded source image path in the file.
-- Output: `icon.png`.
+- Small icon utility.
+- Inputs:
+  - `cargo run --bin make_transparent -- [src] [dst]`
+  - Defaults: `icon_source.png` -> `icon.png`
+- Output:
+  - Transparent PNG icon.
 
 ### `make_transparent.py`
 
-- Purpose: Python version of the same icon helper.
-- Input: hardcoded source image path in the file.
-- Output: `icon.png`.
+- Python version of the icon utility.
+- Inputs:
+  - `python3 make_transparent.py [src] [dst]`
+  - Defaults: `icon_source.png` -> `icon.png`
+- Output:
+  - Transparent PNG icon.
 
 ### `clip_viewer_ref.rs`
 
-- Purpose: reference code kept around for comparison and porting.
-- Input/output: not part of the Cargo build.
+- Reference/experimental viewer implementation kept outside the main build path.
 
 ### `iris.desktop`
 
-- Purpose: desktop launcher entry for Linux desktop environments.
-- Input: none.
-- Output: launcher metadata.
+- Desktop entry template for Linux launchers.
 
-## Requirements
+## Configuration
 
-- Rust toolchain with Cargo
-- `exiftool` in `PATH`
-- `dolphin` if you want the preferred folder opener
-- `mpv` if you want the video open action
+Iris no longer requires hardcoded personal paths. Use environment variables:
 
-The current code also expects the local search assets to live here:
+- `IRIS_DB_DIR`: LanceDB directory.  
+  Default fallback: `${XDG_DATA_HOME}/iris/lancedb` or `${HOME}/.local/share/iris/lancedb`.
+- `IRIS_IMAGESEARCH_DIR`: path to the `imagesearch` project used for model/runtime helpers.
+- `IRIS_ON_DEMAND_EMBED_SCRIPT`: optional override for the on-demand embedding script path.
+- `IRIS_EXIFTOOL`: optional explicit path to `exiftool`.
+- `IRIS_FFPROBE`: optional explicit path to `ffprobe`.
 
-- LanceDB directory: `/media/lewis/1b/lancedb`
-- collection roots:
-  - `/media/lewis/1b/Phone`
-  - `/media/lewis/1b/Telegram Backup`
-- description model: `/home/lewis/Dev/imagesearch/models/clip-text/clip_text.onnx`
-- tokenizer: `/home/lewis/Dev/imagesearch/models/clip-text/tokenizer.json`
+Collection root mapping is resolved from the `collection_roots` table in LanceDB (and can be discovered from indexed file samples).
 
-If your setup is different, update those paths in `src/main.rs`.
+## External Dependencies
 
-## How To Run It
+- Rust + Cargo
+- `uv` (for Python helper execution)
+- `exiftool`
+- `ffprobe` (from ffmpeg)
+- `mpv` (video open action)
+- `dolphin` (preferred folder opener; app has a fallback opener if unavailable)
 
-1. Optional: regenerate the icon transparency.
-   ```bash
-   python3 make_transparent.py
-   ```
+## Runtime Pipeline
 
-   or:
+1. Start app and open a file/folder.
+2. Build gallery list from filesystem scan.
+3. If AI-backed search is used:
+   - Lazy-load DB indices and text encoder.
+   - Search mode:
+     - Description search -> CLIP text encoder + vector index.
+     - OCR search -> OCR text index with phrase/term ranking.
+4. For files missing embeddings:
+   - Trigger `tools/on_demand_embeddings.py`.
+   - Compute CLIP/face vectors on the fly.
+   - Run “Show most similar” or “Show more of this person” using returned vectors.
+5. Side panels:
+   - EXIF/raw metadata via `exiftool`
+   - video metadata via `ffprobe`
+   - duplicates/similarity diagnostics from DB + SIFT helper
 
-   ```bash
-   cargo run --bin make_transparent
-   ```
+## Run
 
-2. Start the app.
-   ```bash
-   cargo run --release -- --no-daemon
-   ```
+```bash
+# from repo root
+cargo run --release -- --no-daemon
+```
 
-3. Open a folder or file directly.
-   ```bash
-   cargo run --release -- --no-daemon /path/to/media/or/folder
-   ```
+```bash
+# open a specific path
+cargo run --release -- --no-daemon /path/to/file-or-folder
+```
 
-4. Reuse an existing window from another shell.
-   ```bash
-   cargo run --release -- --same-window /path/to/file
-   ```
-
-## In-App Flow
-
-- `G` toggles the gallery grid.
-- The `Filename`, `Description Search`, and `OCR Text` tabs all use the same grid area.
-- The right sidebar switches between binary layout, raw EXIF, and duplicates.
-- The app can also open folders and videos with external tools when those tools are installed.
-
-## Notes
-
-- The app daemonizes unless you pass `--no-daemon`.
-- `--new-window` is currently a no-op because the default behavior already opens a new window.
-- The old nested `iris/` subcrate is no longer part of this repository.
+```bash
+# reuse an existing window
+cargo run --release -- --same-window /path/to/file-or-folder
+```

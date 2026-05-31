@@ -9,11 +9,13 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch,
+    RecordBatchIterator,
     StringArray, StructArray,
 };
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::AddDataMode;
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
@@ -216,6 +218,103 @@ fn extract_system_block(exif_data: &str) -> String {
         }
     }
     result
+}
+
+fn resolve_exiftool_path() -> Option<PathBuf> {
+    static EXIFTOOL_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXIFTOOL_PATH
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("IRIS_EXIFTOOL").map(PathBuf::from) {
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    let candidate = dir.join("exiftool");
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+
+            [
+                "/usr/bin/exiftool",
+                "/usr/bin/vendor_perl/exiftool",
+                "/usr/local/bin/exiftool",
+                "/bin/exiftool",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        })
+        .clone()
+}
+
+fn resolve_ffprobe_path() -> Option<PathBuf> {
+    static FFPROBE_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FFPROBE_PATH
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("IRIS_FFPROBE").map(PathBuf::from) {
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    let candidate = dir.join("ffprobe");
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+
+            ["/usr/bin/ffprobe", "/usr/local/bin/ffprobe", "/bin/ffprobe"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .clone()
+}
+
+fn load_ffprobe_metadata(path: &Path) -> String {
+    if let Some(ffprobe_path) = resolve_ffprobe_path() {
+        match Command::new(&ffprobe_path)
+            .args([
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-show_chapters",
+                "-show_programs",
+                "-show_data",
+                "-show_private_data",
+                "-print_format",
+                "json",
+            ])
+            .arg(path)
+            .output()
+        {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                if !stdout.trim().is_empty() {
+                    stdout
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if stderr.is_empty() {
+                        format!("ffprobe produced no output for {}", path.display())
+                    } else {
+                        format!("ffprobe error: {}", stderr)
+                    }
+                }
+            }
+            Err(e) => format!("Error running ffprobe at {}: {}", ffprobe_path.display(), e),
+        }
+    } else {
+        "Error running ffprobe: executable not found. Set IRIS_FFPROBE or install ffmpeg.".to_string()
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -1022,6 +1121,30 @@ struct SearchResult {
     is_video: bool,
     timestamp_sec: f32,
     media_path: Option<PathBuf>,
+    ocr_term_hits: usize,
+    ocr_query_terms: usize,
+    ocr_phrase_query: bool,
+}
+
+#[derive(Clone)]
+enum PendingSearchRequest {
+    Similar {
+        db_file_name: Option<String>,
+        media_path: PathBuf,
+        is_video: bool,
+        timestamp_sec: f32,
+    },
+    Person {
+        db_file_name: Option<String>,
+        media_path: PathBuf,
+        is_video: bool,
+    },
+}
+
+struct OnDemandEmbedResult {
+    request: PendingSearchRequest,
+    clip_vector: Option<Vec<f32>>,
+    face_vectors: Vec<Vec<f32>>,
 }
 
 #[derive(Clone)]
@@ -1728,6 +1851,9 @@ fn search_index(
                 is_video,
                 timestamp_sec,
                 media_path: None,
+                ocr_term_hits: 0,
+                ocr_query_terms: 0,
+                ocr_phrase_query: false,
             },
         )
         .collect();
@@ -1747,22 +1873,39 @@ fn search_ocr_index(
     video_only: bool,
     folder_filter: &str,
 ) -> Vec<SearchResult> {
-    let query_lower = query.trim().to_lowercase();
+    let query_trimmed = query.trim();
+    if query_trimmed.is_empty() {
+        return Vec::new();
+    }
+    let query_is_quoted = query_trimmed.starts_with('"')
+        && query_trimmed.ends_with('"')
+        && query_trimmed.len() >= 2;
+    let normalized_query = if query_is_quoted {
+        query_trimmed[1..query_trimmed.len() - 1].trim()
+    } else {
+        query_trimmed
+    };
+    let query_lower = normalized_query.to_lowercase();
     if query_lower.is_empty() {
         return Vec::new();
     }
+
     let terms: Vec<&str> = query_lower
         .split_whitespace()
         .filter(|term| !term.is_empty())
         .collect();
-    let term_den = terms.len().max(1) as f32;
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let query_term_count = terms.len();
+    let require_phrase_match = query_is_quoted;
 
     let merged = index
         .entries
         .par_chunks(4096)
         .map(|chunk| {
             let db_roots = get_db_roots();
-            let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
+            let mut local: HashMap<String, (f32, bool, f32, usize, usize, bool)> = HashMap::new();
             for entry in chunk {
                 if video_only && !entry.is_video {
                     continue;
@@ -1774,20 +1917,45 @@ fn search_ocr_index(
                 let term_hits = terms
                     .iter()
                     .filter(|term| entry.text_lower.contains(**term))
-                    .count() as f32;
-                if !phrase_hit && term_hits <= 0.0 {
+                    .count();
+                if require_phrase_match {
+                    if !phrase_hit {
+                        continue;
+                    }
+                } else if term_hits == 0 {
                     continue;
                 }
-                let term_score = term_hits / term_den;
-                let score = if phrase_hit { 2.0 + term_score } else { term_score };
+                // Unquoted mode: prioritize rows that match more query terms.
+                // Quoted mode: exact phrase required; term count keeps deterministic tie ordering.
+                let score = if require_phrase_match {
+                    10_000.0 + term_hits as f32
+                } else {
+                    let all_terms_bonus = if term_hits == query_term_count { 100.0 } else { 0.0 };
+                    let phrase_bonus = if phrase_hit { 10.0 } else { 0.0 };
+                    (term_hits as f32) * 1000.0 + all_terms_bonus + phrase_bonus
+                };
                 local
                     .entry(entry.file_name.to_string())
                     .and_modify(|best| {
                         if score > best.0 {
-                            *best = (score, entry.is_video, entry.timestamp_sec);
+                            *best = (
+                                score,
+                                entry.is_video,
+                                entry.timestamp_sec,
+                                term_hits,
+                                query_term_count,
+                                require_phrase_match,
+                            );
                         }
                     })
-                    .or_insert((score, entry.is_video, entry.timestamp_sec));
+                    .or_insert((
+                        score,
+                        entry.is_video,
+                        entry.timestamp_sec,
+                        term_hits,
+                        query_term_count,
+                        require_phrase_match,
+                    ));
             }
             local
         })
@@ -1807,13 +1975,16 @@ fn search_ocr_index(
     let mut rows: Vec<_> = merged
         .into_iter()
         .map(
-            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+            |(file_name, (score, is_video, timestamp_sec, ocr_term_hits, ocr_query_terms, ocr_phrase_query))| SearchResult {
                 rank: 0,
                 score,
                 file_name,
                 is_video,
                 timestamp_sec,
                 media_path: None,
+                ocr_term_hits,
+                ocr_query_terms,
+                ocr_phrase_query,
             },
         )
         .collect();
@@ -1884,6 +2055,9 @@ fn search_face_index(
                 is_video,
                 timestamp_sec,
                 media_path: None,
+                ocr_term_hits: 0,
+                ocr_query_terms: 0,
+                ocr_phrase_query: false,
             },
         )
         .collect();
@@ -1934,24 +2108,340 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+const MEDIA_INDEX_TABLE: &str = "media_index";
+const COLLECTION_ROOTS_TABLE: &str = "collection_roots";
+
+fn default_db_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("XDG_DATA_HOME") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("iris").join("lancedb");
+        }
+    }
+    if let Ok(raw) = std::env::var("HOME") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed)
+                .join(".local")
+                .join("share")
+                .join("iris")
+                .join("lancedb");
+        }
+    }
+    PathBuf::from("./lancedb")
+}
+
+fn get_db_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("IRIS_DB_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    default_db_dir()
+}
+
+fn resolve_imagesearch_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("IRIS_IMAGESEARCH_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("../imagesearch"));
+        candidates.push(cwd.join("imagesearch"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../imagesearch"));
+
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return candidate
+                .canonicalize()
+                .unwrap_or(candidate);
+        }
+    }
+
+    PathBuf::from("imagesearch")
+}
+
+fn resolve_on_demand_embeddings_script_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("IRIS_ON_DEMAND_EMBED_SCRIPT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tools")
+        .join("on_demand_embeddings.py")
+}
+
+fn dedupe_dirs(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let canonical = candidate.canonicalize().unwrap_or(candidate.clone());
+        let key = canonical.to_string_lossy().to_string();
+        if seen.insert(key) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+fn add_dir_and_children(base: &Path, out: &mut Vec<PathBuf>) {
+    if !base.is_dir() {
+        return;
+    }
+    out.push(base.to_path_buf());
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn add_dir_children_depth2(base: &Path, out: &mut Vec<PathBuf>) {
+    if !base.is_dir() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let level1 = entry.path();
+            if !level1.is_dir() {
+                continue;
+            }
+            out.push(level1.clone());
+            if let Ok(level2_entries) = std::fs::read_dir(&level1) {
+                for entry2 in level2_entries.filter_map(|e| e.ok()) {
+                    let level2 = entry2.path();
+                    if level2.is_dir() {
+                        out.push(level2);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn candidate_root_dirs(db_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = db_dir.parent() {
+        add_dir_and_children(parent, &mut candidates);
+        if let Some(grand) = parent.parent() {
+            add_dir_and_children(grand, &mut candidates);
+        }
+    }
+    add_dir_children_depth2(Path::new("/media"), &mut candidates);
+    add_dir_children_depth2(Path::new("/run/media"), &mut candidates);
+    add_dir_children_depth2(Path::new("/mnt"), &mut candidates);
+    dedupe_dirs(candidates)
+}
+
+async fn load_collection_roots_from_table(db_dir: &Path) -> Result<HashMap<String, PathBuf>> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table_names = db.table_names().execute().await?;
+    if !table_names.iter().any(|name| name == COLLECTION_ROOTS_TABLE) {
+        return Ok(HashMap::new());
+    }
+
+    let table = db.open_table(COLLECTION_ROOTS_TABLE).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&["collection_id", "root_path"]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut roots = HashMap::new();
+    for batch in &batches {
+        let ids = string_col(batch, "collection_id")?;
+        let paths = string_col(batch, "root_path")?;
+        for row in 0..batch.num_rows() {
+            if ids.is_null(row) || paths.is_null(row) {
+                continue;
+            }
+            let collection = ids.value(row).trim();
+            let root_path = paths.value(row).trim();
+            if collection.is_empty() || root_path.is_empty() {
+                continue;
+            }
+            let root = PathBuf::from(root_path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(root_path));
+            roots.insert(collection.to_string(), root);
+        }
+    }
+    Ok(roots)
+}
+
+async fn collect_collection_samples_from_media_index(
+    db_dir: &Path,
+) -> Result<HashMap<String, Vec<String>>> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(MEDIA_INDEX_TABLE).execute().await?;
+    let stream = table
+        .query()
+        .select(Select::columns(&["file_name"]))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+    let mut samples: HashMap<String, Vec<String>> = HashMap::new();
+    for batch in &batches {
+        let file_names = string_col(batch, "file_name")?;
+        for row in 0..batch.num_rows() {
+            if file_names.is_null(row) {
+                continue;
+            }
+            let file_name = file_names.value(row);
+            let Some((collection, rel)) = file_name.split_once('/') else {
+                continue;
+            };
+            let rel = rel.trim_start_matches('/').to_string();
+            if rel.is_empty() {
+                continue;
+            }
+            let bucket = samples.entry(collection.to_string()).or_default();
+            if bucket.len() < 16 && !bucket.contains(&rel) {
+                bucket.push(rel);
+            }
+        }
+    }
+    Ok(samples)
+}
+
+fn discover_collection_roots_from_samples(
+    db_dir: &Path,
+    samples: &HashMap<String, Vec<String>>,
+) -> HashMap<String, PathBuf> {
+    let candidates = candidate_root_dirs(db_dir);
+    let mut roots = HashMap::new();
+
+    for (collection, rel_samples) in samples {
+        let mut best_path: Option<PathBuf> = None;
+        let mut best_hits = 0usize;
+        for candidate in &candidates {
+            let hits = rel_samples
+                .iter()
+                .filter(|rel| candidate.join(rel.as_str()).exists())
+                .count();
+            if hits > best_hits {
+                best_hits = hits;
+                best_path = Some(candidate.clone());
+            }
+        }
+        if best_hits > 0 {
+            if let Some(path) = best_path {
+                roots.insert(collection.clone(), path);
+            }
+        }
+    }
+    roots
+}
+
+async fn write_collection_roots_table(db_dir: &Path, roots: &HashMap<String, PathBuf>) -> Result<()> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table_names = db.table_names().execute().await?;
+    let table_exists = table_names.iter().any(|name| name == COLLECTION_ROOTS_TABLE);
+
+    let mut rows: Vec<(String, String)> = roots
+        .iter()
+        .map(|(collection, root)| (collection.clone(), root.to_string_lossy().to_string()))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let collection_ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+    let root_paths: Vec<String> = rows.iter().map(|(_, path)| path.clone()).collect();
+    let batch = RecordBatch::try_from_iter(vec![
+        ("collection_id", Arc::new(StringArray::from(collection_ids)) as ArrayRef),
+        ("root_path", Arc::new(StringArray::from(root_paths)) as ArrayRef),
+    ])?;
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+
+    if table_exists {
+        let table = db.open_table(COLLECTION_ROOTS_TABLE).execute().await?;
+        table
+            .add(Box::new(batches))
+            .mode(AddDataMode::Overwrite)
+            .execute()
+            .await?;
+    } else {
+        db.create_table(COLLECTION_ROOTS_TABLE, Box::new(batches))
+            .execute()
+            .await?;
+    }
+    Ok(())
+}
+
+fn load_or_discover_db_roots(db_dir: &Path) -> HashMap<String, PathBuf> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    let Ok(runtime) = runtime else {
+        return HashMap::new();
+    };
+
+    runtime.block_on(async {
+        let mut roots = load_collection_roots_from_table(db_dir)
+            .await
+            .unwrap_or_default();
+        let samples = collect_collection_samples_from_media_index(db_dir)
+            .await
+            .unwrap_or_default();
+        let discovered = discover_collection_roots_from_samples(db_dir, &samples);
+
+        let mut changed = false;
+        for (collection, discovered_root) in discovered {
+            match roots.get(&collection) {
+                Some(existing_root) => {
+                    if !existing_root.exists() && discovered_root.exists() {
+                        roots.insert(collection, discovered_root);
+                        changed = true;
+                    }
+                }
+                None => {
+                    roots.insert(collection, discovered_root);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            let _ = write_collection_roots_table(db_dir, &roots).await;
+        }
+        roots
+    })
+}
+
 fn get_db_roots() -> HashMap<String, PathBuf> {
     static ROOTS: std::sync::OnceLock<HashMap<String, PathBuf>> = std::sync::OnceLock::new();
-    ROOTS.get_or_init(|| {
-        let mut roots = HashMap::new();
-        roots.insert(
-            "phone".to_string(),
-            PathBuf::from("/media/lewis/1b/Phone")
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Phone")),
-        );
-        roots.insert(
-            "telegram_backup".to_string(),
-            PathBuf::from("/media/lewis/1b/Telegram Backup")
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Telegram Backup")),
-        );
-        roots
-    }).clone()
+    ROOTS
+        .get_or_init(|| {
+            let db_dir = get_db_dir();
+            load_or_discover_db_roots(&db_dir)
+        })
+        .clone()
 }
 
 fn file_matches_folder(file_name: &str, folder: &str, db_roots: &HashMap<String, PathBuf>) -> bool {
@@ -1991,16 +2481,20 @@ fn resolve_media_path(
     file_name: &str,
     timestamp_sec: f32,
 ) -> Result<PathBuf> {
-    let (collection, rel) = file_name
+    let source = resolve_source_path(roots, file_name)?;
+    let (_collection, rel) = file_name
         .split_once('/')
         .ok_or_else(|| anyhow!("file_name does not contain collection id"))?;
-    let root = roots
-        .get(collection)
-        .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
     let rel_path = Path::new(rel);
-    let source = root.join(rel_path);
     if is_video_path(&source) {
-        if let Some(still) = resolve_video_still(root, db_dir, rel_path, timestamp_sec)? {
+        let (collection, _) = file_name
+            .split_once('/')
+            .ok_or_else(|| anyhow!("file_name does not contain collection id"))?;
+        let root = roots
+            .get(collection)
+            .cloned()
+            .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
+        if let Some(still) = resolve_video_still(&root, db_dir, rel_path, timestamp_sec)? {
             return Ok(still);
         }
     }
@@ -2013,6 +2507,7 @@ fn resolve_source_path(roots: &HashMap<String, PathBuf>, file_name: &str) -> Res
         .ok_or_else(|| anyhow!("file_name does not contain collection id"))?;
     let root = roots
         .get(collection)
+        .cloned()
         .ok_or_else(|| anyhow!("no collection-root for {collection}"))?;
     Ok(root.join(Path::new(rel)))
 }
@@ -2023,7 +2518,8 @@ fn db_filename_from_video_still_path(path: &Path) -> Option<String> {
         return None;
     }
     
-    let db_dir = Path::new("/media/lewis/1b/lancedb");
+    let db_dir_buf = get_db_dir();
+    let db_dir = db_dir_buf.as_path();
     
     let rel = path.strip_prefix(db_dir).ok().map(|p| p.to_path_buf()).or_else(|| {
         let canon_path = path.canonicalize().ok()?;
@@ -2156,8 +2652,9 @@ fn resolve_video_still(
 }
 
 fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
+    let imagesearch_dir = resolve_imagesearch_dir();
     let output = Command::new("uv")
-        .current_dir("/home/lewis/Dev/imagesearch")
+        .current_dir(&imagesearch_dir)
         .args([
             "run",
             "python",
@@ -2205,6 +2702,88 @@ fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
         keypoints_a,
         keypoints_b
     ))
+}
+
+fn compute_on_demand_embeddings(
+    image_path: &Path,
+    need_clip: bool,
+    need_faces: bool,
+) -> Result<(Option<Vec<f32>>, Vec<Vec<f32>>)> {
+    let imagesearch_dir = resolve_imagesearch_dir();
+    let helper_script = resolve_on_demand_embeddings_script_path();
+    let mut cmd = Command::new("uv");
+    cmd.current_dir(&imagesearch_dir);
+    cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
+    cmd.args(["run", "python"]);
+    cmd.arg(&helper_script);
+    cmd.arg("--image");
+    cmd.arg(image_path);
+    if need_clip {
+        cmd.arg("--clip");
+    }
+    if need_faces {
+        cmd.arg("--faces");
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow!("failed to run embedding helper: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+        "embedding helper failed (status {}) using {} and {}: {}",
+            output.status,
+            imagesearch_dir.display(),
+            helper_script.display(),
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                stderr.as_str()
+            }
+        );
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("invalid embedding helper JSON: {e}"))?;
+    if !payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("embedding helper returned ok=false");
+        bail!("{err}");
+    }
+
+    let clip_vector = payload
+        .get("clip_embedding")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_f64)
+                .map(|v| v as f32)
+                .collect::<Vec<f32>>()
+        })
+        .filter(|vec| !vec.is_empty());
+
+    let face_vectors = payload
+        .get("face_embeddings")
+        .and_then(Value::as_array)
+        .map(|outer| {
+            outer
+                .iter()
+                .filter_map(Value::as_array)
+                .map(|inner| {
+                    inner
+                        .iter()
+                        .filter_map(Value::as_f64)
+                        .map(|v| v as f32)
+                        .collect::<Vec<f32>>()
+                })
+                .filter(|vec| !vec.is_empty())
+                .collect::<Vec<Vec<f32>>>()
+        })
+        .unwrap_or_default();
+
+    Ok((clip_vector, face_vectors))
 }
 
 struct ImageViewer {
@@ -2255,6 +2834,8 @@ struct ImageViewer {
     semantic_mode: SearchMode,
     semantic_results: Vec<SearchResult>,
     semantic_status: String,
+    pending_search_request: Option<PendingSearchRequest>,
+    on_demand_embed_rx: Option<Receiver<Result<OnDemandEmbedResult, String>>>,
     
     // Duplicates & SIFT states
     compare_target: Option<PathBuf>,
@@ -2268,6 +2849,9 @@ struct ImageViewer {
 
     // Cache resolved video still paths to avoid redundant manifest.json reads on the UI thread
     video_still_cache: std::cell::RefCell<HashMap<PathBuf, PathBuf>>,
+
+    // Cache duplicate sidebar pHash rows so repainting/scrolling does not rebuild large groups.
+    duplicate_similars_cache: std::cell::RefCell<HashMap<String, Vec<SimilarFile>>>,
 
     // Cache computed resolution and size strings to avoid heavy sync disk I/O on the UI thread
     resolution_size_cache: std::cell::RefCell<HashMap<PathBuf, String>>,
@@ -2334,7 +2918,6 @@ fn get_system_disks() -> Vec<PathBuf> {
     let usernames = vec![
         std::env::var("USER").unwrap_or_default(),
         std::env::var("USERNAME").unwrap_or_default(),
-        "lewis".to_string(), // explicit check for current user since it's standard
     ];
     
     let mut scan_paths = vec![
@@ -2382,11 +2965,9 @@ fn get_system_disks() -> Vec<PathBuf> {
 }
 
 fn is_path_ai_backed(path: &Path) -> bool {
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let db_roots = get_db_roots();
     for root in db_roots.values() {
-        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        if canon_path.starts_with(&canon_root) {
+        if path.starts_with(root) {
             return true;
         }
     }
@@ -2606,6 +3187,8 @@ impl ImageViewer {
             semantic_mode: SearchMode::Filename,
             semantic_results: Vec::new(),
             semantic_status: "Ready. Enter a phrase and press Search.".to_string(),
+            pending_search_request: None,
+            on_demand_embed_rx: None,
             
             // SIFT defaults
             compare_target: None,
@@ -2615,6 +3198,7 @@ impl ImageViewer {
 
             db_filename_by_path: HashMap::new(),
             video_still_cache: std::cell::RefCell::new(HashMap::new()),
+            duplicate_similars_cache: std::cell::RefCell::new(HashMap::new()),
             resolution_size_cache: std::cell::RefCell::new(HashMap::new()),
             db_filename_cache: std::cell::RefCell::new(HashMap::new()),
             show_home_page: start_on_home_page,
@@ -2651,10 +3235,14 @@ impl ImageViewer {
                 };
                 
             let result: Result<DatabaseIndices, anyhow::Error> = rt.block_on(async {
-                let db_dir = Path::new("/media/lewis/1b/lancedb");
-                let table_name = "media_index";
-                let onnx_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/clip_text.onnx");
-                let tokenizer_path = Path::new("/home/lewis/Dev/imagesearch/models/clip-text/tokenizer.json");
+                let db_dir_buf = get_db_dir();
+                let db_dir = db_dir_buf.as_path();
+                let table_name = MEDIA_INDEX_TABLE;
+                let imagesearch_dir = resolve_imagesearch_dir();
+                let onnx_path_buf = imagesearch_dir.join("models/clip-text/clip_text.onnx");
+                let tokenizer_path_buf = imagesearch_dir.join("models/clip-text/tokenizer.json");
+                let onnx_path = onnx_path_buf.as_path();
+                let tokenizer_path = tokenizer_path_buf.as_path();
                 
                 let db_fut = load_all_database_indices(db_dir, table_name);
                 let encoder_fut = async {
@@ -2725,10 +3313,23 @@ impl ImageViewer {
                 self.db_loaded = true;
                 self.db_loading = false;
                 self.semantic_status = "AI Explorer Database Loaded successfully! Ready to search.".to_string();
+                if let Some(request) = self.pending_search_request.take() {
+                    let maybe_ctx = self
+                        .ctx_shared
+                        .lock()
+                        .ok()
+                        .and_then(|lock| lock.as_ref().cloned());
+                    if let Some(ctx) = maybe_ctx {
+                        self.run_search_request_now(request, &ctx);
+                    } else {
+                        self.pending_search_request = Some(request);
+                    }
+                }
             }
             Ok(Err(err)) => {
                 self.db_loading = false;
                 self.db_failed = true;
+                self.pending_search_request = None;
                 self.semantic_status = format!("❌ AI DB Initialization failed: {err}");
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2737,23 +3338,72 @@ impl ImageViewer {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.db_loading = false;
                 self.db_failed = true;
+                self.pending_search_request = None;
                 self.semantic_status = "❌ AI DB Loader thread disconnected unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn poll_on_demand_embeddings(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.on_demand_embed_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(payload)) => {
+                let label = Self::label_for_request(&payload.request);
+                match payload.request {
+                    PendingSearchRequest::Similar { db_file_name, .. } => {
+                        if let Some(query_vector) = payload.clip_vector {
+                            self.show_most_similar_from_vector(
+                                query_vector,
+                                db_file_name.as_deref(),
+                                &label,
+                            );
+                        } else {
+                            self.semantic_status =
+                                format!("No CLIP embedding produced for {label}");
+                        }
+                    }
+                    PendingSearchRequest::Person { .. } => {
+                        self.show_more_of_this_person_with_vectors(payload.face_vectors, &label);
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.semantic_status = format!("On-demand embedding failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.on_demand_embed_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.semantic_status =
+                    "On-demand embedding worker disconnected unexpectedly.".to_string();
             }
         }
     }
 
     fn get_db_filename_from_path(&self, path: &Path) -> Option<String> {
         let roots = get_db_roots();
+        let path_norm = path.to_string_lossy().replace('\\', "/");
+
+        // Fast path 0: already a DB-style relative path such as:
+        //   <collection_id>/...
+        // This must resolve directly to collection roots.
+        let trimmed = path_norm.trim_start_matches("./").trim_start_matches('/');
+        if let Some((collection, rel)) = trimmed.split_once('/') {
+            if !rel.is_empty() && roots.contains_key(collection) {
+                return Some(format!("{}/{}", collection, rel.trim_start_matches('/')));
+            }
+        }
         
         // Fast path 1: folder component substring match (extremely robust against mount path/canonicalize differences like /media vs /run/media)
-        for (col_id, _root_path) in &roots {
-            let folder_name = match col_id.as_str() {
-                "phone" => "Phone",
-                "telegram_backup" => "Telegram Backup",
-                _ => col_id.as_str(),
-            };
+        for (col_id, root_path) in &roots {
+            let folder_name = root_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(col_id.as_str());
             
-            let path_norm = path.to_string_lossy().replace('\\', "/");
             let path_lower = path_norm.to_lowercase();
             let match_str_lower = format!("/{}/", folder_name.to_lowercase());
             if let Some(pos) = path_lower.find(&match_str_lower) {
@@ -2762,23 +3412,8 @@ impl ImageViewer {
             }
         }
         
-        // Fast path 2: try raw strip prefix first WITHOUT touching the disk or canonicalizing!
+        // Fast path 2: prefix-strip against known roots without touching the disk.
         for (col_id, root_path) in &roots {
-            if let Ok(rel) = path.strip_prefix(root_path) {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
-            }
-        }
-        
-        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        
-        // Primary: prefix-strip against known roots (canonicalized and raw)
-        for (col_id, root_path) in &roots {
-            let root_canon = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
-            if let Ok(rel) = canon_path.strip_prefix(&root_canon) {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
-            }
             if let Ok(rel) = path.strip_prefix(root_path) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
                 return Some(format!("{}/{}", col_id, rel_str.trim_start_matches('/')));
@@ -2793,23 +3428,18 @@ impl ImageViewer {
                 let rel = &path_str[root_str.len()..];
                 return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
             }
-            if let Ok(root_canon) = root_path.canonicalize() {
-                let root_canon_str = root_canon.to_string_lossy().replace('\\', "/");
-                if path_str.starts_with(&root_canon_str) {
-                    let rel = &path_str[root_canon_str.len()..];
-                    return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
-                }
-            }
         }
 
         // Tertiary: basename lookup in loaded index.
-        // Handles images opened from arbitrary folders (e.g. pHash similar previews)
-        // that still exist in the DB under a different root path.
-        if let Some(indices) = &self.db_indices {
-            if let Some(fname) = path.file_name() {
-                let base = fname.to_string_lossy().to_lowercase();
-                if let Some(resolved) = indices.basename_to_db_filename.get(&base) {
-                    return Some(resolved.clone());
+        // Only use this for non-existing/virtual paths (e.g. synthesized preview references).
+        // For real existing full paths outside mapped roots, basename matching is too ambiguous.
+        if !path.exists() {
+            if let Some(indices) = &self.db_indices {
+                if let Some(fname) = path.file_name() {
+                    let base = fname.to_string_lossy().to_lowercase();
+                    if let Some(resolved) = indices.basename_to_db_filename.get(&base) {
+                        return Some(resolved.clone());
+                    }
                 }
             }
         }
@@ -2856,7 +3486,8 @@ impl ImageViewer {
             }
 
             if let Some(file_name) = self.resolve_db_filename(path) {
-                let db_dir = Path::new("/media/lewis/1b/lancedb");
+                let db_dir_buf = get_db_dir();
+                let db_dir = db_dir_buf.as_path();
                 let db_roots = get_db_roots();
                 if let Some((collection, rel)) = file_name.split_once('/') {
                     if let Some(root) = db_roots.get(collection) {
@@ -2871,6 +3502,65 @@ impl ImageViewer {
         }
         path.to_path_buf()
     }
+
+    fn combined_phash_similars_for(
+        &self,
+        master_file_name: &str,
+        sift_members: &[String],
+    ) -> Vec<SimilarFile> {
+        let cache_key = if sift_members.is_empty() {
+            master_file_name.to_string()
+        } else {
+            let mut key = master_file_name.to_string();
+            for member in sift_members {
+                key.push('\0');
+                key.push_str(member);
+            }
+            key
+        };
+
+        if let Some(cached) = self.duplicate_similars_cache.borrow().get(&cache_key) {
+            return cached.clone();
+        }
+
+        let Some(indices) = self.db_indices.as_ref() else {
+            return Vec::new();
+        };
+        let mut combined = Vec::new();
+        let mut seen = HashSet::new();
+
+        if sift_members.is_empty() {
+            if let Some(items) = indices.similar_by_master.get(master_file_name) {
+                for item in items {
+                    if seen.insert(item.file_name.clone()) {
+                        combined.push(item.clone());
+                    }
+                }
+            }
+        } else {
+            for member in sift_members {
+                if let Some(items) = indices.similar_by_master.get(member.as_str()) {
+                    for item in items {
+                        if seen.insert(item.file_name.clone()) {
+                            combined.push(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        combined.sort_by(|a, b| {
+            b.similarity_pct
+                .unwrap_or(f32::NEG_INFINITY)
+                .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
+                .unwrap_or(Ordering::Equal)
+        });
+        self.duplicate_similars_cache
+            .borrow_mut()
+            .insert(cache_key, combined.clone());
+        combined
+    }
+
     fn get_file_resolution_and_size(&self, path: &Path) -> String {
         if let Some(cached) = self.resolution_size_cache.borrow().get(path) {
             return cached.clone();
@@ -3015,7 +3705,8 @@ impl ImageViewer {
         }
         
         let db_roots = get_db_roots();
-        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        let db_dir_buf = get_db_dir();
+        let db_dir = db_dir_buf.as_path();
         for row in &mut results {
             row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
             if let Some(path) = &row.media_path {
@@ -3054,7 +3745,8 @@ impl ImageViewer {
         }
         
         let db_roots = get_db_roots();
-        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        let db_dir_buf = get_db_dir();
+        let db_dir = db_dir_buf.as_path();
         for row in &mut results {
             row.media_path = resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
             if let Some(path) = &row.media_path {
@@ -3227,10 +3919,10 @@ impl ImageViewer {
     fn update_exif(&mut self) {
         if let Some(path) = self.images.get(self.current_index) {
             let resolved_path = self.resolve_actual_path(path);
-            let inspect_path: &Path = if path.exists() {
-                path.as_path()
-            } else {
+            let inspect_path: &Path = if resolved_path.exists() {
                 resolved_path.as_path()
+            } else {
+                path.as_path()
             };
 
             self.current_dimensions = match image::image_dimensions(inspect_path) {
@@ -3251,14 +3943,47 @@ impl ImageViewer {
                 })
                 .unwrap_or_else(|_| "Unknown size".to_string());
 
-            let output = Command::new("exiftool")
-                .args(["-a", "-u", "-g1", "-H"])
-                .arg(inspect_path)
-                .output();
-
-            self.exif_data = match output {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-                Err(e) => format!("Error running exiftool: {}", e),
+            let exiftool_data = if !inspect_path.exists() {
+                format!("Resolved file does not exist: {}", inspect_path.display())
+            } else if let Some(exiftool_path) = resolve_exiftool_path() {
+                match Command::new(&exiftool_path)
+                    .args(["-a", "-u", "-g1", "-H"])
+                    .arg(inspect_path)
+                    .output()
+                {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                        if !stdout.trim().is_empty() {
+                            stdout
+                        } else {
+                            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                            if stderr.is_empty() {
+                                format!(
+                                    "exiftool produced no output for {}",
+                                    inspect_path.display()
+                                )
+                            } else {
+                                format!("exiftool error: {}", stderr)
+                            }
+                        }
+                    }
+                    Err(e) => format!(
+                        "Error running exiftool at {}: {}",
+                        exiftool_path.display(),
+                        e
+                    ),
+                }
+            } else {
+                "Error running exiftool: executable not found. Set IRIS_EXIFTOOL or install exiftool.".to_string()
+            };
+            self.exif_data = if inspect_path.exists() && is_video_path(inspect_path) {
+                format!(
+                    "{}\n\n---- FFprobe JSON ----\n{}",
+                    exiftool_data.trim_end(),
+                    load_ffprobe_metadata(inspect_path)
+                )
+            } else {
+                exiftool_data
             };
 
             if let Ok(bytes) = std::fs::read(inspect_path) {
@@ -3334,6 +4059,7 @@ impl ImageViewer {
     }
 
     fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[derive(Clone)]
         struct GalleryItem {
             path: PathBuf,
             is_video: bool,
@@ -3343,19 +4069,6 @@ impl ImageViewer {
         }
 
         ui.vertical(|ui| {
-            // Title and Close
-            ui.horizontal(|ui| {
-                ui.heading("Folder Gallery and Search");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("❌ Close Gallery [G]").clicked() {
-                        self.show_grid = false;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(8.0);
-            
             // Dynamic Database Mapping Check & Auto Lazy Load
             let has_db = self.current_folder_has_db_mappings();
             if (self.semantic_mode == SearchMode::Clip || self.semantic_mode == SearchMode::Ocr) && !self.db_loaded && !self.db_loading {
@@ -3370,11 +4083,11 @@ impl ImageViewer {
                 ui.add_enabled_ui(has_db, |ui| {
                     let clip_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "Description Search");
                     if !has_db {
-                        clip_btn.on_hover_text("Description search is only available for Phone or Telegram Backup folders.");
+                        clip_btn.on_hover_text("Description search is available for folders mapped in the database collection roots.");
                     }
                     let ocr_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "OCR Text");
                     if !has_db {
-                        ocr_btn.on_hover_text("OCR Search is only available for Phone or Telegram Backup folders.");
+                        ocr_btn.on_hover_text("OCR search is available for folders mapped in the database collection roots.");
                     }
                 });
                 
@@ -3493,7 +4206,23 @@ impl ImageViewer {
                                 is_video: item.is_video,
                                 score_label: Some(match self.semantic_mode {
                                     SearchMode::Clip => format!("{:.0}% Match", (item.score * 100.0).clamp(0.0, 100.0)),
-                                    SearchMode::Ocr => "OCR Match".to_string(),
+                                    SearchMode::Ocr => {
+                                        if item.ocr_phrase_query {
+                                            format!(
+                                                "{} / {} words (exact phrase)",
+                                                item.ocr_term_hits,
+                                                item.ocr_query_terms
+                                            )
+                                        } else if item.ocr_query_terms > 0 {
+                                            format!(
+                                                "{} / {} words",
+                                                item.ocr_term_hits,
+                                                item.ocr_query_terms
+                                            )
+                                        } else {
+                                            "OCR Match".to_string()
+                                        }
+                                    }
                                     _ => String::new(),
                                 }),
                                 timestamp_sec: item.timestamp_sec,
@@ -3524,10 +4253,10 @@ impl ImageViewer {
                     let num_rows = (num_items + cols - 1) / cols;
                     let row_height = 160.0 + 12.0;
 
-                    let mut clicked_path = None;
+                    let mut double_clicked_item: Option<GalleryItem> = None;
                     let mut single_clicked_path = None;
-                    let mut clicked_similar = None;
-                    let mut clicked_person = None;
+                    let mut clicked_similar: Option<PendingSearchRequest> = None;
+                    let mut clicked_person: Option<PendingSearchRequest> = None;
 
                     egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
                         for row_idx in row_range {
@@ -3599,31 +4328,38 @@ impl ImageViewer {
                                         }
                                         if item.is_video {
                                             if ui.button("🎬 Open in mpv").clicked() {
+                                                let playback_path = if let Some(db_name) = &item.db_filename {
+                                                    let roots = get_db_roots();
+                                                    resolve_source_path(&roots, db_name)
+                                                        .ok()
+                                                        .unwrap_or_else(|| self.resolve_actual_path(path))
+                                                } else {
+                                                    self.resolve_actual_path(path)
+                                                };
                                                 let _ = std::process::Command::new("mpv")
                                                     .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
-                                                    .arg(path)
+                                                    .arg(playback_path)
                                                     .spawn();
                                                 ui.close();
                                             }
                                         }
-                                        if let Some(db_name) = &item.db_filename {
-                                            ui.separator();
-                                            if ui.button("Show most similar").clicked() {
-                                                let sr = SearchResult {
-                                                    rank: 0,
-                                                    score: 1.0,
-                                                    file_name: db_name.clone(),
-                                                    is_video: item.is_video,
-                                                    timestamp_sec: item.timestamp_sec,
-                                                    media_path: Some(path.clone()),
-                                                };
-                                                clicked_similar = Some(sr);
-                                                ui.close();
-                                            }
-                                            if ui.button("👥 Show more of this person").clicked() {
-                                                clicked_person = Some(db_name.clone());
-                                                ui.close();
-                                            }
+                                        ui.separator();
+                                        if ui.button("Show most similar").clicked() {
+                                            clicked_similar = Some(PendingSearchRequest::Similar {
+                                                db_file_name: item.db_filename.clone(),
+                                                media_path: path.clone(),
+                                                is_video: item.is_video,
+                                                timestamp_sec: item.timestamp_sec,
+                                            });
+                                            ui.close();
+                                        }
+                                        if ui.button("Show more of this person").clicked() {
+                                            clicked_person = Some(PendingSearchRequest::Person {
+                                                db_file_name: item.db_filename.clone(),
+                                                media_path: path.clone(),
+                                                is_video: item.is_video,
+                                            });
+                                            ui.close();
                                         }
                                     });
 
@@ -3720,7 +4456,26 @@ impl ImageViewer {
                                     };
                                     ui.painter().rect_filled(banner_rect, banner_rounding, egui::Color32::from_black_alpha(180));
 
-                                    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                    let filename_owned = if let Some(db_name) = &item.db_filename {
+                                        db_name
+                                            .split_once('/')
+                                            .map(|(_, rel)| rel)
+                                            .and_then(|rel| Path::new(rel).file_name())
+                                            .and_then(|s| s.to_str())
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| {
+                                                path.file_name()
+                                                    .and_then(|s| s.to_str())
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            })
+                                    } else {
+                                        path.file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("")
+                                            .to_string()
+                                    };
+                                    let filename = filename_owned.as_str();
                                     let filename_label = if filename.chars().count() > 22 {
                                         format!("{}...", filename.chars().take(19).collect::<String>())
                                     } else {
@@ -3780,7 +4535,7 @@ impl ImageViewer {
                                     }
                                         
                                     if response.double_clicked() {
-                                        clicked_path = Some(path.clone());
+                                        double_clicked_item = Some(item.clone());
                                     } else if response.clicked() {
                                         single_clicked_path = Some(path.clone());
                                     }
@@ -3788,7 +4543,26 @@ impl ImageViewer {
                         }
                     });
                     
-                    if let Some(path) = clicked_path {
+                    if let Some(item) = double_clicked_item {
+                        let path = item.path.clone();
+                        if let Some(db_name) = &item.db_filename {
+                            self.db_filename_by_path.insert(path.clone(), db_name.clone());
+                        }
+
+                        if item.is_video {
+                            let playback_path = if let Some(db_name) = &item.db_filename {
+                                let roots = get_db_roots();
+                                resolve_source_path(&roots, db_name)
+                                    .ok()
+                                    .unwrap_or_else(|| self.resolve_actual_path(&path))
+                            } else {
+                                self.resolve_actual_path(&path)
+                            };
+                            let _ = std::process::Command::new("mpv")
+                                .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
+                                .arg(playback_path)
+                                .spawn();
+                        } else {
                         let active_paths: Vec<PathBuf> = if is_active_semantic_search {
                             for item in &gallery_items {
                                 if let Some(db_name) = &item.db_filename {
@@ -3810,6 +4584,7 @@ impl ImageViewer {
                         self.offset = egui::Vec2::ZERO;
                         self.update_exif();
                         ui.ctx().request_repaint();
+                        }
                     }
                     
                     if let Some(path) = single_clicked_path {
@@ -3835,13 +4610,13 @@ impl ImageViewer {
                         }
                     }
 
-                    if let Some(item) = clicked_similar {
-                        self.show_most_similar_clip(&item);
+                    if let Some(request) = clicked_similar {
+                        self.request_search_action(request, ui.ctx());
                         ui.ctx().request_repaint();
                     }
 
-                    if let Some(name) = clicked_person {
-                        self.show_more_of_this_person(&name);
+                    if let Some(request) = clicked_person {
+                        self.request_search_action(request, ui.ctx());
                         ui.ctx().request_repaint();
                     }
                 }
@@ -3867,12 +4642,13 @@ impl ImageViewer {
         best.map(|(entry, _)| entry.vector.clone())
     }
 
-    fn show_most_similar_clip(&mut self, row: &SearchResult) {
+    fn show_most_similar_from_vector(
+        &mut self,
+        query_vector: Vec<f32>,
+        exclude_file: Option<&str>,
+        label: &str,
+    ) {
         let Some(indices) = &self.db_indices else {
-            return;
-        };
-        let Some(query_vector) = self.clip_vector_for_result(row) else {
-            self.semantic_status = format!("no CLIP vector found for {}", row.file_name);
             return;
         };
         if query_vector.len() != indices.clip_index.dim {
@@ -3886,11 +4662,14 @@ impl ImageViewer {
         let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(12)).max(self.semantic_limit + 32);
         let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, false, "");
-        results.retain(|candidate| candidate.file_name != row.file_name);
+        if let Some(exclude) = exclude_file {
+            results.retain(|candidate| candidate.file_name != exclude);
+        }
         results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         
         let db_roots = get_db_roots();
-        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        let db_dir_buf = get_db_dir();
+        let db_dir = db_dir_buf.as_path();
         for candidate in &mut results {
             candidate.media_path =
                 resolve_media_path(&db_roots, db_dir, &candidate.file_name, candidate.timestamp_sec).ok();
@@ -3903,9 +4682,17 @@ impl ImageViewer {
             "✓ Found {} CLIP-similar results in {} ms for {}",
             results.len(),
             took,
-            row.file_name
+            label
         );
         self.semantic_results = results;
+    }
+
+    fn show_most_similar_clip(&mut self, row: &SearchResult) {
+        let Some(query_vector) = self.clip_vector_for_result(row) else {
+            self.semantic_status = format!("no CLIP vector found for {}", row.file_name);
+            return;
+        };
+        self.show_most_similar_from_vector(query_vector, Some(row.file_name.as_str()), &row.file_name);
     }
 
     fn face_vectors_for_file(indices: &DatabaseIndices, file_name: &str) -> Vec<Vec<f32>> {
@@ -3954,20 +4741,24 @@ impl ImageViewer {
         related
     }
 
-    fn show_more_of_this_person(&mut self, file_name: &str) {
+    fn query_face_vectors_for_seed(&self, file_name: &str) -> Vec<Vec<f32>> {
         let Some(indices) = &self.db_indices else {
-            return;
+            return Vec::new();
         };
         let related_files = Self::related_files_for_face_seed(indices, file_name);
         let mut query_faces = Vec::new();
         for related in &related_files {
             query_faces.extend(Self::face_vectors_for_file(indices, related));
         }
+        query_faces
+    }
+
+    fn show_more_of_this_person_with_vectors(&mut self, query_faces: Vec<Vec<f32>>, label: &str) {
+        let Some(indices) = &self.db_indices else {
+            return;
+        };
         if query_faces.is_empty() {
-            self.semantic_status = format!(
-                "No stored face vectors for {file_name} or {} related file(s)",
-                related_files.len().saturating_sub(1)
-            );
+            self.semantic_status = format!("No face embeddings available for {label}");
             self.semantic_results = Vec::new();
             return;
         }
@@ -3975,9 +4766,10 @@ impl ImageViewer {
         let mut results =
             search_face_index(&indices.face_index, &query_faces, 500, FACE_MATCH_MIN_SCORE);
         results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, 500);
-        
+
         let db_roots = get_db_roots();
-        let db_dir = Path::new("/media/lewis/1b/lancedb");
+        let db_dir_buf = get_db_dir();
+        let db_dir = db_dir_buf.as_path();
         for row in &mut results {
             row.media_path =
                 resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
@@ -3987,13 +4779,150 @@ impl ImageViewer {
         }
         let took = started.elapsed().as_millis();
         self.semantic_status = format!(
-            "✓ Found {} person results in {} ms using {} query face vector(s)",
+            "✓ Found {} person results in {} ms using {} query face vector(s) for {}",
             results.len(),
             took,
-            query_faces.len()
+            query_faces.len(),
+            label
         );
         self.semantic_results = results;
     }
+
+    fn label_for_request(request: &PendingSearchRequest) -> String {
+        match request {
+            PendingSearchRequest::Similar {
+                db_file_name,
+                media_path,
+                ..
+            }
+            | PendingSearchRequest::Person {
+                db_file_name,
+                media_path,
+                ..
+            } => db_file_name
+                .clone()
+                .unwrap_or_else(|| media_path.to_string_lossy().to_string()),
+        }
+    }
+
+    fn inspect_path_for_request(&self, request: &PendingSearchRequest) -> PathBuf {
+        match request {
+            PendingSearchRequest::Similar {
+                media_path,
+                is_video,
+                ..
+            }
+            | PendingSearchRequest::Person {
+                media_path,
+                is_video,
+                ..
+            } => {
+                let resolved = self.resolve_actual_path(media_path);
+                if *is_video {
+                    self.get_thumbnail_path(&resolved)
+                } else {
+                    resolved
+                }
+            }
+        }
+    }
+
+    fn start_on_demand_embedding_request(
+        &mut self,
+        request: PendingSearchRequest,
+        need_clip: bool,
+        need_faces: bool,
+        ctx: &egui::Context,
+    ) {
+        if self.on_demand_embed_rx.is_some() {
+            return;
+        }
+        let image_path = self.inspect_path_for_request(&request);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<OnDemandEmbedResult, String>>();
+        self.on_demand_embed_rx = Some(rx);
+        let request_clone = request.clone();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = compute_on_demand_embeddings(&image_path, need_clip, need_faces)
+                .map(|(clip_vector, face_vectors)| OnDemandEmbedResult {
+                    request: request_clone,
+                    clip_vector,
+                    face_vectors,
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn run_search_request_now(&mut self, request: PendingSearchRequest, ctx: &egui::Context) {
+        match &request {
+            PendingSearchRequest::Similar {
+                db_file_name,
+                media_path,
+                is_video,
+                timestamp_sec,
+            } => {
+                if let Some(db_name) = db_file_name {
+                    let row = SearchResult {
+                        rank: 0,
+                        score: 1.0,
+                        file_name: db_name.clone(),
+                        is_video: *is_video,
+                        timestamp_sec: *timestamp_sec,
+                        media_path: Some(media_path.clone()),
+                        ocr_term_hits: 0,
+                        ocr_query_terms: 0,
+                        ocr_phrase_query: false,
+                    };
+                    if self.clip_vector_for_result(&row).is_some() {
+                        self.show_most_similar_clip(&row);
+                        return;
+                    }
+                }
+                self.semantic_status = format!(
+                    "Computing CLIP embedding on the fly for {}...",
+                    Self::label_for_request(&request)
+                );
+                self.start_on_demand_embedding_request(request, true, false, ctx);
+            }
+            PendingSearchRequest::Person { db_file_name, .. } => {
+                if let Some(db_name) = db_file_name {
+                    let query_faces = self.query_face_vectors_for_seed(db_name);
+                    if !query_faces.is_empty() {
+                        self.show_more_of_this_person_with_vectors(query_faces, db_name);
+                        return;
+                    }
+                }
+                self.semantic_status = format!(
+                    "Computing face embeddings on the fly for {}...",
+                    Self::label_for_request(&request)
+                );
+                self.start_on_demand_embedding_request(request, false, true, ctx);
+            }
+        }
+    }
+
+    fn request_search_action(&mut self, request: PendingSearchRequest, ctx: &egui::Context) {
+        let label = Self::label_for_request(&request);
+        self.semantic_mode = SearchMode::Clip;
+        self.semantic_query = label.clone();
+        self.semantic_results.clear();
+        self.pending_search_request = Some(request.clone());
+
+        if !self.db_loaded {
+            self.semantic_status =
+                format!("Loading AI DB to search for matches related to {label}...");
+            if !self.db_failed && !self.db_loading {
+                self.start_lazy_db_load(ctx);
+            }
+            return;
+        }
+
+        self.pending_search_request = None;
+        self.run_search_request_now(request, ctx);
+    }
+
 }
 
 impl eframe::App for ImageViewer {
@@ -4006,6 +4935,7 @@ impl eframe::App for ImageViewer {
 
         self.poll_db_load();
         self.poll_sift_alignment();
+        self.poll_on_demand_embeddings(ctx);
 
         if !self.db_loaded && !self.db_loading {
             let is_ai = if let Some(p) = self.images.get(self.current_index) {
@@ -4163,7 +5093,25 @@ impl eframe::App for ImageViewer {
                 
                 ui.separator();
                 if let Some(path) = self.images.get(self.current_index) {
-                    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                    let filename = self
+                        .resolve_db_filename(path)
+                        .and_then(|db_name| {
+                            db_name
+                                .split_once('/')
+                                .map(|(_, rel)| rel.to_string())
+                        })
+                        .and_then(|rel| {
+                            Path::new(&rel)
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            path.file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or("")
+                                .to_string()
+                        });
                     ui.label(format!("{} ({}/{}) - {} - {}", filename, self.current_index + 1, self.images.len(), self.current_dimensions, self.current_file_size));
                 } else {
                     ui.label("No image loaded");
@@ -4393,38 +5341,8 @@ impl eframe::App for ImageViewer {
                                     }
                                 }
                                 
-                                // Combine pHash/VideoHash similars for all SIFT members in this group
-                                let member_sources: Vec<String> = if sift_members.is_empty() {
-                                    vec![master_file_name.clone()]
-                                } else {
-                                    sift_members.clone()
-                                };
-                                
-                                let mut combined_similars: Vec<SimilarFile> = Vec::new();
-                                let mut combined_seen = HashSet::new();
-                                for member in &member_sources {
-                                    let mut items = indices.similar_by_master
-                                        .get(member.as_str())
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    items.sort_by(|a, b| {
-                                        b.similarity_pct
-                                            .unwrap_or(f32::NEG_INFINITY)
-                                            .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
-                                            .unwrap_or(Ordering::Equal)
-                                    });
-                                    for item in &items {
-                                        if combined_seen.insert(item.file_name.clone()) {
-                                            combined_similars.push(item.clone());
-                                        }
-                                    }
-                                }
-                                combined_similars.sort_by(|a, b| {
-                                    b.similarity_pct
-                                        .unwrap_or(f32::NEG_INFINITY)
-                                        .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
-                                        .unwrap_or(Ordering::Equal)
-                                });
+                                let combined_similars =
+                                    self.combined_phash_similars_for(&master_file_name, &sift_members);
                                 
                                 // Precompute SIFT members metadata
                                 // source_path = original file (video/image), preview_path = video still or image
@@ -4433,7 +5351,8 @@ impl eframe::App for ImageViewer {
                                 for member in &displayed_sift_members {
                                     let source_path_opt = resolve_source_path(&roots, member).ok();
                                     let preview_path_opt = source_path_opt.as_ref().map(|p| self.get_thumbnail_path(p));
-                                    let member_is_video = source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
+                                    let member_is_video = is_video_path(Path::new(member))
+                                        || source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
                                     let res_size_str = source_path_opt.as_ref()
                                         .map(|p| self.get_file_resolution_and_size(p))
                                         .unwrap_or_else(|| "n/a".to_string());
@@ -4441,18 +5360,6 @@ impl eframe::App for ImageViewer {
                                     displayed_sift_metadata.push((member.clone(), source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str));
                                 }
 
-                                // Precompute combined similars metadata
-                                let mut combined_similars_metadata = Vec::new();
-                                for item in &combined_similars {
-                                    let source_path_opt = resolve_source_path(&roots, &item.file_name).ok();
-                                    let preview_path_opt = source_path_opt.as_ref().map(|p| self.get_thumbnail_path(p));
-                                    let item_is_video = source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
-                                    let res_size_str = source_path_opt.as_ref()
-                                        .map(|p| self.get_file_resolution_and_size(p))
-                                        .unwrap_or_else(|| "n/a".to_string());
-                                    combined_similars_metadata.push((item.clone(), source_path_opt, preview_path_opt, item_is_video, res_size_str));
-                                }
-                                
                                 ui.heading("👥 Duplicate Matches");
                                 ui.add_space(4.0);
                                 ui.weak(format!("Current: {}", filename));
@@ -4470,7 +5377,7 @@ impl eframe::App for ImageViewer {
                                     ui.add_space(6.0);
                                     
                                     let active_resolved = self.get_thumbnail_path(&path);
-                                    let active_is_video = is_video_path(&path);
+                                    let active_is_video = current_is_video;
                                     let active_actual = self.resolve_actual_path(&path);
                                     
                                     ui.horizontal(|ui| {
@@ -4497,7 +5404,13 @@ impl eframe::App for ImageViewer {
                                                 if ui.button("📂 Open Folder").clicked() {
                                                     open_in_dolphin_or_fallback(&active_actual);
                                                 }
-                                                if ui.button("👁 View").clicked() {
+                                                if active_is_video {
+                                                    if ui.button("▶ Open in mpv").clicked() {
+                                                        let _ = std::process::Command::new("mpv")
+                                                            .arg(&active_actual)
+                                                            .spawn();
+                                                    }
+                                                } else if ui.button("👁 View").clicked() {
                                                     if let Some(pos) = self.images.iter().position(|p| p == &path) {
                                                         self.current_index = pos;
                                                     } else {
@@ -4508,13 +5421,6 @@ impl eframe::App for ImageViewer {
                                                     self.show_grid = false;
                                                     self.back_target_is_gallery = true;
                                                     self.update_exif();
-                                                }
-                                                if active_is_video {
-                                                    if ui.button("▶ Open in mpv").clicked() {
-                                                        let _ = std::process::Command::new("mpv")
-                                                            .arg(&active_actual)
-                                                            .spawn();
-                                                    }
                                                 }
                                             });
                                         });
@@ -4625,92 +5531,121 @@ impl eframe::App for ImageViewer {
                                         });
                                         ui.add_space(6.0);
                                         
-                                        for (item, source_path_opt, preview_path_opt, item_is_video, res_size_str) in &combined_similars_metadata {
-                                            ui.horizontal(|ui| {
-                                                // Left: Thumbnail preview (use preview_path for video stills)
-                                                let thumb_path = preview_path_opt.as_ref().or(source_path_opt.as_ref());
-                                                if let Some(t_path) = thumb_path {
-                                                    self.draw_thumbnail_async(ui, t_path, side_thumb);
-                                                } else {
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(side_thumb, side_thumb),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
-                                                }
-                                                
-                                                // Right: Info and buttons
-                                                ui.vertical(|ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.colored_label(
-                                                            if *item_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
-                                                            if *item_is_video { "📹 Video" } else { "🖼 Image" }
+                                        let row_height = side_thumb + 24.0;
+                                        let total_rows = combined_similars.len();
+                                        let list_top = ui.cursor().min.y;
+                                        let clip = ui.clip_rect();
+                                        let first_row = (((clip.min.y - list_top) / row_height)
+                                            .floor()
+                                            .max(0.0) as usize)
+                                            .min(total_rows);
+                                        let last_row = (((clip.max.y - list_top) / row_height)
+                                            .ceil()
+                                            .max(first_row as f32) as usize)
+                                            .min(total_rows);
+
+                                        if first_row > 0 {
+                                            ui.add_space(first_row as f32 * row_height);
+                                        }
+
+                                        for item in combined_similars[first_row..last_row].iter().cloned() {
+                                            let source_path_opt = resolve_source_path(&roots, &item.file_name).ok();
+                                            let preview_path_opt = source_path_opt.as_ref().map(|p| self.get_thumbnail_path(p));
+                                            let item_is_video = item.is_video
+                                                || is_video_path(Path::new(&item.file_name))
+                                                || source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
+                                            let res_size_str = source_path_opt.as_ref()
+                                                .map(|p| self.get_file_resolution_and_size(p))
+                                                .unwrap_or_else(|| "n/a".to_string());
+
+                                            ui.allocate_ui(egui::vec2(ui.available_width(), row_height), |ui| {
+                                                ui.horizontal(|ui| {
+                                                    // Left: Thumbnail preview (use preview_path for video stills)
+                                                    let thumb_path = preview_path_opt.as_ref().or(source_path_opt.as_ref());
+                                                    if let Some(t_path) = thumb_path {
+                                                        self.draw_thumbnail_async(ui, t_path, side_thumb);
+                                                    } else {
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            egui::vec2(side_thumb, side_thumb),
+                                                            egui::Sense::hover(),
                                                         );
-                                                        if item.file_name == filename {
-                                                            ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
-                                                        }
-                                                    });
+                                                        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                                    }
                                                     
-                                                    let similarity_label = item.similarity_pct
-                                                        .map(|v| format!("similarity {:.2}%", v))
-                                                        .unwrap_or_else(|| "similarity n/a".to_string());
-                                                    ui.colored_label(egui::Color32::from_rgb(100, 180, 255), similarity_label);
-                                                    
-                                                    ui.weak(res_size_str);
-                                                    
-                                                    let display_name = item.file_name.split_once('/').map(|x| x.1).unwrap_or(&item.file_name);
-                                                    ui.monospace(display_name);
-                                                    
-                                                    ui.horizontal(|ui| {
-                                                        if let Some(s_path) = source_path_opt.as_ref() {
-                                                            if ui.button("📂 Open Folder").clicked() {
-                                                                open_in_dolphin_or_fallback(s_path);
+                                                    // Right: Info and buttons
+                                                    ui.vertical(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.colored_label(
+                                                                if item_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
+                                                                if item_is_video { "📹 Video" } else { "🖼 Image" }
+                                                            );
+                                                            if item.file_name == filename {
+                                                                ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                             }
-                                                            if item.file_name != filename {
-                                                                if *item_is_video {
-                                                                    // Open video in mpv
-                                                                    if ui.button("▶ Open in mpv").clicked() {
-                                                                        let _ = std::process::Command::new("mpv")
-                                                                            .arg(s_path)
-                                                                            .spawn();
-                                                                    }
-                                                                } else {
-                                                                    // View image in the viewer
-                                                                    if ui.button("👁 View").clicked() {
-                                                                        if let Some(pos) = self.images.iter().position(|p| p == s_path) {
-                                                                            self.current_index = pos;
-                                                                        } else {
-                                                                            self.images.insert(self.current_index + 1, s_path.clone());
-                                                                            self.db_filename_by_path.insert(s_path.clone(), item.file_name.clone());
-                                                                            self.current_index += 1;
+                                                        });
+                                                        
+                                                        let similarity_label = item.similarity_pct
+                                                            .map(|v| format!("similarity {:.2}%", v))
+                                                            .unwrap_or_else(|| "similarity n/a".to_string());
+                                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 255), similarity_label);
+                                                        
+                                                        ui.weak(&res_size_str);
+                                                        
+                                                        let display_name = item.file_name.split_once('/').map(|x| x.1).unwrap_or(&item.file_name);
+                                                        ui.monospace(display_name);
+                                                        
+                                                        ui.horizontal(|ui| {
+                                                            if let Some(s_path) = source_path_opt.as_ref() {
+                                                                if ui.button("📂 Open Folder").clicked() {
+                                                                    open_in_dolphin_or_fallback(s_path);
+                                                                }
+                                                                if item.file_name != filename {
+                                                                    if item_is_video {
+                                                                        // Open video in mpv
+                                                                        if ui.button("▶ Open in mpv").clicked() {
+                                                                            let _ = std::process::Command::new("mpv")
+                                                                                .arg(s_path)
+                                                                                .spawn();
                                                                         }
-                                                                        self.show_grid = false;
-                                                                        self.back_target_is_gallery = true;
-                                                                        self.update_exif();
-                                                                    }
-                                                                }
-                                                            }
-                                                            
-                                                            if !*item_is_video {
-                                                                let is_active_compare = self.compare_target.as_ref() == Some(s_path);
-                                                                let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                                if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                                    if is_active_compare {
-                                                                        self.compare_target = None;
-                                                                        self.sift_pair_overlay = None;
                                                                     } else {
-                                                                        self.compare_target = Some(s_path.clone());
-                                                                        self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                        // View image in the viewer
+                                                                        if ui.button("👁 View").clicked() {
+                                                                            if let Some(pos) = self.images.iter().position(|p| p == s_path) {
+                                                                                self.current_index = pos;
+                                                                            } else {
+                                                                                self.images.insert(self.current_index + 1, s_path.clone());
+                                                                                self.db_filename_by_path.insert(s_path.clone(), item.file_name.clone());
+                                                                                self.current_index += 1;
+                                                                            }
+                                                                            self.show_grid = false;
+                                                                            self.back_target_is_gallery = true;
+                                                                            self.update_exif();
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                if !item_is_video {
+                                                                    let is_active_compare = self.compare_target.as_ref() == Some(s_path);
+                                                                    let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
+                                                                    if ui.selectable_label(is_active_compare, btn_label).clicked() {
+                                                                        if is_active_compare {
+                                                                            self.compare_target = None;
+                                                                            self.sift_pair_overlay = None;
+                                                                        } else {
+                                                                            self.compare_target = Some(s_path.clone());
+                                                                            self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
+                                                                        }
                                                                     }
                                                                 }
                                                             }
-                                                        }
+                                                        });
                                                     });
                                                 });
                                             });
-                                            ui.add_space(8.0);
-                                            ui.separator();
-                                            ui.add_space(8.0);
+                                        }
+
+                                        if last_row < total_rows {
+                                            ui.add_space((total_rows - last_row) as f32 * row_height);
                                         }
                                     } else if sift_members.is_empty() {
                                         ui.weak("No duplicates or similar files found in database.");

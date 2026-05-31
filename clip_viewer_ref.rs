@@ -31,7 +31,7 @@ const FACE_MATCH_MIN_SCORE: f32 = 0.35;
 #[command(name = "clip-viewer")]
 #[command(about = "Fast native Rust CLIP viewer for embedimages LanceDB")]
 struct Args {
-    #[arg(long, default_value = "/media/lewis/1b/lancedb")]
+    #[arg(long, default_value = "./lancedb")]
     db_dir: PathBuf,
 
     #[arg(long, default_value = "media_index")]
@@ -268,18 +268,6 @@ fn main() -> Result<()> {
 
 fn parse_collection_roots(values: &[String]) -> Result<HashMap<String, PathBuf>> {
     let mut roots = HashMap::new();
-    roots.insert(
-        "phone".to_string(),
-        PathBuf::from("/media/lewis/1b/Phone")
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Phone")),
-    );
-    roots.insert(
-        "telegram_backup".to_string(),
-        PathBuf::from("/media/lewis/1b/Telegram Backup")
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("/media/lewis/1b/Telegram Backup")),
-    );
     for value in values {
         let (collection, root) = value
             .split_once('=')
