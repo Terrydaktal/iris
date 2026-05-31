@@ -2214,6 +2214,10 @@ struct ImageViewer {
     offset: egui::Vec2,
     exif_data: String,
     show_exif: bool,
+    side_panel_window_expanded: bool,
+    side_panel_open_pending: bool,
+    side_panel_expand_target_width: Option<f32>,
+    side_panel_open_pending_frames: u8,
     chunks: Vec<FileChunk>,
     viewport_bg: Option<egui::Color32>,
     rx: Receiver<PathBuf>,
@@ -2390,6 +2394,105 @@ fn is_path_ai_backed(path: &Path) -> bool {
 }
 
 impl ImageViewer {
+    const SIDE_PANEL_WIDTH: f32 = 400.0;
+    const MIN_WINDOW_WIDTH: f32 = 640.0;
+    const SIDE_PANEL_RESIZE_TOLERANCE: f32 = 6.0;
+    const SIDE_PANEL_OPEN_FALLBACK_FRAMES: u8 = 8;
+
+    fn viewport_inner_size(ctx: &egui::Context) -> egui::Vec2 {
+        ctx.input(|input| {
+            input
+                .viewport()
+                .inner_rect
+                .map(|rect| rect.size())
+                .unwrap_or_else(|| input.viewport_rect().size())
+        })
+    }
+
+    fn set_window_width(ctx: &egui::Context, width: f32, height: f32) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            width,
+            height,
+        )));
+    }
+
+    fn open_side_panel(&mut self, ctx: &egui::Context, mode: SidePanelMode) {
+        self.side_panel_mode = mode;
+        if self.show_exif || self.side_panel_open_pending {
+            return;
+        }
+
+        let current_size = Self::viewport_inner_size(ctx);
+        let target_width = (current_size.x + Self::SIDE_PANEL_WIDTH).max(Self::MIN_WINDOW_WIDTH);
+        Self::set_window_width(ctx, target_width, current_size.y);
+        self.side_panel_window_expanded = true;
+        self.side_panel_open_pending = true;
+        self.side_panel_expand_target_width = Some(target_width);
+        self.side_panel_open_pending_frames = 0;
+        ctx.request_repaint();
+    }
+
+    fn close_side_panel(&mut self, ctx: &egui::Context) {
+        let should_shrink =
+            self.show_exif || self.side_panel_open_pending || self.side_panel_window_expanded;
+        let was_pending_only = self.side_panel_open_pending && !self.show_exif;
+        let expand_target_width = self.side_panel_expand_target_width;
+
+        self.show_exif = false;
+        self.side_panel_open_pending = false;
+        self.side_panel_expand_target_width = None;
+        self.side_panel_open_pending_frames = 0;
+
+        if should_shrink {
+            let current_size = Self::viewport_inner_size(ctx);
+            let resize_has_landed = expand_target_width
+                .map(|target| current_size.x + Self::SIDE_PANEL_RESIZE_TOLERANCE >= target)
+                .unwrap_or(true);
+            let target_width = if was_pending_only && !resize_has_landed {
+                current_size.x
+            } else {
+                (current_size.x - Self::SIDE_PANEL_WIDTH).max(Self::MIN_WINDOW_WIDTH)
+            };
+            Self::set_window_width(ctx, target_width, current_size.y);
+            self.side_panel_window_expanded = false;
+            ctx.request_repaint();
+        }
+    }
+
+    fn toggle_layout_side_panel(&mut self, ctx: &egui::Context) {
+        let layout_active = (self.show_exif || self.side_panel_open_pending)
+            && self.side_panel_mode == SidePanelMode::Layout;
+        if layout_active {
+            self.close_side_panel(ctx);
+        } else {
+            self.open_side_panel(ctx, SidePanelMode::Layout);
+        }
+    }
+
+    fn apply_pending_side_panel_open(&mut self, ctx: &egui::Context) {
+        if !self.side_panel_open_pending {
+            return;
+        }
+
+        let current_size = Self::viewport_inner_size(ctx);
+        let target_width = self
+            .side_panel_expand_target_width
+            .unwrap_or(current_size.x);
+        self.side_panel_open_pending_frames =
+            self.side_panel_open_pending_frames.saturating_add(1);
+
+        let resize_landed = current_size.x + Self::SIDE_PANEL_RESIZE_TOLERANCE >= target_width;
+        let waited_too_long =
+            self.side_panel_open_pending_frames >= Self::SIDE_PANEL_OPEN_FALLBACK_FRAMES;
+        if resize_landed || waited_too_long {
+            self.show_exif = true;
+            self.side_panel_open_pending = false;
+            self.side_panel_expand_target_width = None;
+        }
+
+        ctx.request_repaint();
+    }
+
     fn new(
         path: PathBuf,
         rx: Receiver<PathBuf>,
@@ -2462,6 +2565,10 @@ impl ImageViewer {
             offset: egui::Vec2::ZERO,
             exif_data: String::new(),
             show_exif: false,
+            side_panel_window_expanded: false,
+            side_panel_open_pending: false,
+            side_panel_expand_target_width: None,
+            side_panel_open_pending_frames: 0,
             chunks: Vec::new(),
             viewport_bg: None,
             rx,
@@ -3119,12 +3226,19 @@ impl ImageViewer {
 
     fn update_exif(&mut self) {
         if let Some(path) = self.images.get(self.current_index) {
-            self.current_dimensions = match image::image_dimensions(path) {
+            let resolved_path = self.resolve_actual_path(path);
+            let inspect_path: &Path = if path.exists() {
+                path.as_path()
+            } else {
+                resolved_path.as_path()
+            };
+
+            self.current_dimensions = match image::image_dimensions(inspect_path) {
                 Ok((w, h)) => format!("{}x{}", w, h),
                 Err(_) => "Unknown px".to_string(),
             };
 
-            self.current_file_size = std::fs::metadata(path)
+            self.current_file_size = std::fs::metadata(inspect_path)
                 .map(|m| {
                     let bytes = m.len();
                     if bytes >= 1_048_576 {
@@ -3139,7 +3253,7 @@ impl ImageViewer {
 
             let output = Command::new("exiftool")
                 .args(["-a", "-u", "-g1", "-H"])
-                .arg(path)
+                .arg(inspect_path)
                 .output();
 
             self.exif_data = match output {
@@ -3147,7 +3261,7 @@ impl ImageViewer {
                 Err(e) => format!("Error running exiftool: {}", e),
             };
 
-            if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(bytes) = std::fs::read(inspect_path) {
                 let mut chunks = if let Some(chunks) = parse_png(&bytes) {
                     chunks
                 } else if let Some(chunks) = parse_jpeg(&bytes) {
@@ -3231,7 +3345,7 @@ impl ImageViewer {
         ui.vertical(|ui| {
             // Title and Close
             ui.horizontal(|ui| {
-                ui.heading("🖼 Folder Gallery & AI Explorer");
+                ui.heading("Folder Gallery and Search");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❌ Close Gallery [G]").clicked() {
                         self.show_grid = false;
@@ -3251,24 +3365,24 @@ impl ImageViewer {
             // Toolbar Controls
             ui.horizontal(|ui| {
                 ui.label("Search Mode:");
-                ui.selectable_value(&mut self.semantic_mode, SearchMode::Filename, "📁 Filename");
+                ui.selectable_value(&mut self.semantic_mode, SearchMode::Filename, "Filename");
                 
                 ui.add_enabled_ui(has_db, |ui| {
-                    let clip_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "🔍 AI Description");
+                    let clip_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "Description Search");
                     if !has_db {
-                        clip_btn.on_hover_text("AI Search is only available for Phone or Telegram Backup folders.");
+                        clip_btn.on_hover_text("Description search is only available for Phone or Telegram Backup folders.");
                     }
-                    let ocr_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "📝 OCR Text");
+                    let ocr_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "OCR Text");
                     if !has_db {
                         ocr_btn.on_hover_text("OCR Search is only available for Phone or Telegram Backup folders.");
                     }
                 });
                 
                 ui.add_space(12.0);
-                ui.checkbox(&mut self.semantic_video_only, "📹 Videos only");
+                ui.checkbox(&mut self.semantic_video_only, "Videos only");
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🔄 Refresh").clicked() {
+                    if ui.button("Refresh").clicked() {
                         self.start_recursive_scan();
                     }
                 });
@@ -3277,7 +3391,7 @@ impl ImageViewer {
 
             ui.horizontal(|ui| {
                 let hint = match self.semantic_mode {
-                    SearchMode::Filename => "🔍 Filter by filename...",
+                    SearchMode::Filename => "Filter by filename...",
                     SearchMode::Clip => "Describe the photo (e.g. 'a cat laying on a keyboard')",
                     SearchMode::Ocr => "Type word/text found inside the image",
                 };
@@ -3298,7 +3412,7 @@ impl ImageViewer {
                     ui.add(egui::Slider::new(&mut self.semantic_limit, 1..=500).text("Limit"));
                     
                     ui.add_space(8.0);
-                    if ui.button("🔍 Search").clicked() || enter_pressed {
+                    if ui.button("Search").clicked() || enter_pressed {
                         let start_dir = if self.open_target.is_dir() {
                             self.open_target.clone()
                         } else {
@@ -3368,14 +3482,18 @@ impl ImageViewer {
                 // Populate unified Gallery Items (only if active semantic search is active)
                 let mut gallery_items: Vec<GalleryItem> = Vec::new();
                 if is_active_semantic_search {
+                    let mut seen_semantic_paths: HashSet<PathBuf> = HashSet::new();
                     for item in &self.semantic_results {
                         if let Some(path) = &item.media_path {
+                            if !seen_semantic_paths.insert(path.clone()) {
+                                continue;
+                            }
                             gallery_items.push(GalleryItem {
                                 path: path.clone(),
                                 is_video: item.is_video,
                                 score_label: Some(match self.semantic_mode {
                                     SearchMode::Clip => format!("{:.0}% Match", (item.score * 100.0).clamp(0.0, 100.0)),
-                                    SearchMode::Ocr => "📝 OCR Match".to_string(),
+                                    SearchMode::Ocr => "OCR Match".to_string(),
                                     _ => String::new(),
                                 }),
                                 timestamp_sec: item.timestamp_sec,
@@ -3400,11 +3518,10 @@ impl ImageViewer {
                         }
                     });
                 } else {
-                    let available_width = ui.available_width() - 16.0;
+                    let available_width = (ui.available_width() - 16.0).max(130.0);
                     let col_width = 130.0 + 12.0;
                     let cols = (available_width / col_width).floor().max(1.0) as usize;
                     let num_rows = (num_items + cols - 1) / cols;
-
                     let row_height = 160.0 + 12.0;
 
                     let mut clicked_path = None;
@@ -3413,12 +3530,13 @@ impl ImageViewer {
                     let mut clicked_person = None;
 
                     egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
-                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                         for row_idx in row_range {
-                            ui.horizontal(|ui| {
-                                let start_idx = row_idx * cols;
-                                let end_idx = (start_idx + cols).min(num_items);
-                                for item_idx in start_idx..end_idx {
+                            let start_idx = row_idx * cols;
+                            let end_idx = (start_idx + cols).min(num_items);
+                            let row_width = (cols as f32 * 130.0) + (cols.saturating_sub(1) as f32 * 12.0);
+                            let (row_rect, _) = ui.allocate_exact_size(egui::vec2(row_width, 160.0), egui::Sense::hover());
+
+                            for (col_idx, item_idx) in (start_idx..end_idx).enumerate() {
                                     let temp_item;
                                     let item = if is_active_semantic_search {
                                         &gallery_items[item_idx]
@@ -3443,7 +3561,15 @@ impl ImageViewer {
                                         false
                                     };
                                     
-                                    let (rect, response) = ui.allocate_at_least(egui::vec2(130.0, 160.0), egui::Sense::click());
+                                    let rect = egui::Rect::from_min_size(
+                                        egui::pos2(row_rect.min.x + col_idx as f32 * col_width, row_rect.min.y),
+                                        egui::vec2(130.0, 160.0),
+                                    );
+                                    let response = ui.interact(
+                                        rect,
+                                        ui.make_persistent_id(("gallery_card", item_idx)),
+                                        egui::Sense::click(),
+                                    );
                                     
                                     response.context_menu(|ui| {
                                         if ui.button("📂 Open parent folder").clicked() {
@@ -3482,7 +3608,7 @@ impl ImageViewer {
                                         }
                                         if let Some(db_name) = &item.db_filename {
                                             ui.separator();
-                                            if ui.button("🔍 Show most similar").clicked() {
+                                            if ui.button("Show most similar").clicked() {
                                                 let sr = SearchResult {
                                                     rank: 0,
                                                     score: 1.0,
@@ -3595,15 +3721,18 @@ impl ImageViewer {
                                     ui.painter().rect_filled(banner_rect, banner_rounding, egui::Color32::from_black_alpha(180));
 
                                     let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(banner_rect.shrink2(egui::vec2(6.0, 2.0))), |ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.add(egui::Label::new(
-                                                egui::RichText::new(filename)
-                                                    .size(9.0)
-                                                    .color(egui::Color32::WHITE)
-                                            ).truncate());
-                                        });
-                                    });
+                                    let filename_label = if filename.chars().count() > 22 {
+                                        format!("{}...", filename.chars().take(19).collect::<String>())
+                                    } else {
+                                        filename.to_string()
+                                    };
+                                    ui.painter().text(
+                                        banner_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        filename_label,
+                                        egui::FontId::proportional(9.0),
+                                        egui::Color32::WHITE,
+                                    );
 
                                     // Overlay 2: Score / Match Badge pill overlay in the top-left
                                     if let Some(lbl) = &item.score_label {
@@ -3617,17 +3746,13 @@ impl ImageViewer {
                                             egui::Color32::from_rgb(0, 90, 158).gamma_multiply(0.85)
                                         };
                                         ui.painter().rect_filled(badge_rect, 4.0, badge_bg);
-                                        
-                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(badge_rect.shrink2(egui::vec2(4.0, 1.0))), |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(lbl)
-                                                        .size(8.0)
-                                                        .color(egui::Color32::WHITE)
-                                                        .strong()
-                                                );
-                                            });
-                                        });
+                                        ui.painter().text(
+                                            badge_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            lbl,
+                                            egui::FontId::proportional(8.0),
+                                            egui::Color32::WHITE,
+                                        );
                                     }
 
                                     // Overlay 3: Video Indicator badge with timestamp in the top-right
@@ -3645,16 +3770,13 @@ impl ImageViewer {
                                             egui::pos2(rect.max.x - 6.0, rect.min.y + 22.0)
                                         );
                                         ui.painter().rect_filled(badge_rect, 4.0, egui::Color32::from_black_alpha(160));
-                                        
-                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(badge_rect.shrink2(egui::vec2(4.0, 1.0))), |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(badge_text)
-                                                        .size(8.0)
-                                                        .color(egui::Color32::WHITE)
-                                                );
-                                            });
-                                        });
+                                        ui.painter().text(
+                                            badge_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            badge_text,
+                                            egui::FontId::proportional(8.0),
+                                            egui::Color32::WHITE,
+                                        );
                                     }
                                         
                                     if response.double_clicked() {
@@ -3662,8 +3784,7 @@ impl ImageViewer {
                                     } else if response.clicked() {
                                         single_clicked_path = Some(path.clone());
                                     }
-                                }
-                            });
+                            }
                         }
                     });
                     
@@ -3709,8 +3830,7 @@ impl ImageViewer {
                             self.images = active_paths;
                             self.current_index = pos;
                             self.update_exif();
-                            self.show_exif = true;
-                            self.side_panel_mode = SidePanelMode::Duplicates;
+                            self.open_side_panel(ui.ctx(), SidePanelMode::Duplicates);
                             ui.ctx().request_repaint();
                         }
                     }
@@ -3962,11 +4082,15 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint();
             }
         }
-        // Mouse Back click handling
-        if !self.show_grid && self.back_target_is_gallery {
+        // Mouse Back click handling:
+        // allow returning to gallery if explicitly marked, or if a gallery list is available.
+        let can_back_to_gallery =
+            self.back_target_is_gallery || (!self.show_home_page && !self.recursive_images.is_empty());
+        if !self.show_grid && can_back_to_gallery {
             let back_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
             if back_clicked {
                 self.show_grid = true;
+                self.back_target_is_gallery = true;
                 ctx.request_repaint();
             }
         }
@@ -3998,13 +4122,7 @@ impl eframe::App for ImageViewer {
                         }
                     }
                     if i.key_pressed(egui::Key::E) {
-                        let show_layout_active = self.show_exif && self.side_panel_mode == SidePanelMode::Layout;
-                        if show_layout_active {
-                            self.show_exif = false;
-                        } else {
-                            self.show_exif = true;
-                            self.side_panel_mode = SidePanelMode::Layout;
-                        }
+                        self.toggle_layout_side_panel(ctx);
                     }
                     if i.key_pressed(egui::Key::Backspace) {
                         self.show_home_page = true;
@@ -4052,30 +4170,12 @@ impl eframe::App for ImageViewer {
                 }
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // EXIF Button
-                    let show_exif_active = self.show_exif && self.side_panel_mode == SidePanelMode::Exif;
-                    let exif_button_text = if show_exif_active { "🏷 Hide EXIF" } else { "🏷 Show EXIF" };
-                    if ui.button(exif_button_text).clicked() {
-                        if show_exif_active {
-                            self.show_exif = false;
-                        } else {
-                            self.show_exif = true;
-                            self.side_panel_mode = SidePanelMode::Exif;
-                        }
-                    }
-
-                    ui.add_space(8.0);
-
                     // Layout Button
-                    let show_layout_active = self.show_exif && self.side_panel_mode == SidePanelMode::Layout;
+                    let show_layout_active = (self.show_exif || self.side_panel_open_pending)
+                        && self.side_panel_mode == SidePanelMode::Layout;
                     let layout_button_text = if show_layout_active { "📂 Hide Layout [E]" } else { "📂 Show Layout [E]" };
                     if ui.button(layout_button_text).clicked() {
-                        if show_layout_active {
-                            self.show_exif = false;
-                        } else {
-                            self.show_exif = true;
-                            self.side_panel_mode = SidePanelMode::Layout;
-                        }
+                        self.toggle_layout_side_panel(ctx);
                     }
                     
                     ui.add_space(8.0);
@@ -4091,11 +4191,14 @@ impl eframe::App for ImageViewer {
             });
         });
 
-        // Collapsible EXIF Side Panel (Shows Binary File Layout Diagram or Raw EXIF)
-        egui::SidePanel::right("exif_panel")
-            .resizable(true)
-            .default_width(400.0)
-            .show_animated(ctx, self.show_exif, |ui| {
+        self.apply_pending_side_panel_open(ctx);
+
+        // Side panel opens only after the native window has expanded, avoiding gallery reflow flicker.
+        if self.show_exif {
+            egui::SidePanel::right("exif_panel")
+                .resizable(true)
+                .default_width(Self::SIDE_PANEL_WIDTH)
+                .show(ctx, |ui| {
                 // Header Tabs
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.side_panel_mode, SidePanelMode::Layout, "📂 Binary Layout");
@@ -4104,7 +4207,7 @@ impl eframe::App for ImageViewer {
                     
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("❌").clicked() {
-                            self.show_exif = false;
+                            self.close_side_panel(ui.ctx());
                         }
                     });
                 });
@@ -4394,6 +4497,18 @@ impl eframe::App for ImageViewer {
                                                 if ui.button("📂 Open Folder").clicked() {
                                                     open_in_dolphin_or_fallback(&active_actual);
                                                 }
+                                                if ui.button("👁 View").clicked() {
+                                                    if let Some(pos) = self.images.iter().position(|p| p == &path) {
+                                                        self.current_index = pos;
+                                                    } else {
+                                                        self.images.insert(self.current_index + 1, path.clone());
+                                                        self.db_filename_by_path.insert(path.clone(), filename.clone());
+                                                        self.current_index += 1;
+                                                    }
+                                                    self.show_grid = false;
+                                                    self.back_target_is_gallery = true;
+                                                    self.update_exif();
+                                                }
                                                 if active_is_video {
                                                     if ui.button("▶ Open in mpv").clicked() {
                                                         let _ = std::process::Command::new("mpv")
@@ -4472,6 +4587,7 @@ impl eframe::App for ImageViewer {
                                                                             self.current_index += 1;
                                                                         }
                                                                         self.show_grid = false;
+                                                                        self.back_target_is_gallery = true;
                                                                         self.update_exif();
                                                                     }
                                                                 }
@@ -4569,6 +4685,7 @@ impl eframe::App for ImageViewer {
                                                                             self.current_index += 1;
                                                                         }
                                                                         self.show_grid = false;
+                                                                        self.back_target_is_gallery = true;
                                                                         self.update_exif();
                                                                     }
                                                                 }
@@ -4607,7 +4724,8 @@ impl eframe::App for ImageViewer {
                         }
                     }
                 }
-            });
+                });
+        }
 
         let mut panel = egui::CentralPanel::default();
         if let Some(bg) = self.viewport_bg {
@@ -4987,7 +5105,7 @@ impl ImageViewer {
                                                         "Disk Partition"
                                                     }
                                                 } else if is_ai {
-                                                    "Folder (AI-Indexed)"
+                                                    "Indexed Folder"
                                                 } else {
                                                     "Folder"
                                                 };
@@ -4995,7 +5113,7 @@ impl ImageViewer {
                                                 let type_color = if is_selected {
                                                     egui::Color32::WHITE
                                                 } else if is_ai {
-                                                    egui::Color32::from_rgb(140, 160, 255) // clean blue-violet for AI indexing
+                                                    egui::Color32::from_rgb(140, 160, 255)
                                                 } else {
                                                     ui.visuals().weak_text_color()
                                                 };
