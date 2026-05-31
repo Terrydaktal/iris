@@ -1,92 +1,125 @@
 # Iris
 
-Iris is a highly optimized, high-fidelity, native graphical image viewer and binary file layout inspector built using **Rust** and the **egui** framework. It is designed to explore large directory trees instantly, stream images in real-time, and parse low-level headers for various image formats (PNG, JPEG, WebP, BMP) with zero UI lag, minimal memory footprint (< 200MB), and near-0% idle CPU usage.
+Iris is a native Rust desktop media viewer built with `eframe/egui`.
 
----
+Current build includes:
+- interactive image/video viewer
+- folder gallery grid
+- filename filtering
+- CLIP text search and OCR text search backed by LanceDB
+- EXIF panel and binary layout inspector
+- duplicate/similarity tools (SIFT + pHash/VideoHash metadata)
+- home-page folder browser start when no path is provided
 
-## Project Structure & Directory Tree
+## Project Structure
 
 ```text
 .
-├── Cargo.lock                     # Workspace dependency lock file
-├── Cargo.toml                     # Root package definition (build manifest)
-├── icon.png                       # Application icon (transparency processed)
-├── iris.desktop                   # Linux/Wayland Desktop Application launcher entry
-├── make_transparent.py            # Python utility script for transparency processing
-├── src/                           # Root crate source code
-│   ├── main.rs                    # Application entrypoint & core GUI logic
-│   └── bin/
-│       └── make_transparent.rs    # Rust utility binary for transparency processing
-├── iris/                          # Nested duplicate/subcrate crate (for absolute parity)
-│   ├── Cargo.lock
-│   ├── Cargo.toml
-│   ├── src/
-│   │   ├── main.rs                # Exactly identical duplicate of root main.rs
-│   │   └── bin/
-│   │       └── make_transparent.rs
-└── README.md                      # Detailed project documentation
+├── Cargo.lock
+├── Cargo.toml
+├── README.md
+├── clip_viewer_ref.rs
+├── icon.png
+├── iris.desktop
+├── make_transparent.py
+├── src
+│   ├── bin
+│   │   └── make_transparent.rs
+│   └── main.rs
+└── target                      # build artifacts (generated)
 ```
 
----
+## Files, Inputs, Outputs
 
-## Script & Binary Details
+### `src/main.rs`
+- Purpose: main GUI application (`iris`).
+- Inputs:
+  - CLI args: `iris [--same-window|-s|--reuse-window|-r] [--new-window|-n] [--no-daemon] [PATH]`
+  - optional UNIX socket messages from other iris processes
+  - media files from selected folders
+  - EXIF output from `exiftool`
+  - optional AI index/model files (see AI requirements)
+- Outputs:
+  - desktop GUI window
+  - gallery grid and detail viewport
+  - EXIF/layout/duplicate side panels
+  - optional commands to open folders (`dolphin`) and videos (`mpv`)
 
-### 1. `iris` Application (Core Viewer)
-* **Script / Code Location**: [src/main.rs](file:///home/lewis/Dev/iris/src/main.rs) & [iris/src/main.rs](file:///home/lewis/Dev/iris/iris/src/main.rs)
-* **Purpose**: Serves as the primary graphical interface for image viewing, EXIF tag querying, recursive directory scanning, and low-level chunk parsing.
-* **Key Features**:
-  - **Asynchronous Neighbour Scanning**: Flat neighbours are loaded in a background thread to prevent GUI blockage.
-  - **Progressive MPSC Streaming**: Thumbnails and recursive image paths are streamed dynamically via `mpsc` channels, popping up in the gallery in real-time.
-  - **Thread-Throttled Decoding**: Decodes thumbnails using at most 4 background worker threads, keeping memory consumption < 200MB.
-  - **Dual Side Panel**: Toggles between a collapsible byte-level **Binary Layout** inspector (supporting PNG, JPEG, WebP, BMP) and a searchable **Raw EXIF Metadata** dump.
-  - **Winit Graphics Fallback**: Seamlessly falls back to XWayland if Wayland graphics context initialization fails under NVIDIA drivers.
-* **Input**:
-  - Command-line arguments: `iris [--same-window | -s] [--no-daemon] <image_path_or_directory>`
-* **Output**:
-  - Detaches itself as a desktop background daemon by default, launching a fluid, GPU-accelerated window.
+### `src/bin/make_transparent.rs`
+- Purpose: Rust utility that converts near-white pixels to transparency in an icon image.
+- Input: hardcoded source image path in the file.
+- Output: writes transparent PNG to `icon.png`.
 
-### 2. `make_transparent` Utility (Python / Rust equivalents)
-* **Python Script**: [make_transparent.py](file:///home/lewis/Dev/iris/make_transparent.py)
-  - **Input**: Absolute path to an image file (defaults to cached white-background app icon).
-  - **Output**: Saves a transparent PNG to [icon.png](file:///home/lewis/Dev/iris/icon.png) by smoothly alpha-scaling light/white pixels.
-* **Rust Binary**: [src/bin/make_transparent.rs](file:///home/lewis/Dev/iris/src/bin/make_transparent.rs) (nested at [iris/src/bin/make_transparent.rs](file:///home/lewis/Dev/iris/iris/src/bin/make_transparent.rs))
-  - **Input**: Reads image file bytes from a white-background source path.
-  - **Output**: Writes the processed transparent PNG back to [icon.png](file:///home/lewis/Dev/iris/icon.png).
-  - **Execution**: Can be run via Cargo:
-    ```bash
-    cargo run --bin make_transparent
-    ```
+### `make_transparent.py`
+- Purpose: Python utility equivalent of the Rust icon transparency tool.
+- Input: hardcoded source image path in the file.
+- Output: writes transparent PNG to `icon.png`.
 
----
+### `clip_viewer_ref.rs`
+- Purpose: reference code snapshot used for comparison/porting ideas.
+- Input/Output: not part of Cargo build by default.
 
-## Execution & Pipeline Order
+### `iris.desktop`
+- Purpose: desktop launcher entry.
+- Input: none.
+- Output: launcher metadata consumed by desktop environments.
 
-Follow these steps to compile, run, and configure the application:
+## Runtime Requirements
 
-### Step 1: Process the Application Icon (Optional)
-If you need to regenerate the transparent icon from a white-background source:
-* **Option A (Python)**:
-  ```bash
-  python make_transparent.py
-  ```
-* **Option B (Rust)**:
-  ```bash
-  cargo run --bin make_transparent
-  ```
+Base viewer:
+- Rust toolchain + Cargo
+- graphics stack supported by `eframe`
+- `exiftool` available in `PATH` (for metadata panel)
 
-### Step 2: Compile & Run the Primary GUI App
-Launch Iris by compiling and executing the binary using Cargo:
-* **Foreground Execution (with logging)**:
-  ```bash
-  cargo run --release -- --no-daemon .
-  ```
-* **Background Daemon Mode (releases terminal instantly)**:
-  ```bash
-  cargo run --release -- .
-  ```
+Optional integrations:
+- `dolphin` (preferred folder opener; falls back to `xdg-open`)
+- `mpv` (video open actions)
 
-### Step 3: Integrate with Desktop Environment (Optional)
-To register Iris as a system-wide desktop application on Linux/KDE/GNOME, copy the `.desktop` launcher to your local applications folder:
-```bash
-cp iris.desktop ~/.local/share/applications/
-```
+AI search path assumptions in current code:
+- LanceDB directory: `/media/lewis/1b/lancedb`
+- collection roots:
+  - `/media/lewis/1b/Phone`
+  - `/media/lewis/1b/Telegram Backup`
+- CLIP text model: `/home/lewis/Dev/imagesearch/models/clip-text/clip_text.onnx`
+- tokenizer: `/home/lewis/Dev/imagesearch/models/clip-text/tokenizer.json`
+
+If your machine differs, update these constants in `src/main.rs`.
+
+## Operation and Execution Order
+
+1. Optional: regenerate app icon transparency.
+   - Python:
+     ```bash
+     python3 make_transparent.py
+     ```
+   - Rust:
+     ```bash
+     cargo run --bin make_transparent
+     ```
+
+2. Build and run Iris.
+   - start at home-page browser (no path):
+     ```bash
+     cargo run --release -- --no-daemon
+     ```
+   - open a specific path immediately:
+     ```bash
+     cargo run --release -- --no-daemon /path/to/media/or/folder
+     ```
+
+3. Reuse an existing window from another shell:
+   ```bash
+   cargo run --release -- --same-window /path/to/file
+   ```
+
+4. In-app workflow:
+- press `G` to open/close gallery grid
+- `Filename` tab filters current folder contents in-grid
+- `AI Description` / `OCR Text` tabs run semantic search and show results in the same grid
+- open side panels for binary layout, raw EXIF, and duplicates tools
+
+## Notes
+
+- Launching without `--no-daemon` daemonizes by default.
+- `--new-window` currently behaves as a no-op because new-window behavior is already default.
+- The previous nested `iris/` subcrate was removed; this repo is now a single crate.

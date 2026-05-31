@@ -3524,7 +3524,7 @@ impl ImageViewer {
                                     
                                     let builder = egui::UiBuilder::new()
                                         .max_rect(rect)
-                                        .id_salt(path);
+                                        .id_salt((path, item_idx));
                                     let mut child_ui = ui.new_child(builder);
                                     egui::Frame::NONE
                                         .fill(card_bg)
