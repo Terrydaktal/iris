@@ -9,6 +9,7 @@ egui_extras = { version = "0.33.3", features = ["all_loaders"] }
 image = { version = "0.25.10", features = ["jpeg", "png", "webp", "bmp", "gif", "tiff", "avif"] }
 rfd = "0.17.2"
 anyhow = "1.0"
+arboard = "3.6.1"
 arrow-array = "57.2"
 futures = "0.3"
 lancedb = "0.26.2"
