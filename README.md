@@ -80,8 +80,7 @@ Iris is a Rust desktop app for browsing local images/videos, inspecting metadata
 
 Iris no longer requires hardcoded personal paths. Use environment variables:
 
-- `IRIS_DB_DIR`: LanceDB directory.  
-  Default fallback: `${XDG_DATA_HOME}/iris/lancedb` or `${HOME}/.local/share/iris/lancedb`.
+- `IRIS_DB_DIR`: LanceDB directory. If unset, Iris looks for an existing `lancedb` directory on mounted volumes, then falls back to `${XDG_DATA_HOME}/iris/lancedb` or `${HOME}/.local/share/iris/lancedb`.
 - `IRIS_IMAGESEARCH_DIR`: path to the `imagesearch` project used for model/runtime helpers.
 - `IRIS_ON_DEMAND_EMBED_SCRIPT`: optional override for the on-demand embedding script path.
 - `IRIS_EXIFTOOL`: optional explicit path to `exiftool`.
@@ -105,7 +104,7 @@ Collection root mapping is resolved from the `collection_roots` table in LanceDB
 3. If AI-backed search is used:
    - Lazy-load DB indices and text encoder.
    - Search mode:
-     - Description search -> CLIP text encoder + vector index.
+     - CLIP -> CLIP text encoder + vector index.
      - OCR search -> OCR text index with phrase/term ranking.
 4. For files missing embeddings:
    - Trigger `tools/on_demand_embeddings.py`.
