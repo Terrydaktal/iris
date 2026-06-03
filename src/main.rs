@@ -1147,6 +1147,11 @@ struct OnDemandEmbedResult {
     face_vectors: Vec<Vec<f32>>,
 }
 
+struct SiftRepairResult {
+    summary: String,
+    files: usize,
+}
+
 #[derive(Clone)]
 struct SimilarFile {
     file_name: String,
@@ -1192,28 +1197,6 @@ struct UnifiedDbData {
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
-}
-
-fn resolve_root(
-    name: &str,
-    direct_root_by_file: &HashMap<String, String>,
-    master_images: &HashSet<String>,
-) -> String {
-    let mut current = name.to_string();
-    for _ in 0..16 {
-        let next = match direct_root_by_file.get(current.as_str()) {
-            Some(v) => v.clone(),
-            None => return current,
-        };
-        if !master_images.contains(next.as_str()) {
-            return current;
-        }
-        if next == current {
-            return current;
-        }
-        current = next;
-    }
-    current
 }
 
 async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<UnifiedDbData> {
@@ -1395,25 +1378,46 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
         });
     }
 
-    // Build SIFT groups using resolve_root
+    // Build SIFT groups from undirected connected components. The stored
+    // sift_match_file value is directional, but grouping is not.
     let mut sift_root_by_file: HashMap<String, String> = HashMap::new();
     let mut sift_members_by_root: HashMap<String, Vec<String>> = HashMap::new();
-    let mut raw_groups: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sift_neighbors: HashMap<String, Vec<String>> = HashMap::new();
     for file_name in &master_images {
-        let root = resolve_root(file_name.as_str(), &direct_root_by_file, &master_images);
-        raw_groups.entry(root).or_default().push(file_name.clone());
+        sift_neighbors.entry(file_name.clone()).or_default();
     }
-    for members in raw_groups.into_values() {
-        if members.len() <= 1 {
+    for (file_name, target) in &direct_root_by_file {
+        if !master_images.contains(file_name.as_str()) || !master_images.contains(target.as_str()) {
             continue;
         }
-        let mut sorted_members = members;
+        sift_neighbors.entry(file_name.clone()).or_default().push(target.clone());
+        sift_neighbors.entry(target.clone()).or_default().push(file_name.clone());
+    }
+
+    let mut visited_sift = HashSet::new();
+    for file_name in &master_images {
+        if !visited_sift.insert(file_name.clone()) {
+            continue;
+        }
+
+        let mut stack = vec![file_name.clone()];
+        let mut sorted_members = Vec::new();
+        while let Some(current) = stack.pop() {
+            sorted_members.push(current.clone());
+            if let Some(neighbors) = sift_neighbors.get(&current) {
+                for neighbor in neighbors {
+                    if visited_sift.insert(neighbor.clone()) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+
+        if sorted_members.len() <= 1 {
+            continue;
+        }
         sorted_members.sort_unstable();
-        let canonical = resolve_root(
-            sorted_members[0].as_str(),
-            &direct_root_by_file,
-            &master_images,
-        );
+        let canonical = sorted_members[0].clone();
         for member in &sorted_members {
             sift_root_by_file.insert(member.clone(), canonical.clone());
         }
@@ -1725,7 +1729,7 @@ fn valid_sift_link(info: &SiftInfo) -> bool {
     info.checked == Some(true)
         && info.match_file.is_some()
         && info.inliers.unwrap_or(0) >= 10
-        && info.inlier_ratio.unwrap_or(0.0) >= 0.75
+        && info.inlier_ratio.unwrap_or(0.0) >= 0.40
         && info.score.unwrap_or(0.0) >= 0.0
 }
 
@@ -2838,6 +2842,83 @@ fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
     ))
 }
 
+fn run_sift_repair_for_files(file_names: &[String]) -> Result<SiftRepairResult> {
+    if file_names.len() < 2 {
+        bail!("select at least two indexed images");
+    }
+
+    let db_dir = get_db_dir();
+    let roots = load_or_discover_db_roots(&db_dir);
+    if roots.is_empty() {
+        bail!("no database collection roots are configured");
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temp_path = std::env::temp_dir().join(format!(
+        "iris_sift_repair_{}_{}.json",
+        std::process::id(),
+        stamp
+    ));
+    let payload = serde_json::to_string(file_names).context("failed to serialize selected file list")?;
+    std::fs::write(&temp_path, payload).context("failed to write selected file list")?;
+
+    let imagesearch_dir = resolve_imagesearch_dir();
+    let mut command = Command::new("uv");
+    command
+        .current_dir(&imagesearch_dir)
+        .args([
+            "run",
+            "python",
+            "tools/repair_sift_results.py",
+            "--db-dir",
+            db_dir.to_string_lossy().as_ref(),
+            "--table",
+            MEDIA_INDEX_TABLE,
+            "--files-json",
+            temp_path.to_string_lossy().as_ref(),
+            "--min-inliers",
+            "10",
+            "--min-inlier-ratio",
+            "0.40",
+        ]);
+    for (collection, root) in &roots {
+        command.arg("--collection-root");
+        command.arg(format!("{}={}", collection, root.to_string_lossy()));
+    }
+    if file_names.len() == 2 {
+        command.arg("--fast-pair");
+    }
+
+    let output = command.output().context("failed to run repair_sift_results.py")?;
+    let _ = std::fs::remove_file(&temp_path);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("repair failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| anyhow!("repair script did not return a JSON summary"))?;
+    let payload: Value = serde_json::from_str(json_line).context("invalid repair summary JSON")?;
+    let images = payload.get("images").and_then(Value::as_u64).unwrap_or(0);
+    let pairs = payload.get("pairs").and_then(Value::as_u64).unwrap_or(0);
+    let accepted = payload.get("accepted_pairs").and_then(Value::as_u64).unwrap_or(0);
+    let linked = payload.get("linked_images").and_then(Value::as_u64).unwrap_or(0);
+    let updated = payload.get("updated").and_then(Value::as_u64).unwrap_or(0);
+    Ok(SiftRepairResult {
+        summary: format!(
+            "SIFT repair finished: {images} images, {pairs} pairs checked, {accepted} accepted, {linked} linked, {updated} database rows updated."
+        ),
+        files: file_names.len(),
+    })
+}
+
 fn compute_on_demand_embeddings(
     image_path: &Path,
     need_clip: bool,
@@ -2977,6 +3058,9 @@ struct ImageViewer {
     sift_pair_overlay: Option<String>,
     sift_running: bool,
     sift_rx: Option<Receiver<Result<String, String>>>,
+    selected_grid_files: Vec<String>,
+    sift_repair_running: bool,
+    sift_repair_rx: Option<Receiver<Result<SiftRepairResult, String>>>,
 
     // Maps resolved media_path → database file_name for AI search results.
     // Avoids reverse-mapping video stills back to collection paths.
@@ -3600,6 +3684,9 @@ impl ImageViewer {
             sift_pair_overlay: None,
             sift_running: false,
             sift_rx: None,
+            selected_grid_files: Vec::new(),
+            sift_repair_running: false,
+            sift_repair_rx: None,
 
             db_filename_by_path: HashMap::new(),
             video_still_cache: std::cell::RefCell::new(HashMap::new()),
@@ -4275,6 +4362,136 @@ impl ImageViewer {
         }
     }
 
+    fn start_selected_sift_repair(&mut self, ctx: &egui::Context) {
+        if self.sift_repair_running {
+            return;
+        }
+        if self.selected_grid_files.len() < 2 {
+            self.semantic_status = "Select at least two indexed images before running SIFT repair.".to_string();
+            return;
+        }
+        if !self.db_loaded {
+            if !self.db_loading && !self.db_failed {
+                self.start_lazy_db_load(ctx);
+            }
+            self.semantic_status = "Loading database index before SIFT repair...".to_string();
+            return;
+        }
+
+        let file_names = self.expanded_sift_repair_selection();
+        let selected_count = self.selected_grid_files.len();
+        let repair_count = file_names.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sift_repair_rx = Some(rx);
+        self.sift_repair_running = true;
+        self.semantic_status = format!(
+            "Running SIFT repair on {selected_count} selected images ({repair_count} including current SIFT groups)..."
+        );
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = run_sift_repair_for_files(&file_names).map_err(|err| err.to_string());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn expanded_sift_repair_selection(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let Some(indices) = &self.db_indices else {
+            return self.selected_grid_files.clone();
+        };
+
+        for file_name in &self.selected_grid_files {
+            if seen.insert(file_name.clone()) {
+                out.push(file_name.clone());
+            }
+            let root = indices
+                .sift_root_by_file
+                .get(file_name)
+                .cloned()
+                .unwrap_or_else(|| file_name.clone());
+            if let Some(members) = indices.sift_members_by_root.get(root.as_str()) {
+                for member in members {
+                    if seen.insert(member.clone()) {
+                        out.push(member.clone());
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    fn start_selected_sift_compare(&mut self, ctx: &egui::Context) {
+        if self.selected_grid_files.len() < 2 {
+            self.semantic_status = "Select two indexed images before running SIFT compare.".to_string();
+            return;
+        }
+
+        let file_a = self.selected_grid_files[0].clone();
+        let file_b = self.selected_grid_files[1].clone();
+        let roots = get_db_roots();
+        let path_a = match resolve_source_path(&roots, &file_a) {
+            Ok(path) => path,
+            Err(err) => {
+                self.semantic_status = format!("SIFT compare failed to resolve first image: {err}");
+                return;
+            }
+        };
+        let path_b = match resolve_source_path(&roots, &file_b) {
+            Ok(path) => path,
+            Err(err) => {
+                self.semantic_status = format!("SIFT compare failed to resolve second image: {err}");
+                return;
+            }
+        };
+
+        self.images = vec![path_a.clone(), path_b.clone()];
+        self.current_index = 0;
+        self.compare_target = Some(path_b.clone());
+        self.show_grid = false;
+        self.back_target_is_gallery = true;
+        self.zoom = 1.0;
+        self.offset = egui::Vec2::ZERO;
+        self.start_sift_alignment(path_a, path_b, ctx.clone());
+    }
+
+    fn poll_sift_repair(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.sift_repair_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.sift_repair_running = false;
+                self.selected_grid_files.clear();
+                self.compare_target = None;
+                self.sift_pair_overlay = None;
+                self.db_loaded = false;
+                self.db_loading = false;
+                self.db_failed = false;
+                self.db_indices = None;
+                self.db_rx = None;
+                self.start_lazy_db_load(ctx);
+                self.semantic_status = format!(
+                    "{} Reloading database maps after repairing {} selected files.",
+                    result.summary, result.files
+                );
+            }
+            Ok(Err(err)) => {
+                self.sift_repair_running = false;
+                self.semantic_status = format!("SIFT repair failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.sift_repair_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.sift_repair_running = false;
+                self.semantic_status = "SIFT repair worker disconnected unexpectedly.".to_string();
+            }
+        }
+    }
+
     fn start_recursive_scan(&mut self) {
         self.grid_loading = true;
         self.recursive_images.clear();
@@ -4563,6 +4780,45 @@ impl ImageViewer {
                 
                 ui.add_space(12.0);
                 ui.checkbox(&mut self.semantic_video_only, "Videos only");
+
+                ui.separator();
+                let selected_count = self.selected_grid_files.len();
+                let repair_label = if self.sift_repair_running {
+                    "Repairing SIFT..."
+                } else {
+                    "Repair selected SIFT"
+                };
+                if ui
+                    .add_enabled(
+                        has_db && !self.sift_repair_running && selected_count >= 2,
+                        egui::Button::new(repair_label),
+                    )
+                    .clicked()
+                {
+                    self.start_selected_sift_repair(ctx);
+                }
+                if ui
+                    .add_enabled(
+                        has_db && !self.sift_repair_running && selected_count >= 2,
+                        egui::Button::new("Compare selected SIFT"),
+                    )
+                    .clicked()
+                {
+                    self.start_selected_sift_compare(ctx);
+                }
+                if ui
+                    .add_enabled(
+                        !self.sift_repair_running && selected_count > 0,
+                        egui::Button::new("Clear selected"),
+                    )
+                    .clicked()
+                {
+                    self.selected_grid_files.clear();
+                    self.semantic_status = "Selection cleared.".to_string();
+                }
+                if selected_count > 0 || self.sift_repair_running {
+                    ui.weak(format!("{selected_count} selected (Ctrl-click tiles to toggle)"));
+                }
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
@@ -4644,7 +4900,19 @@ impl ImageViewer {
 
             // Status message label
             ui.horizontal(|ui| {
-                if is_active_semantic_search {
+                let show_sift_status = self.sift_repair_running
+                    || self.semantic_status.starts_with("SIFT repair")
+                    || self.semantic_status.starts_with("Running SIFT")
+                    || self.semantic_status.starts_with("Loading database index before SIFT")
+                    || self.semantic_status.starts_with("Select at least")
+                    || self.semantic_status.contains("selected")
+                    || self.semantic_status.starts_with("Only indexed");
+                if show_sift_status {
+                    if self.sift_repair_running {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    }
+                    ui.weak(&self.semantic_status);
+                } else if is_active_semantic_search {
                     ui.weak(&self.semantic_status);
                 } else if self.grid_loading {
                     ui.add(egui::Spinner::new().size(14.0));
@@ -4760,6 +5028,10 @@ impl ImageViewer {
                                         &temp_item
                                     };
                                     let path = &item.path;
+                                    let is_selected = item
+                                        .db_filename
+                                        .as_ref()
+                                        .is_some_and(|name| self.selected_grid_files.contains(name));
                                     let is_current = if let Some(curr_p) = self.images.get(self.current_index) {
                                         curr_p == path
                                     } else {
@@ -4842,7 +5114,9 @@ impl ImageViewer {
                                     let is_hovered = response.hovered();
                                     let is_clicked = response.clicked();
                                     
-                                    let card_bg = if is_clicked {
+                                    let card_bg = if is_selected {
+                                        ui.visuals().selection.bg_fill.gamma_multiply(0.45)
+                                    } else if is_clicked {
                                         ui.visuals().selection.bg_fill.gamma_multiply(0.3)
                                     } else if is_hovered {
                                         ui.visuals().code_bg_color.gamma_multiply(1.5)
@@ -4852,7 +5126,9 @@ impl ImageViewer {
                                         ui.visuals().code_bg_color
                                     };
                                     
-                                    let card_stroke = if is_current {
+                                    let card_stroke = if is_selected {
+                                        egui::Stroke::new(3.0, egui::Color32::from_rgb(100, 200, 120))
+                                    } else if is_current {
                                         egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
                                     } else if is_hovered {
                                         egui::Stroke::new(1.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5))
@@ -5010,7 +5286,35 @@ impl ImageViewer {
                                         );
                                     }
                                         
-                                    if response.double_clicked() {
+                                    let ctrl_clicked = response.clicked()
+                                        && ui.input(|i| i.modifiers.matches_logically(egui::Modifiers::CTRL));
+                                    if ctrl_clicked {
+                                        if item.is_video {
+                                            self.semantic_status = "Selection only supports indexed images for SIFT actions.".to_string();
+                                        } else if let Some(db_name) = &item.db_filename {
+                                            if !self.db_loaded && !self.db_loading && !self.db_failed {
+                                                self.start_lazy_db_load(ui.ctx());
+                                            }
+                                            if let Some(pos) = self
+                                                .selected_grid_files
+                                                .iter()
+                                                .position(|name| name == db_name)
+                                            {
+                                                self.selected_grid_files.remove(pos);
+                                            } else {
+                                                self.selected_grid_files.push(db_name.clone());
+                                            }
+                                            let selected_count = self.selected_grid_files.len();
+                                            self.semantic_status = format!(
+                                                "{selected_count} indexed image(s) selected."
+                                            );
+                                        } else {
+                                            if !self.db_loaded && !self.db_loading && !self.db_failed {
+                                                self.start_lazy_db_load(ui.ctx());
+                                            }
+                                            self.semantic_status = "Only indexed database images can be selected.".to_string();
+                                        }
+                                    } else if response.double_clicked() {
                                         double_clicked_item = Some(item.clone());
                                     } else if response.clicked() {
                                         single_clicked_item = Some(item.clone());
@@ -5445,6 +5749,7 @@ impl eframe::App for ImageViewer {
 
         self.poll_db_load();
         self.poll_sift_alignment();
+        self.poll_sift_repair(ctx);
         self.poll_on_demand_embeddings(ctx);
 
         if !self.db_loaded && !self.db_loading {
@@ -5808,20 +6113,24 @@ impl eframe::App for ImageViewer {
                                 // Check if the current file is a video in the DB
                                 let current_is_video = is_video_path(Path::new(&filename));
                                 
-                                // Resolve grouped master like clip_viewer:
-                                // videos → file_name directly (no SIFT for videos)
-                                // images → sift_root_by_file → phash_master → sift_root
+                                // Resolve grouped master: prefer the current image's SIFT
+                                // component, then fall back through pHash/VideoHash.
                                 let master_file_name = if current_is_video {
                                     filename.clone()
                                 } else {
-                                    let phash_master = indices.phash_master_by_file
+                                    indices.sift_root_by_file
                                         .get(&filename)
                                         .cloned()
-                                        .unwrap_or_else(|| filename.clone());
-                                    indices.sift_root_by_file
-                                        .get(&phash_master)
-                                        .cloned()
-                                        .unwrap_or(phash_master)
+                                        .unwrap_or_else(|| {
+                                            let phash_master = indices.phash_master_by_file
+                                                .get(&filename)
+                                                .cloned()
+                                                .unwrap_or_else(|| filename.clone());
+                                            indices.sift_root_by_file
+                                                .get(&phash_master)
+                                                .cloned()
+                                                .unwrap_or(phash_master)
+                                        })
                                 };
                                 
                                 // Fetch SIFT members in this group
@@ -5832,10 +6141,10 @@ impl eframe::App for ImageViewer {
                                 
                                 let mut displayed_sift_members = Vec::new();
                                 let mut displayed_seen = HashSet::new();
+                                if !sift_members.is_empty() && displayed_seen.insert(filename.clone()) {
+                                    displayed_sift_members.push(filename.clone());
+                                }
                                 for member in &sift_members {
-                                    if member == &filename {
-                                        continue;
-                                    }
                                     if displayed_seen.insert(member.clone()) {
                                         displayed_sift_members.push(member.clone());
                                     }
@@ -5914,70 +6223,11 @@ impl eframe::App for ImageViewer {
                                 egui::ScrollArea::vertical().show(ui, |ui| {
                                     let side_thumb = 90.0_f32;
                                     
-                                    // 0. Active File / Current Selection
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "★ Current Selection");
-                                    });
-                                    ui.add_space(6.0);
-                                    
-                                    let active_resolved = self.get_thumbnail_path(&path);
-                                    let active_is_video = current_is_video;
-                                    let active_actual = self.resolve_actual_path(&path);
-                                    
-                                    ui.horizontal(|ui| {
-                                        // Left: Thumbnail preview
-                                        self.draw_thumbnail_async(ui, &active_resolved, side_thumb);
-                                        
-                                        // Right: Info and buttons
-                                        ui.vertical(|ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.colored_label(
-                                                    if active_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
-                                                    if active_is_video { "📹 Video" } else { "🖼 Image" }
-                                                );
-                                                ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
-                                            });
-                                            
-                                            let res_size_str = format!("{} • {}", self.current_dimensions, self.current_file_size);
-                                            ui.weak(&res_size_str);
-                                            
-                                            let display_name = filename.split_once('/').map(|x| x.1).unwrap_or(&filename);
-                                            wrapping_monospace_path(ui, display_name);
-                                            
-                                            ui.horizontal(|ui| {
-                                                if ui.button("📂 Open Folder").clicked() {
-                                                    open_in_dolphin_or_fallback(&active_actual);
-                                                }
-                                                if active_is_video {
-                                                    if ui.button("▶ Open in mpv").clicked() {
-                                                        let _ = std::process::Command::new("mpv")
-                                                            .arg(&active_actual)
-                                                            .spawn();
-                                                    }
-                                                } else if ui.button("👁 View").clicked() {
-                                                    if let Some(pos) = self.images.iter().position(|p| p == &path) {
-                                                        self.current_index = pos;
-                                                    } else {
-                                                        self.images.insert(self.current_index + 1, path.clone());
-                                                        self.db_filename_by_path.insert(path.clone(), filename.clone());
-                                                        self.current_index += 1;
-                                                    }
-                                                    self.show_grid = false;
-                                                    self.back_target_is_gallery = true;
-                                                    self.update_exif();
-                                                }
-                                            });
-                                        });
-                                    });
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(8.0);
-                                    
                                     // 1. SIFT Cluster Members (Duplicates)
                                     if !sift_members.is_empty() {
                                         ui.horizontal(|ui| {
                                             ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "✓ SIFT Group");
-                                            ui.weak(format!("({} files, current shown above)", sift_members.len()));
+                                            ui.weak(format!("({} files)", sift_members.len()));
                                         });
                                         ui.add_space(6.0);
                                         
@@ -6330,11 +6580,15 @@ impl eframe::App for ImageViewer {
                     let left_uri = format!("file://{}", left_resolved.to_string_lossy());
                     let right_uri = format!("file://{}", right_resolved.to_string_lossy());
                     
-                    let avail_size = ui.available_size();
+                    let builder = egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .id_salt("sift_compare_viewport");
+                    let mut compare_ui = ui.new_child(builder);
+                    let avail_size = rect.size();
                     let half_w = (avail_size.x / 2.0 - 12.0).max(10.0);
-                    let h = (avail_size.y - 120.0).max(10.0); // leave space for SIFT overlay
+                    let h = (avail_size.y - 120.0).max(10.0);
                     
-                    ui.horizontal(|ui| {
+                    compare_ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2(half_w, h),
                             egui::Image::new(left_uri)
@@ -6361,8 +6615,8 @@ impl eframe::App for ImageViewer {
                         "SIFT alignment not calculated.".to_string()
                     };
                     
-                    ui.add_space(16.0);
-                    ui.vertical_centered(|ui| {
+                    compare_ui.add_space(16.0);
+                    compare_ui.vertical_centered(|ui| {
                         egui::Frame::NONE
                             .fill(egui::Color32::from_black_alpha(190))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 180, 255).gamma_multiply(0.4)))
