@@ -1,4 +1,51 @@
-target/
-.antigravitycli/
+# Rust build output
+/target/
+
+# Local editor and tool state
+/.antigravitycli/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python caches and virtual environments
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.env.*
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# uv and local package caches
+.uv-cache/
+uv-cache/
+
+# Local databases and generated index artifacts
+lancedb/
+*.lance/
+*.tmp
+*.log
+
+# Media indexer model artifacts are generated/downloaded locally.
+# The ONNX data file is multi-GB and should not be committed to the public repo.
+/tools/media_indexer/models/
+
+# Media indexer generated reports and ad-hoc result dumps
+thumb_phash_results.csv
+thumb_phash_results.txt
+failure_report*.json
+failure_report*.txt
+
+# Generated extracted video still folders, when created inside the repo.
+*-video/

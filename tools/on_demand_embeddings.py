@@ -30,14 +30,18 @@ def resolve_imagesearch_root() -> Path:
 
     here = Path(__file__).resolve()
     candidates = [
+        here.parent / "media_indexer",
         here.parent.parent / "imagesearch",
+        here.parent.parent / "tools" / "media_indexer",
+        Path.cwd(),
+        Path.cwd() / "tools" / "media_indexer",
         Path.cwd() / "../imagesearch",
         Path.cwd() / "imagesearch",
     ]
     for candidate in candidates:
         if candidate.is_dir():
             return candidate.resolve()
-    return Path("imagesearch")
+    return Path("tools/media_indexer")
 
 
 def main() -> int:
@@ -50,7 +54,7 @@ def main() -> int:
     if not image_path.is_file():
         return emit({"ok": False, "error": f"image does not exist: {image_path}"})
 
-    # Reuse the existing imagesearch implementation and model configuration.
+    # Reuse the integrated media indexer implementation and model configuration.
     imagesearch_root = resolve_imagesearch_root()
     sys.path.insert(0, str(imagesearch_root))
     try:
@@ -62,7 +66,7 @@ def main() -> int:
             read_image_bgr,
         )
     except Exception as exc:
-        return emit({"ok": False, "error": f"failed to import imagesearch main.py: {exc}"})
+        return emit({"ok": False, "error": f"failed to import media_indexer main.py: {exc}"})
 
     try:
         frame = read_image_bgr(image_path)
