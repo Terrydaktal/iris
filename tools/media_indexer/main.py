@@ -446,6 +446,11 @@ def cross_media_state_path(cfg: AppConfig) -> Path:
     return cfg.db_dir / "cross-media-state.json"
 
 
+def cross_media_work_path(cfg: AppConfig) -> Path:
+    collection_hash = hashlib.sha1(cfg.collection_id.encode("utf-8")).hexdigest()[:12]
+    return cfg.db_dir / "cross-media-work" / f"{collection_hash}.json"
+
+
 def read_cross_media_state(cfg: AppConfig) -> dict[str, Any]:
     path = cross_media_state_path(cfg)
     if not path.exists():
@@ -462,6 +467,61 @@ def write_cross_media_state(cfg: AppConfig, state: dict[str, Any]) -> None:
     temp_path = path.with_suffix(".tmp")
     temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     temp_path.replace(path)
+
+
+def read_cross_media_work(cfg: AppConfig, fingerprint: str) -> dict[str, Any] | None:
+    path = cross_media_work_path(cfg)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("collection_id") != cfg.collection_id or data.get("fingerprint") != fingerprint:
+        return None
+    desired = data.get("desired_by_file")
+    if not isinstance(desired, dict):
+        return None
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for file_name, matches in desired.items():
+        normalized[str(file_name)] = normalize_cross_media_matches(matches) or []
+    data["desired_by_file"] = normalized
+    return data
+
+
+def write_cross_media_work(
+    cfg: AppConfig,
+    *,
+    fingerprint: str,
+    state: str,
+    desired_by_file: dict[str, list[dict[str, Any]]],
+    image_total: int,
+    video_total: int,
+) -> None:
+    path = cross_media_work_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "collection_id": cfg.collection_id,
+        "fingerprint": fingerprint,
+        "state": state,
+        "image_total": image_total,
+        "video_total": video_total,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "desired_by_file": desired_by_file,
+    }
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def clear_cross_media_work(cfg: AppConfig) -> None:
+    try:
+        cross_media_work_path(cfg).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def cross_media_input_fingerprint(
@@ -1025,7 +1085,10 @@ def discover_media_files(root: Path) -> list[Path]:
         if suffix in IMAGE_EXTS or suffix in VIDEO_EXTS:
             files.append(path)
     files.sort()
-    print_info(f"[stage 0] discovered {len(files)} supported media files from {scanned} paths")
+    print_info(
+        f"{format_stage_label('Stage 0a/9 Startup scan media files')}: "
+        f"discovered {len(files)} supported media files from {scanned} paths"
+    )
     return files
 
 
@@ -1060,7 +1123,7 @@ def migrate_legacy_records_for_scan(
     media_paths: list[Path],
 ) -> None:
     rename_pairs: list[tuple[str, str]] = []
-    for path in progress(media_paths, desc="Stage 0d/9 Startup check legacy DB keys", unit="file"):
+    for path in progress(media_paths, desc="Stage 0g/9 Startup check legacy DB keys", unit="file"):
         legacy_key = relative_file_name(cfg.input_dir, path)
         new_key = scoped_file_name(cfg, path)
         if new_key in records:
@@ -1068,12 +1131,12 @@ def migrate_legacy_records_for_scan(
         if legacy_key in records:
             rename_pairs.append((legacy_key, new_key))
     if not rename_pairs:
-        print_info("[stage 0] legacy DB key migration not needed")
+        print_info(f"{format_stage_label('Stage 0h/9 Startup migrate legacy DB keys')}: not needed")
         return
 
-    print_info(f"[stage 0] migrating {len(rename_pairs)} legacy DB keys")
+    print_info(f"{format_stage_label('Stage 0h/9 Startup migrate legacy DB keys')}: migrating {len(rename_pairs)} rows")
     remap = {old: new for old, new in rename_pairs}
-    for old_key, new_key in progress(rename_pairs, desc="Stage 0e/9 Startup migrate legacy DB keys", unit="row"):
+    for old_key, new_key in progress(rename_pairs, desc="Stage 0h/9 Startup migrate legacy DB keys", unit="row"):
         row = dict(records[old_key])
         row["file_name"] = new_key
         row["collection_id"] = cfg.collection_id
@@ -1140,7 +1203,7 @@ def db_table_names(db) -> set[str]:
 
 
 def connect_table(db_dir: Path, table_name: str):
-    with TimedStep(f"Stage 0b/9 Startup open LanceDB table {table_name}"):
+    with TimedStep(f"Stage 0c/9 Startup open LanceDB table {table_name}"):
         db_dir.mkdir(parents=True, exist_ok=True)
         db = lancedb.connect(str(db_dir))
         if table_name not in db_table_names(db):
@@ -1193,9 +1256,9 @@ def ensure_file_name_index(table) -> None:
     if index_name in index_names:
         return
     try:
-        print_info("[stage 0] creating file_name scalar index")
+        print_info(f"{format_stage_label('Stage 0d/9 Startup ensure file_name index')}: creating")
         table.create_scalar_index("file_name", replace=False, name=index_name)
-        print_info("[stage 0] file_name scalar index ready")
+        print_info(f"{format_stage_label('Stage 0d/9 Startup ensure file_name index')}: ready")
     except Exception as exc:
         print_warning(f"[db] warning: failed to create file_name scalar index: {exc}")
 
@@ -1273,14 +1336,14 @@ def migrate_row_to_current_schema(old_row: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_records(table) -> dict[str, dict[str, Any]]:
-    with TimedStep("Stage 0c/9 Startup load DB rows into memory"):
+    with TimedStep("Stage 0e/9 Startup load DB rows into memory"):
         try:
             rows = table.to_arrow().to_pylist()
         except Exception:
             return {}
 
     records: dict[str, dict[str, Any]] = {}
-    for row in progress(rows, desc="Stage 0c/9 Startup normalize DB rows", unit="row"):
+    for row in progress(rows, desc="Stage 0f/9 Startup normalize DB rows", unit="row"):
         file_name = row["file_name"]
         records[file_name] = {
             "file_name": file_name,
@@ -1309,7 +1372,7 @@ def load_records(table) -> dict[str, dict[str, Any]]:
             "clip_groups": row.get("clip_groups"),
             "ocr_groups": row.get("ocr_groups"),
         }
-    print_info(f"[stage 0] loaded {len(records)} DB rows")
+    print_info(f"{format_stage_label('Stage 0f/9 Startup normalize DB rows')}: loaded {len(records)} DB rows")
     return records
 
 
@@ -1326,6 +1389,12 @@ def upsert_record(table, records: dict[str, dict[str, Any]], record: dict[str, A
 def upsert_records_to_table(table, batch: list[dict[str, Any]]) -> None:
     if not batch:
         return
+    batch_by_file: dict[str, dict[str, Any]] = {}
+    for record in batch:
+        # LanceDB merge_insert rejects multiple source rows for the same key.
+        # Keep the newest queued version of each row when a stage touches it twice.
+        batch_by_file[record["file_name"]] = record
+    batch = list(batch_by_file.values())
     arrow_batch = pa.Table.from_pylist(batch, schema=SCHEMA)
     if hasattr(table, "merge_insert"):
         (
@@ -1350,7 +1419,7 @@ def upsert_records_batch(
     if not batch:
         return
     upsert_records_to_table(table, batch)
-    for record in batch:
+    for record in {record["file_name"]: record for record in batch}.values():
         records[record["file_name"]] = record
 
 
@@ -3940,12 +4009,19 @@ def run_cross_media_match_stage(
         and isinstance(collection_state, dict)
         and collection_state.get("fingerprint") == input_fingerprint
     ):
+        clear_cross_media_work(cfg)
         report_stage_complete("Stage 3e/9 image↔video frame match", len(image_paths), "images")
         report_stage_complete("Stage 3f/9 video frame↔image match", len(video_paths), "videos")
         return set()
 
     changed: set[str] = set()
     upsert_batch: list[dict[str, Any]] = []
+    work = None if force else read_cross_media_work(cfg, input_fingerprint)
+    work_state = str(work.get("state")) if work else ""
+    if work and work_state == "image_to_video_complete":
+        print_info("[cross-media] resuming from saved Stage 3e image-to-video results")
+    elif work and work_state == "computed":
+        print_info("[cross-media] reusing saved Stage 3e/3f results and resuming DB apply")
 
     for file_name, record in records.items():
         existing_matches = normalize_cross_media_matches(record.get("cross_media_matches")) or []
@@ -3977,96 +4053,123 @@ def run_cross_media_match_stage(
 
     video_tree, video_refs_by_key = build_video_frame_hash_index(records)
     max_distance = max_hamming_for_similarity(cfg.phash_skip_similarity_pct)
-    desired_by_file: dict[str, list[dict[str, Any]]] = {file_name: [] for file_name in current_files}
+    desired_by_file: dict[str, list[dict[str, Any]]]
 
-    write_status(
-        cfg,
-        stage="cross_media_image_to_video",
-        state="running",
-        image_total=len(image_paths),
-    )
-    for image_path in progress(image_paths, desc="Stage 3e/9 image↔video frame match", unit="image"):
-        file_name = scoped_file_name(cfg, image_path)
-        record = records.get(file_name)
-        if not record:
-            continue
-        phash_hex = normalize_phash_hex(record.get("phash_hex"))
-        if phash_hex is None:
-            continue
-        per_video_best: dict[str, dict[str, Any]] = {}
-        for ref_key, distance in video_tree.find_all(int(phash_hex, 16), max_distance=max_distance):
-            ref = video_refs_by_key.get(ref_key)
-            if ref is None:
+    if work and work_state in {"image_to_video_complete", "computed"}:
+        desired_by_file = {
+            str(file_name): list(matches)
+            for file_name, matches in work["desired_by_file"].items()
+        }
+        report_stage_complete("Stage 3e/9 image↔video frame match", len(image_paths), "images")
+    else:
+        desired_by_file = {file_name: [] for file_name in current_files}
+        write_status(
+            cfg,
+            stage="cross_media_image_to_video",
+            state="running",
+            image_total=len(image_paths),
+        )
+        for image_path in progress(image_paths, desc="Stage 3e/9 image↔video frame match", unit="image"):
+            file_name = scoped_file_name(cfg, image_path)
+            record = records.get(file_name)
+            if not record:
                 continue
-            if ref.file_name == file_name:
-                continue
-            similarity_pct = round(float((64 - distance) * 100.0 / 64.0), 3)
-            existing = per_video_best.get(ref.file_name)
-            if existing is None or float(existing["similarity_pct"]) < similarity_pct:
-                per_video_best[ref.file_name] = {
-                    "file_name": ref.file_name,
-                    "is_video": True,
-                    "similarity_pct": similarity_pct,
-                }
-        matches = normalize_cross_media_matches(list(per_video_best.values())) or []
-        desired_by_file[file_name] = matches
-        for entry in matches:
-            record_cross_media_entry(
-                desired_by_file,
-                file_name=str(entry["file_name"]),
-                related_file_name=file_name,
-                related_is_video=False,
-                similarity_pct=float(entry["similarity_pct"]),
-            )
-
-    write_status(
-        cfg,
-        stage="cross_media_image_to_video",
-        state="complete",
-        image_total=len(image_paths),
-    )
-    write_status(
-        cfg,
-        stage="cross_media_video_to_image",
-        state="running",
-        video_total=len(video_paths),
-    )
-    for video_path in progress(video_paths, desc="Stage 3f/9 video frame↔image match", unit="video"):
-        file_name = scoped_file_name(cfg, video_path)
-        frame_hash_groups = current_video_hash_groups.get(file_name) or []
-        per_image_best: dict[str, dict[str, Any]] = {}
-        for group in frame_hash_groups:
-            phash_hex = normalize_phash_hex(group.get("phash_hex"))
+            phash_hex = normalize_phash_hex(record.get("phash_hex"))
             if phash_hex is None:
                 continue
-            for image_file_name, distance in image_tree.find_all(int(phash_hex, 16), max_distance=max_distance):
-                if image_file_name == file_name:
+            per_video_best: dict[str, dict[str, Any]] = {}
+            for ref_key, distance in video_tree.find_all(int(phash_hex, 16), max_distance=max_distance):
+                ref = video_refs_by_key.get(ref_key)
+                if ref is None:
+                    continue
+                if ref.file_name == file_name:
                     continue
                 similarity_pct = round(float((64 - distance) * 100.0 / 64.0), 3)
-                existing = per_image_best.get(image_file_name)
+                existing = per_video_best.get(ref.file_name)
                 if existing is None or float(existing["similarity_pct"]) < similarity_pct:
-                    per_image_best[image_file_name] = {
-                        "file_name": image_file_name,
-                        "is_video": False,
+                    per_video_best[ref.file_name] = {
+                        "file_name": ref.file_name,
+                        "is_video": True,
                         "similarity_pct": similarity_pct,
                     }
-        matches = normalize_cross_media_matches(list(per_image_best.values())) or []
-        desired_by_file[file_name] = merge_cross_media_match_entries(desired_by_file.get(file_name), matches)
-        for entry in matches:
-            record_cross_media_entry(
-                desired_by_file,
-                file_name=str(entry["file_name"]),
-                related_file_name=file_name,
-                related_is_video=True,
-                similarity_pct=float(entry["similarity_pct"]),
-            )
+            matches = normalize_cross_media_matches(list(per_video_best.values())) or []
+            desired_by_file[file_name] = matches
+            for entry in matches:
+                record_cross_media_entry(
+                    desired_by_file,
+                    file_name=str(entry["file_name"]),
+                    related_file_name=file_name,
+                    related_is_video=False,
+                    similarity_pct=float(entry["similarity_pct"]),
+                )
 
-    write_status(
-        cfg,
-        stage="cross_media_video_to_image",
-        state="complete",
-        video_total=len(video_paths),
-    )
+        write_status(
+            cfg,
+            stage="cross_media_image_to_video",
+            state="complete",
+            image_total=len(image_paths),
+        )
+        write_cross_media_work(
+            cfg,
+            fingerprint=input_fingerprint,
+            state="image_to_video_complete",
+            desired_by_file=desired_by_file,
+            image_total=len(image_paths),
+            video_total=len(video_paths),
+        )
+    if work and work_state == "computed":
+        report_stage_complete("Stage 3f/9 video frame↔image match", len(video_paths), "videos")
+    else:
+        write_status(
+            cfg,
+            stage="cross_media_video_to_image",
+            state="running",
+            video_total=len(video_paths),
+        )
+        for video_path in progress(video_paths, desc="Stage 3f/9 video frame↔image match", unit="video"):
+            file_name = scoped_file_name(cfg, video_path)
+            frame_hash_groups = current_video_hash_groups.get(file_name) or []
+            per_image_best: dict[str, dict[str, Any]] = {}
+            for group in frame_hash_groups:
+                phash_hex = normalize_phash_hex(group.get("phash_hex"))
+                if phash_hex is None:
+                    continue
+                for image_file_name, distance in image_tree.find_all(int(phash_hex, 16), max_distance=max_distance):
+                    if image_file_name == file_name:
+                        continue
+                    similarity_pct = round(float((64 - distance) * 100.0 / 64.0), 3)
+                    existing = per_image_best.get(image_file_name)
+                    if existing is None or float(existing["similarity_pct"]) < similarity_pct:
+                        per_image_best[image_file_name] = {
+                            "file_name": image_file_name,
+                            "is_video": False,
+                            "similarity_pct": similarity_pct,
+                        }
+            matches = normalize_cross_media_matches(list(per_image_best.values())) or []
+            desired_by_file[file_name] = merge_cross_media_match_entries(desired_by_file.get(file_name), matches)
+            for entry in matches:
+                record_cross_media_entry(
+                    desired_by_file,
+                    file_name=str(entry["file_name"]),
+                    related_file_name=file_name,
+                    related_is_video=True,
+                    similarity_pct=float(entry["similarity_pct"]),
+                )
+
+        write_status(
+            cfg,
+            stage="cross_media_video_to_image",
+            state="complete",
+            video_total=len(video_paths),
+        )
+        write_cross_media_work(
+            cfg,
+            fingerprint=input_fingerprint,
+            state="computed",
+            desired_by_file=desired_by_file,
+            image_total=len(image_paths),
+            video_total=len(video_paths),
+        )
     for file_name, desired_matches in desired_by_file.items():
         record = records.get(file_name)
         if record is None:
@@ -4094,6 +4197,7 @@ def run_cross_media_match_stage(
     state["version"] = 1
     state["collections"] = collections
     write_cross_media_state(cfg, state)
+    clear_cross_media_work(cfg)
     return changed
 
 
@@ -5184,7 +5288,7 @@ def main() -> None:
         return
 
     image_paths, video_paths = split_media(media_paths)
-    print_info(f"{format_stage_label('Stage 0a/9 Startup scan media files')}: media split: {len(image_paths)} images, {len(video_paths)} videos")
+    print_info(f"{format_stage_label('Stage 0b/9 Startup split media files')}: {len(image_paths)} images, {len(video_paths)} videos")
     table = connect_table(cfg.db_dir, cfg.table_name)
     records = load_records(table)
     migrate_legacy_records_for_scan(cfg, table, records, media_paths)

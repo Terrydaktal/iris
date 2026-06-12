@@ -2261,6 +2261,11 @@ fn discover_existing_db_dir() -> Option<PathBuf> {
 }
 
 fn default_db_dir() -> PathBuf {
+    let repo_db_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lancedb");
+    if repo_db_dir.exists() || cfg!(debug_assertions) {
+        return repo_db_dir;
+    }
+
     if let Some(discovered) = discover_existing_db_dir() {
         return discovered;
     }

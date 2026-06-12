@@ -1,6 +1,8 @@
 # Iris
 
-Iris is a Rust desktop app for browsing local images/videos, inspecting metadata, and searching indexed media by filename, CLIP similarity, or OCR text.
+Iris is a local media browser for large photo and video archives. It can browse folders directly, inspect metadata, open videos in `mpv`, show duplicate/similar media relationships, and search an indexed LanceDB database by filename, CLIP similarity, or OCR text.
+
+The app is intentionally local-first. Media files, embeddings, OCR output, duplicate links, and collection roots live in a local LanceDB directory. No personal collection paths should be hardcoded in the source tree.
 
 ## Project Structure
 
@@ -12,7 +14,6 @@ Iris is a Rust desktop app for browsing local images/videos, inspecting metadata
 ├── iris.desktop
 ├── icon.png
 ├── make_transparent.py
-├── clip_viewer_ref.rs
 ├── src
 │   ├── main.rs
 │   └── bin
@@ -20,6 +21,7 @@ Iris is a Rust desktop app for browsing local images/videos, inspecting metadata
 └── tools
     ├── on_demand_embeddings.py
     └── media_indexer
+        ├── README.md
         ├── main.py
         ├── easyocr_worker.py
         ├── face_worker.py
@@ -30,154 +32,189 @@ Iris is a Rust desktop app for browsing local images/videos, inspecting metadata
         └── tools
 ```
 
-## What Each File Does
+Generated local data is ignored by Git, including `target/`, `lancedb/`, Python virtualenv/cache folders, downloaded/exported indexer models, reports, and extracted `*-video/` still folders.
 
-### `src/main.rs`
+## Main Components
 
-- Main GUI application.
-- Inputs:
-  - CLI args: `iris [--same-window|-s|--reuse-window|-r] [--new-window|-n] [--no-daemon] [PATH]`
-  - Filesystem media under the opened path.
-  - LanceDB tables (`media_index`, optional `collection_roots`).
-  - External tools: `exiftool`, `ffprobe`, `mpv`, and optional `dolphin`.
-  - Python tooling in `tools/media_indexer` for database indexing, SIFT diagnostics, and on-demand CLIP/face embeddings.
-- Outputs:
-  - Interactive gallery/viewer UI.
-  - Similarity and OCR/description search results.
-  - EXIF/raw metadata and ffprobe output for videos.
+### Iris Viewer: `src/main.rs`
 
-### `tools/on_demand_embeddings.py`
+The Rust desktop application. It provides:
 
-- Helper used by Iris when a file does not already have stored vectors.
-- Inputs:
-  - `--image <path>`
-  - `--clip` and/or `--faces`
-- Output:
-  - JSON payload on stdout:
-    - `{"ok": true, "clip_embedding": [...], "face_embeddings": [[...], ...]}`
-    - or `{"ok": false, "error": "..."}`
-- Runtime dependency:
-  - Imports model/runtime code from `tools/media_indexer` by default, or from `IRIS_IMAGESEARCH_DIR` when set.
+- Folder and file gallery browsing for images and videos.
+- Filename, CLIP, and OCR search modes from one search UI.
+- Optional folder-scoped CLIP/OCR search across indexed collections.
+- Image viewing, video handoff to `mpv`, and folder opening.
+- EXIF/raw metadata via `exiftool` and video stream/format metadata via `ffprobe`.
+- Duplicate sidebar for SIFT groups, pHash/VideoHash similar files, and image-video cross-media matches.
+- Right-click actions for showing visually similar files and more of the same person.
+- Ctrl-click multi-selection for SIFT compare/repair tooling.
+- Embedded crop/rotate editor for image edits.
+- On-demand CLIP/face embedding for files that have not already been indexed.
 
-### `tools/media_indexer/main.py`
+### Media Indexer: `tools/media_indexer/main.py`
 
-- Database builder for media collections.
-- Inputs:
-  - `uv run embedimages <media-folder> --db-dir <lancedb-dir>`
-  - Optional collection id, OCR, face, CLIP, pHash, VideoHash, and SIFT tuning flags.
-- Outputs:
-  - LanceDB `media_index` rows.
-  - ANN side tables for face, CLIP, and OCR search.
-  - Optional extracted video stills next to scanned video folders.
+The Python indexing pipeline that builds and updates the LanceDB database. It handles:
 
-### `tools/media_indexer/*_worker.py`
+- Collection-aware media indexing using `<collection_id>/<relative/path>` file keys.
+- Collection root mapping through the `collection_roots` table.
+- VideoHash for videos.
+- PySceneDetect still extraction for videos.
+- Image pHash and video-still pHash generation.
+- Cross-media image-to-video and video-to-image relationships when an image matches a video still.
+- CLIP embeddings for images and video stills.
+- SIFT duplicate grouping using CLIP ANN candidates.
+- Face detection and embeddings.
+- PaddleOCR text detection and EasyOCR text extraction.
+- Face, CLIP, and OCR text ANN side tables for Iris search.
 
-- Worker processes used by the database builder:
-  - `face_worker.py`: InsightFace detection and ArcFace embeddings.
-  - `paddle_worker.py`: PaddleOCR text detection.
-  - `easyocr_worker.py`: EasyOCR text extraction.
+See [tools/media_indexer/README.md](tools/media_indexer/README.md) for the full indexing pipeline and stage details.
 
-### `tools/media_indexer/tools`
+### On-Demand Embeddings: `tools/on_demand_embeddings.py`
 
-- Maintenance and diagnostic scripts used by Iris and the indexer.
-- Includes SIFT comparison/repair, weak-link pruning, face reruns, collection rollback, CUDA probing, failure reports, and CLIP text model export.
+Used by Iris when a file needs CLIP or face vectors but does not already have them in the database.
 
-### `tools/media_indexer/models/clip-text`
+Example output:
 
-- ONNX CLIP text encoder and tokenizer files used by Iris for in-app CLIP text search.
-- Generated locally with `tools/media_indexer/tools/export_clip_text_onnx.py`.
-- Ignored by Git because the exported ONNX data file is multi-GB.
+```json
+{"ok": true, "clip_embedding": [0.1, 0.2], "face_embeddings": [[0.1, 0.2]]}
+```
 
-### `src/bin/make_transparent.rs`
+### Icon Helpers
 
-- Small icon utility.
-- Inputs:
-  - `cargo run --bin make_transparent -- [src] [dst]`
-  - Defaults: `icon_source.png` -> `icon.png`
-- Output:
-  - Transparent PNG icon.
+- `make_transparent.py`: Python icon cleanup tool. It removes edge-connected backgrounds and writes a transparent PNG.
+- `src/bin/make_transparent.rs`: Rust icon utility kept for the Cargo workspace.
+- `icon.png`: app icon used by the desktop entry.
+- `iris.desktop`: Linux desktop entry. It uses `Icon=iris` and `StartupWMClass=iris`; the app sets the matching native app id.
 
-### `make_transparent.py`
+## Database Location
 
-- Python version of the icon utility.
-- Inputs:
-  - `python3 make_transparent.py [src] [dst]`
-  - Defaults: `icon_source.png` -> `icon.png`
-- Output:
-  - Transparent PNG icon.
+Iris chooses the database directory in this order:
 
-### `clip_viewer_ref.rs`
+1. `IRIS_DB_DIR`, if set.
+2. The repo-local `lancedb` directory, normally `~/Dev/iris/lancedb` when running from this checkout.
+3. Existing discovered `lancedb` directories on common mounted locations.
+4. `${XDG_DATA_HOME}/iris/lancedb`, `${HOME}/.local/share/iris/lancedb`, or `./lancedb` as fallbacks.
 
-- Reference/experimental viewer implementation kept outside the main build path.
+For this repo, the expected default is the repo-local `lancedb/`. That directory is ignored by Git because it contains generated database tables and extracted still metadata.
 
-### `iris.desktop`
+## Runtime Configuration
 
-- Desktop entry template for Linux launchers.
+Environment variables:
 
-## Configuration
+- `IRIS_DB_DIR`: override LanceDB directory.
+- `IRIS_IMAGESEARCH_DIR`: override the media indexer/runtime helper directory. Defaults to `tools/media_indexer`.
+- `IRIS_ON_DEMAND_EMBED_SCRIPT`: override the on-demand embedding helper path.
+- `IRIS_EXIFTOOL`: explicit `exiftool` path.
+- `IRIS_FFPROBE`: explicit `ffprobe` path.
 
-Iris no longer requires hardcoded personal paths. Use environment variables:
+External commands used by the viewer:
 
-- `IRIS_DB_DIR`: LanceDB directory. If unset, Iris looks for an existing `lancedb` directory on mounted volumes, then falls back to `${XDG_DATA_HOME}/iris/lancedb` or `${HOME}/.local/share/iris/lancedb`.
-- `IRIS_IMAGESEARCH_DIR`: optional override path for the image indexing/runtime helpers. If unset, Iris uses `tools/media_indexer`.
-- `IRIS_ON_DEMAND_EMBED_SCRIPT`: optional override for the on-demand embedding script path.
-- `IRIS_EXIFTOOL`: optional explicit path to `exiftool`.
-- `IRIS_FFPROBE`: optional explicit path to `ffprobe`.
+- `exiftool` for image metadata.
+- `ffprobe` for video metadata.
+- `mpv` for video playback.
+- `dolphin` if available for opening folders, with fallback openers otherwise.
 
-Collection root mapping is resolved from the `collection_roots` table in LanceDB (and can be discovered from indexed file samples).
+## Build And Run Iris
 
-## External Dependencies
+```bash
+cargo run --release -- --no-daemon
+```
 
-- Rust + Cargo
-- `uv` (for Python helper execution)
-- Python dependencies from `tools/media_indexer/pyproject.toml` when building or repairing the media index
-- `exiftool`
-- `ffprobe` (from ffmpeg)
-- `mpv` (video open action)
-- `dolphin` (preferred folder opener; app has a fallback opener if unavailable)
+Open a file or folder:
 
-## Runtime Pipeline
+```bash
+cargo run --release -- --no-daemon /path/to/file-or-folder
+```
 
-1. Start app and open a file/folder.
-2. Build gallery list from filesystem scan.
-3. If AI-backed search is used:
-   - Lazy-load DB indices and text encoder.
-   - Search mode:
-     - CLIP -> CLIP text encoder + vector index.
-     - OCR search -> OCR text index with phrase/term ranking.
-4. For files missing embeddings:
-   - Trigger `tools/on_demand_embeddings.py`.
-   - Compute CLIP/face vectors on the fly.
-   - Run “Show most similar” or “Show more of this person” using returned vectors.
-5. Side panels:
-   - EXIF/raw metadata via `exiftool`
-   - video metadata via `ffprobe`
-   - duplicates/similarity diagnostics from DB + SIFT helper
+Reuse an existing window:
+
+```bash
+cargo run --release -- --same-window /path/to/file-or-folder
+```
+
+Install the desktop file/icon in the normal Linux locations if you want launcher/taskbar integration. The repo contains the desktop file template, but the actual icon lookup depends on `iris` being installed into the local icon theme or system icon theme.
 
 ## Build Or Update The Media Database
+
+Use `uv` from the media indexer directory:
 
 ```bash
 cd tools/media_indexer
 UV_CACHE_DIR="/data/.cache/uv" uv sync
+```
+
+Export the CLIP text model used by Iris text search if it is not already present:
+
+```bash
 UV_CACHE_DIR="/data/.cache/uv" uv run python tools/export_clip_text_onnx.py --out-dir models/clip-text
-UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media --db-dir /path/to/lancedb
 ```
 
-Use `--collection-id <id>` when adding multiple folders to one database. Stored DB file names use `<collection_id>/<relative/path>`, and Iris resolves those through the `collection_roots` table.
-
-## Run
+Index or incrementally update a collection:
 
 ```bash
-# from repo root
-cargo run --release -- --no-daemon
+UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media \
+  --db-dir ../../lancedb \
+  --collection-id my_collection
 ```
 
-```bash
-# open a specific path
-cargo run --release -- --no-daemon /path/to/file-or-folder
-```
+Use stable collection ids. Iris resolves database paths such as `my_collection/sub/folder/file.jpg` through the `collection_roots` table, not through hardcoded source paths.
+
+## Indexing Stages
+
+The media indexer prints numbered stages and completion status. Current stages are:
+
+- `Stage 0a/9`: startup scan media files.
+- `Stage 0b/9`: split images and videos.
+- `Stage 0c/9`: open LanceDB table and check schema.
+- `Stage 0d/9`: ensure `file_name` scalar index.
+- `Stage 0e/9`: load DB rows into memory.
+- `Stage 0f/9`: normalize DB rows.
+- `Stage 0g/9`: check legacy DB keys.
+- `Stage 0h/9`: migrate legacy DB keys if needed.
+- `Stage 1a/9`: VideoHash videos.
+- `Stage 1b/9`: apply VideoHash groups.
+- `Stage 2/9`: PySceneDetect video still extraction.
+- `Stage 3a/9`: cached image metadata.
+- `Stage 3b/9`: image pHash.
+- `Stage 3c/9`: video-still pHash.
+- `Stage 3d/9`: apply image pHash groups.
+- `Stage 3e/9`: image-to-video-frame matching.
+- `Stage 3f/9`: video-frame-to-image matching.
+- `Stage 4/9`: CLIP embeddings for images and video stills.
+- `Stage 5a/9`: SIFT CLIP ANN shortlist.
+- `Stage 5b/9`: SIFT master match.
+- `Stage 6/9`: faces.
+- `Stage 7/9`: PaddleOCR text detection.
+- `Stage 8/9`: EasyOCR text extraction.
+- `Stage 9/9`: search-index sync for Face, CLIP, and OCR ANN tables.
+
+Most stages are incremental. Completed rows are skipped unless a rerun flag is used. Cross-media work writes a resumable work file before final DB application, so a crash during DB upsert can resume from saved `3e`/`3f` results.
+
+Force a stage to rerun:
 
 ```bash
-# reuse an existing window
-cargo run --release -- --same-window /path/to/file-or-folder
+UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media \
+  --db-dir ../../lancedb \
+  --collection-id my_collection \
+  --rerun-stage 3e \
+  --rerun-stage 3f
 ```
+
+## Search Behavior
+
+Filename, CLIP, and OCR share one search UI in Iris.
+
+- Filename search scans the visible filesystem tree.
+- CLIP search uses the LanceDB CLIP ANN side table and can search by text, pasted image, or image path.
+- OCR search supports normal multi-term matching and quoted exact phrases.
+- Folder scope can be blank for all indexed folders, an absolute path, a collection-relative path, a partial path section, or a single folder segment.
+
+## Notes For Public Repo Hygiene
+
+Do not commit:
+
+- `lancedb/` or `.lance` tables.
+- downloaded/exported model files under `tools/media_indexer/models/`.
+- extracted video still folders.
+- personal media paths, collection roots, or generated reports.
+- ad-hoc images or screenshots unless they are deliberately part of the app assets.
