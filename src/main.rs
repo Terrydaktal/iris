@@ -133,6 +133,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("iris")
             .with_inner_size([1200.0, 800.0])
             .with_title("Iris"),
         ..Default::default()
@@ -1188,8 +1189,7 @@ struct DatabaseIndices {
     encoder: ClipTextEncoder,
 }
 
-struct UnifiedDbData {
-    clip_index: ClipIndex,
+struct SupplementalDbData {
     face_index: FaceIndex,
     ocr_index: OcrIndex,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
@@ -1199,7 +1199,12 @@ struct UnifiedDbData {
     sift_members_by_root: HashMap<String, Vec<String>>,
 }
 
-async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<UnifiedDbData> {
+enum DatabaseLoadMessage {
+    ClipReady(Result<(ClipIndex, ClipTextEncoder), String>),
+    SupplementalReady(Result<SupplementalDbData, String>),
+}
+
+async fn load_clip_database_index(db_dir: &Path, table_name: &str) -> Result<ClipIndex> {
     let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
         .execute()
         .await?;
@@ -1211,26 +1216,58 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
             "is_video",
             "skip_processing",
             "clip_groups",
-            "face_groups",
-            "ocr_groups",
-            "dedupe_match_file",
-            "dedupe_similarity_pct",
-            "cross_media_matches",
-            "sift_match_file",
-            "sift_match_score",
-            "sift_match_inliers",
-            "sift_match_good_matches",
-            "sift_match_inlier_ratio",
-            "sift_match_checked",
         ]))
         .execute()
         .await?;
     let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let mut entries = Vec::new();
+    let mut dim = None;
+    let mut seen = HashSet::new();
+    for batch in &batches {
+        parse_batch(batch, &mut entries, &mut dim, &mut seen)?;
+    }
+    Ok(ClipIndex {
+        entries,
+        dim: dim.unwrap_or(512),
+        file_count: seen.len(),
+    })
+}
 
-    let mut clip_entries = Vec::new();
-    let mut clip_dim = None;
-    let mut clip_seen = HashSet::new();
-    
+async fn load_supplemental_database_indices(
+    db_dir: &Path,
+    table_name: &str,
+) -> Result<SupplementalDbData> {
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let table = db.open_table(table_name).execute().await?;
+    let table_schema = table.schema().await?;
+    let has_cross_media_matches = table_schema.field_with_name("cross_media_matches").is_ok();
+    let mut selected_columns = vec![
+        "file_name",
+        "is_video",
+        "skip_processing",
+        "face_groups",
+        "ocr_groups",
+        "dedupe_match_file",
+        "dedupe_similarity_pct",
+        "sift_match_file",
+        "sift_match_score",
+        "sift_match_inliers",
+        "sift_match_good_matches",
+        "sift_match_inlier_ratio",
+        "sift_match_checked",
+    ];
+    if has_cross_media_matches {
+        selected_columns.push("cross_media_matches");
+    }
+    let stream = table
+        .query()
+        .select(Select::columns(&selected_columns))
+        .execute()
+        .await?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
     let mut face_entries = Vec::new();
     let mut face_seen = HashSet::new();
     
@@ -1244,9 +1281,6 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
     let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
 
     for batch in &batches {
-        // Parse Clip
-        parse_batch(batch, &mut clip_entries, &mut clip_dim, &mut clip_seen)?;
-        
         // Parse Face
         parse_face_batch(batch, &mut face_entries, &mut face_seen)?;
         
@@ -1258,7 +1292,9 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
         let is_video = bool_col(batch, "is_video")?;
         let dedupe_match = string_col(batch, "dedupe_match_file")?;
         let similarity_col = batch.column_by_name("dedupe_similarity_pct");
-        let cross_media_matches = list_col(batch, "cross_media_matches")?;
+        let cross_media_matches = batch
+            .column_by_name("cross_media_matches")
+            .and_then(|column| column.as_any().downcast_ref::<ListArray>());
 
         for row in 0..batch.num_rows() {
             if dedupe_match.is_null(row) || file_names.is_null(row) {
@@ -1278,51 +1314,53 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
             phash_master_by_file.insert(similar_file, master);
         }
 
-        for row in 0..batch.num_rows() {
-            if file_names.is_null(row) || cross_media_matches.is_null(row) {
-                continue;
-            }
-            let source_file = file_names.value(row).to_string();
-            let matches_any = cross_media_matches.value(row);
-            let matches = matches_any
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| anyhow!("cross_media_matches value is not a struct array"))?;
-            let related_files = matches
-                .column_by_name("file_name")
-                .ok_or_else(|| anyhow!("cross_media_matches missing file_name"))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("cross_media_matches file_name is not string"))?;
-            let related_is_video = matches
-                .column_by_name("is_video")
-                .ok_or_else(|| anyhow!("cross_media_matches missing is_video"))?
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| anyhow!("cross_media_matches is_video is not bool"))?;
-            let related_similarity = matches.column_by_name("similarity_pct");
+        if let Some(cross_media_matches) = cross_media_matches {
+            for row in 0..batch.num_rows() {
+                if file_names.is_null(row) || cross_media_matches.is_null(row) {
+                    continue;
+                }
+                let source_file = file_names.value(row).to_string();
+                let matches_any = cross_media_matches.value(row);
+                let matches = matches_any
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| anyhow!("cross_media_matches value is not a struct array"))?;
+                let related_files = matches
+                    .column_by_name("file_name")
+                    .ok_or_else(|| anyhow!("cross_media_matches missing file_name"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("cross_media_matches file_name is not string"))?;
+                let related_is_video = matches
+                    .column_by_name("is_video")
+                    .ok_or_else(|| anyhow!("cross_media_matches missing is_video"))?
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| anyhow!("cross_media_matches is_video is not bool"))?;
+                let related_similarity = matches.column_by_name("similarity_pct");
 
-            for match_idx in 0..matches.len() {
-                if related_files.is_null(match_idx) {
-                    continue;
+                for match_idx in 0..matches.len() {
+                    if related_files.is_null(match_idx) {
+                        continue;
+                    }
+                    let related_file = related_files.value(match_idx).to_string();
+                    if related_file == source_file {
+                        continue;
+                    }
+                    similar_by_master
+                        .entry(source_file.clone())
+                        .or_default()
+                        .push(SimilarFile {
+                            file_name: related_file,
+                            is_video: if related_is_video.is_null(match_idx) {
+                                false
+                            } else {
+                                related_is_video.value(match_idx)
+                            },
+                            similarity_pct: related_similarity
+                                .and_then(|col| float_value(col.as_ref(), match_idx)),
+                        });
                 }
-                let related_file = related_files.value(match_idx).to_string();
-                if related_file == source_file {
-                    continue;
-                }
-                similar_by_master
-                    .entry(source_file.clone())
-                    .or_default()
-                    .push(SimilarFile {
-                        file_name: related_file,
-                        is_video: if related_is_video.is_null(match_idx) {
-                            false
-                        } else {
-                            related_is_video.value(match_idx)
-                        },
-                        similarity_pct: related_similarity
-                            .and_then(|col| float_value(col.as_ref(), match_idx)),
-                    });
             }
         }
 
@@ -1401,13 +1439,6 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
             direct_root_by_file.insert(file_name, target);
         }
     }
-
-    let clip_dim = clip_dim.unwrap_or(512);
-    let clip_index = ClipIndex {
-        entries: clip_entries,
-        dim: clip_dim,
-        file_count: clip_seen.len(),
-    };
 
     let face_index = FaceIndex {
         entries: face_entries,
@@ -1491,8 +1522,7 @@ async fn load_all_database_indices(db_dir: &Path, table_name: &str) -> Result<Un
         sift_members_by_root.insert(canonical, sorted_members);
     }
 
-    Ok(UnifiedDbData {
-        clip_index,
+    Ok(SupplementalDbData {
         face_index,
         ocr_index,
         similar_by_master,
@@ -2625,10 +2655,39 @@ fn file_matches_folder(file_name: &str, folder: &str, db_roots: &HashMap<String,
     }
     let normalized_file = file_name.replace('\\', "/").to_lowercase();
     let normalized_folder = folder.replace('\\', "/").to_lowercase();
+    let folder_path = Path::new(folder);
+    let is_path_like = normalized_folder.contains('/')
+        || normalized_folder.contains('\\')
+        || folder_path.is_absolute();
+
+    if !is_path_like {
+        let rel_segments: Vec<&str> = normalized_file.split('/').collect();
+        if rel_segments.len() > 2 {
+            for segment in &rel_segments[1..rel_segments.len() - 1] {
+                if segment.contains(&normalized_folder) {
+                    return true;
+                }
+            }
+        }
+        if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
+            let source_segments: Vec<String> = source_path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+                .collect();
+            if source_segments.len() > 1 {
+                for segment in &source_segments[..source_segments.len() - 1] {
+                    if segment.contains(&normalized_folder) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     if normalized_file.contains(&normalized_folder) {
         return true;
     }
-    let folder_path = Path::new(folder);
     if let Ok(canon_folder) = folder_path.canonicalize() {
         if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
             if let Ok(canon_source) = source_path.canonicalize() {
@@ -2647,6 +2706,24 @@ fn file_matches_folder(file_name: &str, folder: &str, db_roots: &HashMap<String,
         }
     }
     false
+}
+
+fn text_edit_enter_pressed(response: &egui::Response) -> bool {
+    let owns_enter = response.has_focus() || response.lost_focus();
+    owns_enter
+        && response.ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            })
+        })
 }
 
 fn resolve_media_path(
@@ -3070,6 +3147,33 @@ fn compute_on_demand_embeddings(
     Ok((clip_vector, face_vectors))
 }
 
+#[derive(Clone, Copy)]
+enum CropDragMode {
+    New,
+    Move,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+struct ImageEditor {
+    source_path: PathBuf,
+    image: image::DynamicImage,
+    texture: egui::TextureHandle,
+    crop_min: egui::Pos2,
+    crop_max: egui::Pos2,
+    crop_drag_mode: Option<CropDragMode>,
+    crop_drag_origin: egui::Pos2,
+    crop_drag_initial_min: egui::Pos2,
+    crop_drag_initial_max: egui::Pos2,
+    status: String,
+}
+
 struct ImageViewer {
     images: Vec<PathBuf>,
     current_index: usize,
@@ -3110,8 +3214,10 @@ struct ImageViewer {
     // AI Database & Explorer States
     db_loaded: bool,
     db_loading: bool,
+    db_supplemental_loaded: bool,
+    db_supplemental_loading: bool,
     db_failed: bool,
-    db_rx: Option<Receiver<Result<DatabaseIndices, String>>>,
+    db_rx: Option<Receiver<DatabaseLoadMessage>>,
     db_indices: Option<DatabaseIndices>,
     semantic_query: String,
     semantic_folder: String,
@@ -3133,6 +3239,7 @@ struct ImageViewer {
     selected_grid_files: Vec<String>,
     sift_repair_running: bool,
     sift_repair_rx: Option<Receiver<Result<SiftRepairResult, String>>>,
+    image_editor: Option<ImageEditor>,
 
     // Maps resolved media_path → database file_name for AI search results.
     // Avoids reverse-mapping video stills back to collection paths.
@@ -3739,6 +3846,8 @@ impl ImageViewer {
             // AI Explorer defaults
             db_loaded: false,
             db_loading: false,
+            db_supplemental_loaded: false,
+            db_supplemental_loading: false,
             db_failed: false,
             db_rx: None,
             db_indices: None,
@@ -3762,6 +3871,7 @@ impl ImageViewer {
             selected_grid_files: Vec::new(),
             sift_repair_running: false,
             sift_repair_rx: None,
+            image_editor: None,
 
             db_filename_by_path: HashMap::new(),
             video_still_cache: std::cell::RefCell::new(HashMap::new()),
@@ -3783,7 +3893,9 @@ impl ImageViewer {
             return;
         }
         self.db_loading = true;
-        self.semantic_status = "Initializing ONNX Runtime and loading database indices... Please wait.".to_string();
+        self.db_supplemental_loaded = false;
+        self.db_supplemental_loading = false;
+        self.semantic_status = "Loading CLIP index and text encoder...".to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         self.db_rx = Some(rx);
         let ctx_clone = ctx.clone();
@@ -3794,13 +3906,15 @@ impl ImageViewer {
                 .build() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                        let _ = tx.send(DatabaseLoadMessage::ClipReady(Err(format!(
+                            "Failed to create tokio runtime: {e}"
+                        ))));
                         ctx_clone.request_repaint();
                         return;
                     }
                 };
-                
-            let result: Result<DatabaseIndices, anyhow::Error> = rt.block_on(async {
+
+            let clip_result: Result<(ClipIndex, ClipTextEncoder), anyhow::Error> = rt.block_on(async {
                 let db_dir_buf = get_db_dir();
                 let db_dir = db_dir_buf.as_path();
                 let table_name = MEDIA_INDEX_TABLE;
@@ -3809,62 +3923,30 @@ impl ImageViewer {
                 let tokenizer_path_buf = imagesearch_dir.join("models/clip-text/tokenizer.json");
                 let onnx_path = onnx_path_buf.as_path();
                 let tokenizer_path = tokenizer_path_buf.as_path();
-                
-                let db_fut = load_all_database_indices(db_dir, table_name);
+
+                let db_fut = load_clip_database_index(db_dir, table_name);
                 let encoder_fut = async {
                     ClipTextEncoder::new(onnx_path, tokenizer_path, 64)
                 };
-
-                let (db_data, encoder) = tokio::try_join!(db_fut, encoder_fut)?;
-                
-                let mut basename_to_db_filename = HashMap::new();
-                for entry in &db_data.clip_index.entries {
-                    if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
-                        let base = fname.to_string_lossy().to_lowercase();
-                        basename_to_db_filename.entry(base).or_insert_with(|| entry.file_name.to_string());
-                    }
-                }
-                for key in db_data.phash_master_by_file.keys() {
-                    if let Some(fname) = Path::new(key).file_name() {
-                        let base = fname.to_string_lossy().to_lowercase();
-                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
-                    }
-                }
-                for key in db_data.similar_by_master.keys() {
-                    if let Some(fname) = Path::new(key).file_name() {
-                        let base = fname.to_string_lossy().to_lowercase();
-                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
-                    }
-                }
-                for key in db_data.sift_info_by_file.keys() {
-                    if let Some(fname) = Path::new(key).file_name() {
-                        let base = fname.to_string_lossy().to_lowercase();
-                        basename_to_db_filename.entry(base).or_insert_with(|| key.clone());
-                    }
-                }
-
-                Ok(DatabaseIndices {
-                    clip_index: Arc::new(db_data.clip_index),
-                    face_index: Arc::new(db_data.face_index),
-                    ocr_index: Arc::new(db_data.ocr_index),
-                    similar_by_master: db_data.similar_by_master,
-                    phash_master_by_file: db_data.phash_master_by_file,
-                    sift_info_by_file: db_data.sift_info_by_file,
-                    sift_root_by_file: db_data.sift_root_by_file,
-                    sift_members_by_root: db_data.sift_members_by_root,
-                    basename_to_db_filename,
-                    encoder,
-                })
+                tokio::try_join!(db_fut, encoder_fut)
             });
-            
-            match result {
-                Ok(indices) => {
-                    let _ = tx.send(Ok(indices));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e.to_string()));
-                }
+
+            let clip_loaded = clip_result.is_ok();
+            let _ = tx.send(DatabaseLoadMessage::ClipReady(
+                clip_result.map_err(|e| e.to_string()),
+            ));
+            ctx_clone.request_repaint();
+            if !clip_loaded {
+                return;
             }
+
+            let supplemental_result = rt
+                .block_on(load_supplemental_database_indices(
+                    get_db_dir().as_path(),
+                    MEDIA_INDEX_TABLE,
+                ))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(DatabaseLoadMessage::SupplementalReady(supplemental_result));
             ctx_clone.request_repaint();
         });
     }
@@ -3874,51 +3956,121 @@ impl ImageViewer {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok(indices)) => {
-                self.db_indices = Some(indices);
-                self.db_loaded = true;
-                self.db_loading = false;
-                self.semantic_status = "AI Explorer Database Loaded successfully! Ready to search.".to_string();
-                if let Some(request) = self.pending_search_request.take() {
-                    let maybe_ctx = self
-                        .ctx_shared
-                        .lock()
-                        .ok()
-                        .and_then(|lock| lock.as_ref().cloned());
-                    if let Some(ctx) = maybe_ctx {
-                        self.run_search_request_now(request, &ctx);
-                    } else {
-                        self.pending_search_request = Some(request);
-                    }
-                } else if let Some(mode) = self.pending_semantic_search_mode.take() {
-                    let maybe_ctx = self
-                        .ctx_shared
-                        .lock()
-                        .ok()
-                        .and_then(|lock| lock.as_ref().cloned());
-                    if let Some(ctx) = maybe_ctx {
-                        self.run_semantic_search_mode(mode, &ctx);
-                    } else {
-                        self.pending_semantic_search_mode = Some(mode);
+            Ok(DatabaseLoadMessage::ClipReady(Ok((clip_index, encoder)))) => {
+                let mut basename_to_db_filename = HashMap::new();
+                for entry in &clip_index.entries {
+                    if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
+                        basename_to_db_filename
+                            .entry(fname.to_string_lossy().to_lowercase())
+                            .or_insert_with(|| entry.file_name.to_string());
                     }
                 }
-            }
-            Ok(Err(err)) => {
+                self.db_indices = Some(DatabaseIndices {
+                    clip_index: Arc::new(clip_index),
+                    face_index: Arc::new(FaceIndex { entries: Vec::new(), file_count: 0 }),
+                    ocr_index: Arc::new(OcrIndex { entries: Vec::new(), file_count: 0 }),
+                    similar_by_master: HashMap::new(),
+                    phash_master_by_file: HashMap::new(),
+                    sift_info_by_file: HashMap::new(),
+                    sift_root_by_file: HashMap::new(),
+                    sift_members_by_root: HashMap::new(),
+                    basename_to_db_filename,
+                    encoder,
+                });
+                self.db_loaded = true;
                 self.db_loading = false;
-                self.db_failed = true;
-                self.pending_search_request = None;
-                self.pending_semantic_search_mode = None;
-                self.semantic_status = format!("❌ AI DB Initialization failed: {err}");
+                self.db_supplemental_loaded = false;
+                self.db_supplemental_loading = true;
+                self.semantic_status =
+                    "CLIP ready. Loading OCR, face, duplicate, and SIFT indexes in the background."
+                        .to_string();
+                self.run_pending_db_request(false);
+                self.db_rx = Some(rx);
+            }
+            Ok(DatabaseLoadMessage::ClipReady(Err(err))) => {
+                self.fail_db_load(err);
+            }
+            Ok(DatabaseLoadMessage::SupplementalReady(Ok(data))) => {
+                if let Some(indices) = self.db_indices.as_mut() {
+                    indices.face_index = Arc::new(data.face_index);
+                    indices.ocr_index = Arc::new(data.ocr_index);
+                    indices.similar_by_master = data.similar_by_master;
+                    indices.phash_master_by_file = data.phash_master_by_file;
+                    indices.sift_info_by_file = data.sift_info_by_file;
+                    indices.sift_root_by_file = data.sift_root_by_file;
+                    indices.sift_members_by_root = data.sift_members_by_root;
+                    for key in indices
+                        .phash_master_by_file
+                        .keys()
+                        .chain(indices.similar_by_master.keys())
+                        .chain(indices.sift_info_by_file.keys())
+                    {
+                        if let Some(fname) = Path::new(key).file_name() {
+                            indices
+                                .basename_to_db_filename
+                                .entry(fname.to_string_lossy().to_lowercase())
+                                .or_insert_with(|| key.clone());
+                        }
+                    }
+                }
+                self.db_supplemental_loaded = true;
+                self.db_supplemental_loading = false;
+                if self.semantic_status.starts_with("CLIP ready.") {
+                    self.semantic_status =
+                        "CLIP, OCR, face, duplicate, and SIFT indexes ready.".to_string();
+                }
+                self.run_pending_db_request(true);
+            }
+            Ok(DatabaseLoadMessage::SupplementalReady(Err(err))) => {
+                self.db_supplemental_loading = false;
+                self.semantic_status = format!(
+                    "CLIP is ready, but supplemental database indexes failed to load: {err}"
+                );
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.db_rx = Some(rx);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.db_loading = false;
-                self.db_failed = true;
-                self.pending_search_request = None;
-                self.pending_semantic_search_mode = None;
-                self.semantic_status = "❌ AI DB Loader thread disconnected unexpectedly.".to_string();
+                if !self.db_loaded {
+                    self.fail_db_load("AI DB loader thread disconnected unexpectedly.".to_string());
+                } else {
+                    self.db_supplemental_loading = false;
+                }
+            }
+        }
+    }
+
+    fn fail_db_load(&mut self, err: String) {
+        self.db_loading = false;
+        self.db_supplemental_loaded = false;
+        self.db_supplemental_loading = false;
+        self.db_failed = true;
+        self.pending_search_request = None;
+        self.pending_semantic_search_mode = None;
+        self.semantic_status = format!("AI DB initialization failed: {err}");
+    }
+
+    fn run_pending_db_request(&mut self, supplemental_ready: bool) {
+        let maybe_ctx = self
+            .ctx_shared
+            .lock()
+            .ok()
+            .and_then(|lock| lock.as_ref().cloned());
+        let Some(ctx) = maybe_ctx else {
+            return;
+        };
+        if let Some(request) = self.pending_search_request.take() {
+            if supplemental_ready || matches!(&request, PendingSearchRequest::Similar { .. }) {
+                self.run_search_request_now(request, &ctx);
+                return;
+            }
+            self.pending_search_request = Some(request);
+        }
+        if let Some(mode) = self.pending_semantic_search_mode.take() {
+            if supplemental_ready || mode == SearchMode::Clip {
+                self.run_semantic_search_mode(mode, &ctx);
+            } else {
+                self.pending_semantic_search_mode = Some(mode);
             }
         }
     }
@@ -4207,35 +4359,47 @@ impl ImageViewer {
     }
 
     fn submit_semantic_search(&mut self, ctx: &egui::Context) {
-        let start_dir = if self.open_target_is_dir {
-            self.open_target.clone()
-        } else {
-            self.open_target
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        self.semantic_folder = start_dir.to_string_lossy().to_string();
-
         if self.semantic_mode == SearchMode::Filename {
+            self.semantic_status = "Select CLIP or OCR before pressing Search.".to_string();
             return;
         }
 
         self.pending_semantic_search_mode = Some(self.semantic_mode);
         self.semantic_results.clear();
         self.semantic_results_mode = None;
+        let mode_label = match self.semantic_mode {
+            SearchMode::Clip => "CLIP",
+            SearchMode::Ocr => "OCR",
+            SearchMode::Filename => "Filename",
+        };
+        self.semantic_status = format!(
+            "Starting {mode_label} search for \"{}\"...",
+            self.semantic_query.trim()
+        );
+        ctx.request_repaint();
 
-        if !self.db_loaded {
-            let mode_label = match self.semantic_mode {
-                SearchMode::Clip => "CLIP",
-                SearchMode::Ocr => "OCR",
-                SearchMode::Filename => "Filename",
-            };
+        if self.semantic_mode == SearchMode::Ocr
+            && self.db_loaded
+            && !self.db_supplemental_loaded
+            && !self.db_supplemental_loading
+        {
+            self.pending_semantic_search_mode = None;
+            self.semantic_status =
+                "OCR search is unavailable because supplemental database loading failed."
+                    .to_string();
+            return;
+        }
+        if !self.db_loaded
+            || (self.semantic_mode == SearchMode::Ocr && !self.db_supplemental_loaded)
+        {
             self.semantic_status = format!(
                 "Loading AI DB for {mode_label} search of \"{}\"...",
                 self.semantic_query.trim()
             );
-            if !self.db_failed && !self.db_loading {
+            if self.db_failed {
+                self.db_failed = false;
+            }
+            if !self.db_loading && !self.db_loaded {
                 self.start_lazy_db_load(ctx);
             }
             return;
@@ -4243,6 +4407,52 @@ impl ImageViewer {
 
         let mode = self.pending_semantic_search_mode.take().unwrap_or(self.semantic_mode);
         self.run_semantic_search_mode(mode, ctx);
+    }
+
+    fn default_semantic_folder(&self) -> PathBuf {
+        if self.open_target_is_dir {
+            self.open_target.clone()
+        } else {
+            self.open_target
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        }
+    }
+
+    fn effective_semantic_folder(&self) -> String {
+        let trimmed = self.semantic_folder.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        String::new()
+    }
+
+    fn folder_has_db_mappings(&self, folder: &str) -> bool {
+        let roots = get_db_roots();
+        if roots.is_empty() {
+            return false;
+        }
+        let trimmed = folder.trim();
+        if trimmed.is_empty() {
+            return roots
+                .values()
+                .any(|col_path| path_matches_db_root(&self.default_semantic_folder(), col_path));
+        }
+        let normalized = trimmed.replace('\\', "/");
+        if let Some((collection_id, rel)) = normalized.split_once('/') {
+            if roots.contains_key(collection_id) && !rel.trim_matches('/').is_empty() {
+                return true;
+            }
+        }
+        let folder_path = Path::new(trimmed);
+        if !normalized.contains('/') && !normalized.contains('\\') && !folder_path.is_absolute() {
+            return true;
+        }
+        let folder_path = Path::new(trimmed);
+        roots
+            .values()
+            .any(|col_path| path_matches_db_root(folder_path, col_path) || path_matches_db_root(col_path, folder_path))
     }
 
     fn clip_query_to_pending_request(&self, query: &str) -> Option<PendingSearchRequest> {
@@ -4320,6 +4530,16 @@ impl ImageViewer {
 
     fn search_clip_now(&mut self, ctx: &egui::Context) {
         let q = self.semantic_query.trim().to_string();
+        let folder_scope = self.effective_semantic_folder();
+        if !self.db_supplemental_loaded {
+            self.pending_semantic_search_mode = Some(SearchMode::Ocr);
+            self.semantic_status = if self.db_supplemental_loading {
+                "Loading OCR index in the background...".to_string()
+            } else {
+                "OCR index is unavailable because supplemental database loading failed.".to_string()
+            };
+            return;
+        }
         if q.is_empty() {
             self.semantic_status = "Please enter a search phrase first.".to_string();
             self.semantic_results.clear();
@@ -4357,7 +4577,7 @@ impl ImageViewer {
         }
 
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, self.semantic_video_only, &self.semantic_folder);
+        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, self.semantic_video_only, &folder_scope);
         if !self.semantic_video_only {
             results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         } else {
@@ -4376,10 +4596,11 @@ impl ImageViewer {
 
         let took = started.elapsed().as_millis();
         self.semantic_status = format!(
-            "✓ Found {} CLIP results in {} ms across {} index vectors",
+            "✓ Found {} CLIP results in {} ms across {} index vectors within {}",
             results.len(),
             took,
-            indices.clip_index.entries.len()
+            indices.clip_index.entries.len(),
+            folder_scope
         );
         self.semantic_results = results;
         self.semantic_results_mode = Some(SearchMode::Clip);
@@ -4424,6 +4645,7 @@ impl ImageViewer {
 
     fn search_ocr_now(&mut self) {
         let q = self.semantic_query.trim().to_string();
+        let folder_scope = self.effective_semantic_folder();
         if q.is_empty() {
             self.semantic_status = "Please enter an OCR word or phrase first.".to_string();
             self.semantic_results.clear();
@@ -4437,7 +4659,7 @@ impl ImageViewer {
 
         let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_ocr_index(&indices.ocr_index, &q, pre_limit, self.semantic_video_only, &self.semantic_folder);
+        let mut results = search_ocr_index(&indices.ocr_index, &q, pre_limit, self.semantic_video_only, &folder_scope);
         if !self.semantic_video_only {
             results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
         } else {
@@ -4456,10 +4678,11 @@ impl ImageViewer {
 
         let took = started.elapsed().as_millis();
         self.semantic_status = format!(
-            "✓ Found {} OCR results in {} ms across {} index entries",
+            "✓ Found {} OCR results in {} ms across {} index entries within {}",
             results.len(),
             took,
-            indices.ocr_index.entries.len()
+            indices.ocr_index.entries.len(),
+            folder_scope
         );
         self.semantic_results = results;
         self.semantic_results_mode = Some(SearchMode::Ocr);
@@ -4513,11 +4736,11 @@ impl ImageViewer {
             self.semantic_status = "Select at least two indexed images before running SIFT repair.".to_string();
             return;
         }
-        if !self.db_loaded {
+        if !self.db_loaded || !self.db_supplemental_loaded {
             if !self.db_loading && !self.db_failed {
                 self.start_lazy_db_load(ctx);
             }
-            self.semantic_status = "Loading database index before SIFT repair...".to_string();
+            self.semantic_status = "Loading duplicate and SIFT indexes before SIFT repair...".to_string();
             return;
         }
 
@@ -4612,6 +4835,8 @@ impl ImageViewer {
                 self.sift_pair_overlay = None;
                 self.db_loaded = false;
                 self.db_loading = false;
+                self.db_supplemental_loaded = false;
+                self.db_supplemental_loading = false;
                 self.db_failed = false;
                 self.db_indices = None;
                 self.db_rx = None;
@@ -4873,6 +5098,368 @@ impl ImageViewer {
         }
     }
 
+    fn editor_texture(ctx: &egui::Context, image: &image::DynamicImage) -> egui::TextureHandle {
+        let rgba = image.to_rgba8();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        );
+        ctx.load_texture("image_editor_preview", color_image, egui::TextureOptions::LINEAR)
+    }
+
+    fn start_image_editor(&mut self, path: &Path, ctx: &egui::Context) {
+        let source_path = self.resolve_actual_path(path);
+        match image::open(&source_path) {
+            Ok(image) => {
+                self.image_editor = Some(ImageEditor {
+                    texture: Self::editor_texture(ctx, &image),
+                    source_path,
+                    image,
+                    crop_min: egui::pos2(0.0, 0.0),
+                    crop_max: egui::pos2(1.0, 1.0),
+                    crop_drag_mode: None,
+                    crop_drag_origin: egui::Pos2::ZERO,
+                    crop_drag_initial_min: egui::Pos2::ZERO,
+                    crop_drag_initial_max: egui::pos2(1.0, 1.0),
+                    status: String::new(),
+                });
+            }
+            Err(err) => {
+                self.semantic_status = format!("Unable to open image for editing: {err}");
+            }
+        }
+    }
+
+    fn edited_copy_path(source: &Path) -> PathBuf {
+        let stem = source.file_stem().and_then(|part| part.to_str()).unwrap_or("image");
+        let extension = source.extension().and_then(|part| part.to_str()).unwrap_or("png");
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let mut candidate = parent.join(format!("{stem}_edited.{extension}"));
+        let mut suffix = 2;
+        while candidate.exists() {
+            candidate = parent.join(format!("{stem}_edited_{suffix}.{extension}"));
+            suffix += 1;
+        }
+        candidate
+    }
+
+    fn save_editor_image(editor: &ImageEditor, destination: &Path, overwrite: bool) -> Result<()> {
+        let image_width = editor.image.width();
+        let image_height = editor.image.height();
+        let left = (editor.crop_min.x * image_width as f32).round() as u32;
+        let top = (editor.crop_min.y * image_height as f32).round() as u32;
+        let right = (editor.crop_max.x * image_width as f32).round() as u32;
+        let bottom = (editor.crop_max.y * image_height as f32).round() as u32;
+        let width = right.saturating_sub(left);
+        let height = bottom.saturating_sub(top);
+        if width == 0 || height == 0 {
+            bail!("Crop area cannot be empty");
+        }
+        let cropped = editor.image.crop_imm(left, top, width, height);
+        let format = image::ImageFormat::from_path(destination)
+            .with_context(|| format!("Unsupported output format: {}", destination.display()))?;
+        if overwrite {
+            let extension = destination.extension().and_then(|part| part.to_str()).unwrap_or("png");
+            let temp_path = destination.with_file_name(format!(
+                ".{}.iris-edit-tmp.{extension}",
+                destination.file_stem().and_then(|part| part.to_str()).unwrap_or("image")
+            ));
+            cropped.save_with_format(&temp_path, format)?;
+            std::fs::rename(&temp_path, destination)?;
+        } else {
+            cropped.save_with_format(destination, format)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_after_image_edit(&mut self, path: &Path, ctx: &egui::Context) {
+        self.thumbnail_textures.remove(path);
+        self.thumbnail_failed.remove(path);
+        self.resolution_size_cache.borrow_mut().remove(path);
+        ctx.forget_image(&format!("file://{}", path.to_string_lossy()));
+        self.update_current_file_info();
+        self.update_side_panel_metadata_if_needed();
+        ctx.request_repaint();
+    }
+
+    fn show_image_editor(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(mut editor) = self.image_editor.take() else {
+            return;
+        };
+        let mut close_editor = false;
+        egui::Frame::NONE
+            .fill(egui::Color32::from_black_alpha(210))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Crop image");
+                    ui.separator();
+                    if ui.button("Rotate left").clicked() {
+                        editor.image = editor.image.rotate270();
+                        editor.crop_min = egui::pos2(0.0, 0.0);
+                        editor.crop_max = egui::pos2(1.0, 1.0);
+                        editor.texture = Self::editor_texture(ctx, &editor.image);
+                    }
+                    if ui.button("Rotate right").clicked() {
+                        editor.image = editor.image.rotate90();
+                        editor.crop_min = egui::pos2(0.0, 0.0);
+                        editor.crop_max = egui::pos2(1.0, 1.0);
+                        editor.texture = Self::editor_texture(ctx, &editor.image);
+                    }
+                    if ui.button("Rotate 180").clicked() {
+                        editor.image = editor.image.rotate180();
+                        editor.texture = Self::editor_texture(ctx, &editor.image);
+                    }
+                    if ui.button("Reset crop").clicked() {
+                        editor.crop_min = egui::pos2(0.0, 0.0);
+                        editor.crop_max = egui::pos2(1.0, 1.0);
+                    }
+                    if ui.button("Fit width").clicked() {
+                        editor.crop_min.x = 0.0;
+                        editor.crop_max.x = 1.0;
+                    }
+                    if ui.button("Fit height").clicked() {
+                        editor.crop_min.y = 0.0;
+                        editor.crop_max.y = 1.0;
+                    }
+                    ui.separator();
+                    if ui.button("Save in place").clicked() {
+                        match Self::save_editor_image(&editor, &editor.source_path, true) {
+                            Ok(()) => {
+                                let path = editor.source_path.clone();
+                                self.refresh_after_image_edit(&path, ctx);
+                                close_editor = true;
+                            }
+                            Err(err) => editor.status = format!("Save failed: {err}"),
+                        }
+                    }
+                    if ui.button("Save edited copy").clicked() {
+                        let destination = Self::edited_copy_path(&editor.source_path);
+                        match Self::save_editor_image(&editor, &destination, false) {
+                            Ok(()) => {
+                                editor.status = format!("Saved {}", destination.display());
+                                self.recursive_images.push(destination);
+                            }
+                            Err(err) => editor.status = format!("Save failed: {err}"),
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_editor = true;
+                    }
+                });
+
+                ui.label("Drag outside the selection to create a crop, inside it to move, or its edges and corners to resize.");
+                if !editor.status.is_empty() {
+                    ui.label(&editor.status);
+                }
+
+                let available = ui.available_size();
+                let image_aspect = editor.image.width() as f32 / editor.image.height() as f32;
+                let available_aspect = available.x / available.y.max(1.0);
+                let draw_size = if available_aspect > image_aspect {
+                    egui::vec2(available.y * image_aspect, available.y)
+                } else {
+                    egui::vec2(available.x, available.x / image_aspect)
+                };
+                let (viewport_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+                let image_rect = egui::Rect::from_center_size(viewport_rect.center(), draw_size);
+                let crop_response = ui.interact(
+                    image_rect.expand(12.0),
+                    ui.make_persistent_id("embedded_image_crop"),
+                    egui::Sense::click_and_drag(),
+                );
+                ui.painter().image(
+                    editor.texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+                let pointer_to_normalized = |pointer: egui::Pos2| {
+                    egui::pos2(
+                        ((pointer.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0),
+                        ((pointer.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0),
+                    )
+                };
+                let crop_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        image_rect.left() + editor.crop_min.x * image_rect.width(),
+                        image_rect.top() + editor.crop_min.y * image_rect.height(),
+                    ),
+                    egui::pos2(
+                        image_rect.left() + editor.crop_max.x * image_rect.width(),
+                        image_rect.top() + editor.crop_max.y * image_rect.height(),
+                    ),
+                );
+                let handle_distance = 14.0;
+                if crop_response.hovered() {
+                    if let Some(pointer) = ctx.pointer_hover_pos() {
+                        let near_left = (pointer.x - crop_rect.left()).abs() <= handle_distance;
+                        let near_right = (pointer.x - crop_rect.right()).abs() <= handle_distance;
+                        let near_top = (pointer.y - crop_rect.top()).abs() <= handle_distance;
+                        let near_bottom = (pointer.y - crop_rect.bottom()).abs() <= handle_distance;
+                        let within_x = pointer.x >= crop_rect.left() - handle_distance
+                            && pointer.x <= crop_rect.right() + handle_distance;
+                        let within_y = pointer.y >= crop_rect.top() - handle_distance
+                            && pointer.y <= crop_rect.bottom() + handle_distance;
+                        let cursor = if (near_left && near_top) || (near_right && near_bottom) {
+                            egui::CursorIcon::ResizeNwSe
+                        } else if (near_right && near_top) || (near_left && near_bottom) {
+                            egui::CursorIcon::ResizeNeSw
+                        } else if (near_left || near_right) && within_y {
+                            egui::CursorIcon::ResizeHorizontal
+                        } else if (near_top || near_bottom) && within_x {
+                            egui::CursorIcon::ResizeVertical
+                        } else if crop_rect.contains(pointer) {
+                            egui::CursorIcon::Move
+                        } else {
+                            egui::CursorIcon::Crosshair
+                        };
+                        ctx.set_cursor_icon(cursor);
+                    }
+                }
+                if crop_response.drag_started() {
+                    if let Some(pointer) = crop_response.interact_pointer_pos() {
+                        let near_left = (pointer.x - crop_rect.left()).abs() <= handle_distance;
+                        let near_right = (pointer.x - crop_rect.right()).abs() <= handle_distance;
+                        let near_top = (pointer.y - crop_rect.top()).abs() <= handle_distance;
+                        let near_bottom = (pointer.y - crop_rect.bottom()).abs() <= handle_distance;
+                        let within_x = pointer.x >= crop_rect.left() - handle_distance
+                            && pointer.x <= crop_rect.right() + handle_distance;
+                        let within_y = pointer.y >= crop_rect.top() - handle_distance
+                            && pointer.y <= crop_rect.bottom() + handle_distance;
+                        editor.crop_drag_mode = Some(if near_left && near_top {
+                            CropDragMode::TopLeft
+                        } else if near_right && near_top {
+                            CropDragMode::TopRight
+                        } else if near_left && near_bottom {
+                            CropDragMode::BottomLeft
+                        } else if near_right && near_bottom {
+                            CropDragMode::BottomRight
+                        } else if near_left && within_y {
+                            CropDragMode::Left
+                        } else if near_right && within_y {
+                            CropDragMode::Right
+                        } else if near_top && within_x {
+                            CropDragMode::Top
+                        } else if near_bottom && within_x {
+                            CropDragMode::Bottom
+                        } else if crop_rect.contains(pointer) {
+                            CropDragMode::Move
+                        } else {
+                            CropDragMode::New
+                        });
+                        editor.crop_drag_origin = pointer_to_normalized(pointer);
+                        editor.crop_drag_initial_min = editor.crop_min;
+                        editor.crop_drag_initial_max = editor.crop_max;
+                    }
+                }
+                if crop_response.dragged() {
+                    if let (Some(mode), Some(pointer)) =
+                        (editor.crop_drag_mode, crop_response.interact_pointer_pos())
+                    {
+                        let current = pointer_to_normalized(pointer);
+                        let origin = editor.crop_drag_origin;
+                        let initial_min = editor.crop_drag_initial_min;
+                        let initial_max = editor.crop_drag_initial_max;
+                        let minimum = egui::vec2(
+                            2.0 / editor.image.width().max(1) as f32,
+                            2.0 / editor.image.height().max(1) as f32,
+                        );
+                        match mode {
+                            CropDragMode::New => {
+                                editor.crop_min =
+                                    egui::pos2(origin.x.min(current.x), origin.y.min(current.y));
+                                editor.crop_max =
+                                    egui::pos2(origin.x.max(current.x), origin.y.max(current.y));
+                            }
+                            CropDragMode::Move => {
+                                let size = initial_max - initial_min;
+                                let delta = current - origin;
+                                let mut min = initial_min + delta;
+                                min.x = min.x.clamp(0.0, 1.0 - size.x);
+                                min.y = min.y.clamp(0.0, 1.0 - size.y);
+                                editor.crop_min = min;
+                                editor.crop_max = min + size;
+                            }
+                            CropDragMode::Left | CropDragMode::TopLeft | CropDragMode::BottomLeft => {
+                                editor.crop_min.x =
+                                    current.x.clamp(0.0, editor.crop_max.x - minimum.x);
+                            }
+                            CropDragMode::Right | CropDragMode::TopRight | CropDragMode::BottomRight => {
+                                editor.crop_max.x =
+                                    current.x.clamp(editor.crop_min.x + minimum.x, 1.0);
+                            }
+                            _ => {}
+                        }
+                        match mode {
+                            CropDragMode::Top | CropDragMode::TopLeft | CropDragMode::TopRight => {
+                                editor.crop_min.y =
+                                    current.y.clamp(0.0, editor.crop_max.y - minimum.y);
+                            }
+                            CropDragMode::Bottom
+                            | CropDragMode::BottomLeft
+                            | CropDragMode::BottomRight => {
+                                editor.crop_max.y =
+                                    current.y.clamp(editor.crop_min.y + minimum.y, 1.0);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if crop_response.drag_stopped() {
+                    editor.crop_drag_mode = None;
+                }
+                let shade = egui::Color32::from_black_alpha(150);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(image_rect.min, egui::pos2(image_rect.right(), crop_rect.top())),
+                    0.0,
+                    shade,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(image_rect.left(), crop_rect.bottom()), image_rect.max),
+                    0.0,
+                    shade,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(image_rect.left(), crop_rect.top()), egui::pos2(crop_rect.left(), crop_rect.bottom())),
+                    0.0,
+                    shade,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(crop_rect.right(), crop_rect.top()), egui::pos2(image_rect.right(), crop_rect.bottom())),
+                    0.0,
+                    shade,
+                );
+                ui.painter().rect_stroke(
+                    crop_rect,
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+                for handle in [
+                    crop_rect.left_top(),
+                    crop_rect.right_top(),
+                    crop_rect.left_bottom(),
+                    crop_rect.right_bottom(),
+                    egui::pos2(crop_rect.center().x, crop_rect.top()),
+                    egui::pos2(crop_rect.center().x, crop_rect.bottom()),
+                    egui::pos2(crop_rect.left(), crop_rect.center().y),
+                    egui::pos2(crop_rect.right(), crop_rect.center().y),
+                ] {
+                    ui.painter().circle_filled(handle, 5.0, egui::Color32::WHITE);
+                    ui.painter().circle_stroke(
+                        handle,
+                        5.0,
+                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    );
+                }
+            });
+        if !close_editor {
+            self.image_editor = Some(editor);
+        }
+    }
+
     fn update_side_panel_metadata_if_needed(&mut self) {
         if self.side_panel_mode != SidePanelMode::Exif {
             return;
@@ -4959,15 +5546,7 @@ impl ImageViewer {
     }
 
     fn current_folder_has_db_mappings(&self) -> bool {
-        let roots = get_db_roots();
-        let start_dir = if self.open_target_is_dir {
-            self.open_target.clone()
-        } else {
-            self.open_target.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
-        };
-        roots
-            .values()
-            .any(|col_path| path_matches_db_root(&start_dir, col_path))
+        self.folder_has_db_mappings(&self.default_semantic_folder().to_string_lossy())
     }
 
     fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -4982,6 +5561,9 @@ impl ImageViewer {
 
         ui.vertical(|ui| {
             // Dynamic Database Mapping Check & Auto Lazy Load
+            let default_scope = self.default_semantic_folder().to_string_lossy().to_string();
+            let effective_scope = self.effective_semantic_folder();
+            let scope_has_db = self.folder_has_db_mappings(&effective_scope);
             let has_db = self.current_folder_has_db_mappings();
             if (self.semantic_mode == SearchMode::Clip || self.semantic_mode == SearchMode::Ocr) && !self.db_loaded && !self.db_loading {
                 self.start_lazy_db_load(ctx);
@@ -5010,17 +5592,8 @@ impl ImageViewer {
             ui.horizontal(|ui| {
                 ui.label("Mode:");
                 ui.selectable_value(&mut self.semantic_mode, SearchMode::Filename, "Filename");
-                
-                ui.add_enabled_ui(has_db, |ui| {
-                    let clip_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "CLIP");
-                    if !has_db {
-                        clip_btn.on_hover_text("CLIP search is available for folders mapped in the database collection roots.");
-                    }
-                    let ocr_btn = ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "OCR");
-                    if !has_db {
-                        ocr_btn.on_hover_text("OCR search is available for folders mapped in the database collection roots.");
-                    }
-                });
+                ui.selectable_value(&mut self.semantic_mode, SearchMode::Clip, "CLIP");
+                ui.selectable_value(&mut self.semantic_mode, SearchMode::Ocr, "OCR");
                 
                 ui.add_space(12.0);
                 ui.checkbox(&mut self.semantic_video_only, "Videos only");
@@ -5087,7 +5660,7 @@ impl ImageViewer {
                 let search_resp = ui.add(egui::TextEdit::singleline(&mut self.semantic_query)
                     .hint_text(hint)
                     .desired_width(320.0));
-                let enter_pressed = search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter_pressed = text_edit_enter_pressed(&search_resp);
                 
                 ui.add_space(8.0);
                 if self.semantic_mode == SearchMode::Clip && ui.button("Paste Image").clicked() {
@@ -5103,6 +5676,42 @@ impl ImageViewer {
                     self.submit_semantic_search(ctx);
                 }
             });
+            if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
+                ui.add_space(6.0);
+                let mut folder_enter_pressed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    let scope_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.semantic_folder)
+                            .hint_text("Blank = all indexed folders, or enter indexed folder path")
+                            .desired_width(520.0),
+                    );
+                    folder_enter_pressed = text_edit_enter_pressed(&scope_resp);
+                    if scope_resp.hovered() {
+                        scope_resp.on_hover_text(
+                            "Use an absolute filesystem path or a database-style path like collection_id/sub/folder. Leave blank to search across all indexed folders."
+                        );
+                    }
+                    if ui.button("Use current").clicked() {
+                        self.semantic_folder = default_scope.clone();
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.semantic_folder.clear();
+                    }
+                });
+                if folder_enter_pressed {
+                    self.submit_semantic_search(ctx);
+                }
+                let scope_label = if self.semantic_folder.trim().is_empty() {
+                    "Active scope: all indexed folders".to_string()
+                } else {
+                    format!("Active scope: {effective_scope}")
+                };
+                ui.weak(scope_label);
+                if !scope_has_db {
+                    ui.weak("The selected scope is not inside a mapped database collection root.");
+                }
+            }
             ui.add_space(8.0);
 
             // Real-time Filename Filtering
@@ -5162,6 +5771,8 @@ impl ImageViewer {
                     ui.add(egui::Spinner::new().size(14.0));
                     ui.weak(&self.semantic_status);
                 } else if is_active_semantic_search {
+                    ui.weak(&self.semantic_status);
+                } else if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
                     ui.weak(&self.semantic_status);
                 } else if self.grid_loading {
                     ui.add(egui::Spinner::new().size(14.0));
@@ -5341,6 +5952,9 @@ impl ImageViewer {
                                                     .spawn();
                                                 ui.close();
                                             }
+                                        } else if ui.button("Edit image").clicked() {
+                                            self.start_image_editor(path, ui.ctx());
+                                            ui.close();
                                         }
                                         ui.separator();
                                         if ui.button("Show most similar").clicked() {
@@ -5974,7 +6588,19 @@ impl ImageViewer {
         self.semantic_results_mode = None;
         self.pending_search_request = Some(request.clone());
 
-        if !self.db_loaded {
+        let needs_supplemental = matches!(&request, PendingSearchRequest::Person { .. });
+        if needs_supplemental
+            && self.db_loaded
+            && !self.db_supplemental_loaded
+            && !self.db_supplemental_loading
+        {
+            self.pending_search_request = None;
+            self.semantic_status =
+                "Person search is unavailable because supplemental database loading failed."
+                    .to_string();
+            return;
+        }
+        if !self.db_loaded || (needs_supplemental && !self.db_supplemental_loaded) {
             self.semantic_status =
                 format!("Loading AI DB to search for matches related to {label}...");
             if !self.db_failed && !self.db_loading {
@@ -6095,7 +6721,7 @@ impl eframe::App for ImageViewer {
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
                 if !self.show_home_page {
-                    if !self.show_grid {
+                    if !self.show_grid && self.image_editor.is_none() {
                         if i.key_pressed(egui::Key::ArrowRight) {
                             self.next_image();
                         }
@@ -6128,7 +6754,9 @@ impl eframe::App for ImageViewer {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.show_home_page {
+                    if self.image_editor.is_some() {
+                        self.image_editor = None;
+                    } else if self.show_home_page {
                         if self.home_current_dir.is_some() {
                             self.home_current_dir = None;
                         } else {
@@ -6344,18 +6972,18 @@ impl eframe::App for ImageViewer {
                         });
                     }
                     SidePanelMode::Duplicates => {
-                        if !self.db_loaded {
+                        if !self.db_loaded || !self.db_supplemental_loaded {
                             if !self.db_failed && !self.db_loading {
                                 self.start_lazy_db_load(ui.ctx());
                             }
                             ui.vertical_centered(|ui| {
                                 ui.add_space(20.0);
-                                if self.db_failed {
+                                if self.db_failed || (self.db_loaded && !self.db_supplemental_loading) {
                                     ui.colored_label(egui::Color32::from_rgb(255, 100, 100), &self.semantic_status);
                                 } else {
                                     ui.add(egui::Spinner::new().size(24.0));
                                     ui.add_space(12.0);
-                                    ui.weak("Loading database index to scan duplicates...");
+                                    ui.weak("Loading duplicate and SIFT indexes...");
                                 }
                             });
                         } else if let Some(path) = self.images.get(self.current_index).cloned() {
@@ -6719,7 +7347,9 @@ impl eframe::App for ImageViewer {
             panel = panel.frame(egui::Frame::NONE.fill(bg));
         }
         panel.show(ctx, |ui| {
-            if self.show_grid {
+            if self.image_editor.is_some() {
+                self.show_image_editor(ui, ctx);
+            } else if self.show_grid {
                 self.show_grid_view(ui, ctx);
             } else {
                 if let Some(path) = self.images.get(self.current_index).cloned() {
@@ -6779,6 +7409,10 @@ impl eframe::App for ImageViewer {
                             );
                             ui.ctx().copy_image(color_image);
                         }
+                        ui.close();
+                    }
+                    if !is_video_item && ui.button("Edit image").clicked() {
+                        self.start_image_editor(&path, ui.ctx());
                         ui.close();
                     }
                     if ui.button("🔍 Fit Image / Recenter").clicked() {
@@ -6915,6 +7549,48 @@ impl eframe::App for ImageViewer {
         if self.flat_loading || self.grid_loading {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_roots() -> HashMap<String, PathBuf> {
+        HashMap::from([(
+            "collection".to_string(),
+            PathBuf::from("/media/library"),
+        )])
+    }
+
+    #[test]
+    fn folder_filter_matches_supported_scope_forms() {
+        let roots = test_roots();
+        let file_name = "collection/People/Ayman/Trips/Sensitive Information 5/photos/image.jpg";
+
+        assert!(file_matches_folder(
+            file_name,
+            "/media/library/People/Ayman",
+            &roots
+        ));
+        assert!(file_matches_folder(file_name, "People/Ayman/Trips", &roots));
+        assert!(file_matches_folder(
+            file_name,
+            "Sensitive Information 5/photos",
+            &roots
+        ));
+        assert!(file_matches_folder(file_name, "ayman", &roots));
+    }
+
+    #[test]
+    fn single_segment_folder_filter_does_not_match_filename() {
+        let roots = test_roots();
+
+        assert!(!file_matches_folder(
+            "collection/People/Trips/ayman-photo.jpg",
+            "ayman",
+            &roots
+        ));
     }
 }
 

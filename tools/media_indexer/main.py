@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import re
 import select
 import site
 import subprocess
@@ -66,7 +67,7 @@ import lancedb
 import numpy as np
 import pyarrow as pa
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 from tqdm import tqdm
 
 if hasattr(cv2, "setLogLevel"):
@@ -123,20 +124,23 @@ SIFT_MIN_RATIO_DEFAULT = 0.75
 SIFT_MIN_INLIERS_DEFAULT = 10
 SIFT_MIN_INLIER_RATIO_DEFAULT = 0.75
 SIFT_CONTRAST_THRESHOLD_DEFAULT = 0.03
-SIFT_CANDIDATE_TOPK_DEFAULT = 32
-SIFT_CANDIDATE_MODEL_DEFAULT = "facebook/dinov2-large"
-SIFT_CANDIDATE_BATCH_SIZE_DEFAULT = 16
-SIFT_CANDIDATE_MAX_DISTANCE_DEFAULT = 0.40
+SIFT_CANDIDATE_TOPK_DEFAULT = 64
 SIFT_MAX_SIDE_DEFAULT = 1920
 SIFT_FEATURE_CACHE_SIZE = 256
 SIFT_MAX_FEATURES_DEFAULT = 2000
 SIFT_MAX_RANSAC_MATCHES_DEFAULT = 500
-SIFT_DINO_ADD_BATCH_SIZE = 512
 PROGRESS_BAR_FORMAT = (
     "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
     "[elapsed {elapsed}, left {remaining}, {rate_fmt}]"
 )
 PROGRESS_DELAY_SECONDS = 2.0
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+ANSI_RED = "\033[31m"
+ANSI_YELLOW = "\033[33m"
+ANSI_ORANGE = "\033[38;5;208m"
 T = TypeVar("T")
 SIFT_THREAD_LOCAL = threading.local()
 
@@ -171,6 +175,10 @@ SCHEMA = pa.schema(
         pa.field("file_name", pa.string()),
         pa.field("collection_id", pa.string()),
         pa.field("is_video", pa.bool_()),
+        pa.field("source_size", pa.int64()),
+        pa.field("source_mtime_ns", pa.int64()),
+        pa.field("image_width", pa.int32()),
+        pa.field("image_height", pa.int32()),
         pa.field("faces", pa.bool_()),
         pa.field("phash_hex", pa.string()),
         pa.field("video_frame_phashes", pa.list_(VIDEO_FRAME_PHASH_STRUCT)),
@@ -250,9 +258,6 @@ class AppConfig:
     sift_min_inlier_ratio: float
     sift_contrast_threshold: float
     sift_candidate_topk: int
-    sift_candidate_model: str
-    sift_candidate_batch_size: int
-    sift_candidate_max_distance: float
     sift_max_side: int
     sift_max_features: int
     sift_max_ransac_matches: int
@@ -260,6 +265,7 @@ class AppConfig:
     scene_min_scene_len: int
     repair_image_masters: bool
     repair_only: bool
+    rerun_stages: set[str]
 
 
 @dataclass(frozen=True)
@@ -306,7 +312,7 @@ def progress(
 ) -> HumanTqdm:
     return HumanTqdm(
         iterable,
-        desc=desc,
+        desc=format_stage_label(desc, stream=sys.stderr),
         unit=unit,
         total=total,
         delay=PROGRESS_DELAY_SECONDS,
@@ -314,6 +320,96 @@ def progress(
         dynamic_ncols=True,
         bar_format=PROGRESS_BAR_FORMAT,
     )
+
+
+def use_color(stream: Any = sys.stdout) -> bool:
+    return os.environ.get("NO_COLOR") is None and bool(getattr(stream, "isatty", lambda: False)())
+
+
+def color_text(text: str, color: str, *, stream: Any = sys.stdout, bold: bool = False) -> str:
+    if not use_color(stream):
+        return text
+    prefix = f"{ANSI_BOLD if bold else ''}{color}"
+    return f"{prefix}{text}{ANSI_RESET}"
+
+
+def format_stage_label(stage_label: str, *, stream: Any = sys.stdout) -> str:
+    match = re.match(r"^(Stages?\s+)(\S+)(.*)$", stage_label)
+    if not match or not use_color(stream):
+        return stage_label
+    prefix, number, name = match.groups()
+    return (
+        color_text(prefix, ANSI_CYAN, stream=stream, bold=True)
+        + color_text(number, ANSI_YELLOW, stream=stream, bold=True)
+        + color_text(name, ANSI_CYAN, stream=stream, bold=True)
+    )
+
+
+def report_stage_complete(stage_label: str, count: int, unit: str) -> None:
+    label = format_stage_label(stage_label)
+    status = color_text("complete", ANSI_GREEN, bold=True)
+    print(f"{label}: {status} ({count}/{count} {unit})")
+
+
+def report_stage_incomplete(stage_label: str, completed: int, total: int, unit: str, reason: str) -> None:
+    label = format_stage_label(stage_label)
+    status = color_text("incomplete", ANSI_ORANGE, bold=True)
+    detail = color_text(reason, ANSI_ORANGE)
+    print(f"{label}: {status} ({completed}/{total} {unit}; {detail})")
+
+
+def report_stage_skipped(stage_label: str, reason: str) -> None:
+    label = format_stage_label(stage_label)
+    status = color_text("skipped", ANSI_ORANGE, bold=True)
+    detail = color_text(reason, ANSI_ORANGE)
+    print(f"{label}: {status} ({detail})")
+
+
+def print_warning(message: str) -> None:
+    print(color_text(message, ANSI_ORANGE, stream=sys.stderr), file=sys.stderr)
+
+
+def print_error(message: str) -> None:
+    print(color_text(message, ANSI_RED, stream=sys.stderr, bold=True), file=sys.stderr)
+
+
+def print_info(message: str) -> None:
+    print(color_text(message, ANSI_CYAN, bold=True))
+
+
+class TimedStep:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.started_at = 0.0
+
+    def __enter__(self) -> "TimedStep":
+        self.started_at = time.monotonic()
+        print_info(f"{format_stage_label(self.label)}: starting")
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type is not None:
+            print_error(f"{self.label}: failed after {time.monotonic() - self.started_at:.1f}s")
+            return
+        print_info(f"{format_stage_label(self.label)}: complete in {time.monotonic() - self.started_at:.1f}s")
+
+
+def start_worker_stderr_forwarder(process: subprocess.Popen[str]) -> None:
+    if process.stderr is None:
+        return
+
+    def forward() -> None:
+        for raw_line in process.stderr:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(token in lowered for token in ("error", "failed", "traceback", "exception")):
+                print_error(line)
+            else:
+                print_warning(line)
+
+    threading.Thread(target=forward, daemon=True).start()
 
 
 def shorten_for_status(value: str, max_len: int = 90) -> str:
@@ -344,6 +440,63 @@ def read_status(cfg: AppConfig) -> dict[str, Any] | None:
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def cross_media_state_path(cfg: AppConfig) -> Path:
+    return cfg.db_dir / "cross-media-state.json"
+
+
+def read_cross_media_state(cfg: AppConfig) -> dict[str, Any]:
+    path = cross_media_state_path(cfg)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_cross_media_state(cfg: AppConfig, state: dict[str, Any]) -> None:
+    path = cross_media_state_path(cfg)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def cross_media_input_fingerprint(
+    cfg: AppConfig,
+    records: dict[str, dict[str, Any]],
+    current_image_files: set[str],
+    current_video_files: set[str],
+) -> str:
+    digest = hashlib.sha256()
+
+    def add(value: str) -> None:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    add("cross-media-v1")
+    add(f"threshold={cfg.phash_skip_similarity_pct:.9f}")
+    for file_name in sorted(current_image_files):
+        add(f"scope-image:{file_name}")
+    for file_name in sorted(current_video_files):
+        add(f"scope-video:{file_name}")
+    for file_name in sorted(records):
+        record = records[file_name]
+        if bool(record.get("is_video")):
+            groups = normalize_video_frame_phashes(record.get("video_frame_phashes")) or []
+            for group in groups:
+                add(
+                    f"video-frame:{file_name}:{float(group['timestamp_sec']):.6f}:"
+                    f"{group['phash_hex']}"
+                )
+            continue
+        phash_hex = normalize_phash_hex(record.get("phash_hex"))
+        if phash_hex is not None:
+            add(f"image:{file_name}:{phash_hex}")
+    return digest.hexdigest()
 
 
 class HammingBkNode:
@@ -642,12 +795,12 @@ def parse_args() -> AppConfig:
     parser.add_argument(
         "--rerun-face-failures",
         action="store_true",
-        help="Rerun Stage 5 face detection for rows that previously failed with processing_error_stage=faces.",
+        help="Rerun Stage 6 face detection for rows that previously failed with processing_error_stage=faces.",
     )
     parser.add_argument(
         "--rerun-zero-face-detections",
         action="store_true",
-        help="Rerun Stage 5 face detection for rows that previously completed with zero detected faces.",
+        help="Rerun Stage 6 face detection for rows that previously completed with zero detected faces.",
     )
     parser.add_argument(
         "--phash-skip-similarity-pct",
@@ -666,7 +819,7 @@ def parse_args() -> AppConfig:
         action="store_true",
         help=(
             "After CLIP stage, annotate image-to-master matches using "
-            "DINOv2 ANN candidates plus SIFT/RANSAC verification."
+            "CLIP ANN candidates plus SIFT/RANSAC verification."
         ),
     )
     parser.add_argument(
@@ -705,27 +858,7 @@ def parse_args() -> AppConfig:
         "--sift-candidate-topk",
         type=int,
         default=SIFT_CANDIDATE_TOPK_DEFAULT,
-        help="Top-K DINOv2 ANN master candidates to verify by SIFT/RANSAC per image.",
-    )
-    parser.add_argument(
-        "--sift-candidate-model",
-        default=SIFT_CANDIDATE_MODEL_DEFAULT,
-        help="HuggingFace DINOv2 model id used for SIFT candidate retrieval.",
-    )
-    parser.add_argument(
-        "--sift-candidate-batch-size",
-        type=int,
-        default=SIFT_CANDIDATE_BATCH_SIZE_DEFAULT,
-        help="CUDA batch size for DINOv2 SIFT candidate embeddings.",
-    )
-    parser.add_argument(
-        "--sift-candidate-max-distance",
-        type=float,
-        default=SIFT_CANDIDATE_MAX_DISTANCE_DEFAULT,
-        help=(
-            "Maximum DINOv2 cosine distance allowed before a candidate is sent to "
-            "SIFT/RANSAC. Lower is faster; raise toward 1.0 for exhaustive top-K recall."
-        ),
+        help="Top-K CLIP ANN image-master candidates to verify by SIFT/RANSAC per image.",
     )
     parser.add_argument(
         "--sift-max-side",
@@ -756,6 +889,16 @@ def parse_args() -> AppConfig:
         type=int,
         default=15,
         help="PySceneDetect minimum scene length in frames.",
+    )
+    parser.add_argument(
+        "--rerun-stage",
+        action="append",
+        default=[],
+        choices=("all", "1", "1a", "1b", "2", "3", "3a", "3b", "3c", "3d", "3e", "3f", "4", "5", "5a", "5b", "6", "7", "8"),
+        help=(
+            "Force a completed stage to rerun. Repeat for multiple stages; parent stages "
+            "such as 3 and 6 include their lettered substages, and 'all' reruns everything."
+        ),
     )
     parser.add_argument(
         "--repair-image-masters",
@@ -824,9 +967,6 @@ def parse_args() -> AppConfig:
         sift_min_inlier_ratio=min(1.0, max(0.0, float(args.sift_min_inlier_ratio))),
         sift_contrast_threshold=max(0.0, float(args.sift_contrast_threshold)),
         sift_candidate_topk=max(1, int(args.sift_candidate_topk)),
-        sift_candidate_model=str(args.sift_candidate_model).strip() or SIFT_CANDIDATE_MODEL_DEFAULT,
-        sift_candidate_batch_size=max(1, int(args.sift_candidate_batch_size)),
-        sift_candidate_max_distance=max(0.0, float(args.sift_candidate_max_distance)),
         sift_max_side=max(256, int(args.sift_max_side)),
         sift_max_features=max(128, int(args.sift_max_features)),
         sift_max_ransac_matches=max(16, int(args.sift_max_ransac_matches)),
@@ -834,7 +974,13 @@ def parse_args() -> AppConfig:
         scene_min_scene_len=args.scene_min_scene_len,
         repair_image_masters=bool(args.repair_image_masters),
         repair_only=bool(args.repair_only),
+        rerun_stages=set(args.rerun_stage),
     )
+
+
+def should_rerun_stage(cfg: AppConfig, stage: str) -> bool:
+    parent = "".join(char for char in stage if char.isdigit())
+    return "all" in cfg.rerun_stages or stage in cfg.rerun_stages or parent in cfg.rerun_stages
 
 
 def ensure_gpu() -> None:
@@ -870,13 +1016,16 @@ def _ort_providers() -> list[str]:
 
 def discover_media_files(root: Path) -> list[Path]:
     files: list[Path] = []
-    for path in root.rglob("*"):
+    scanned = 0
+    for path in progress(root.rglob("*"), desc="Stage 0a/9 Startup scan media files", unit="path"):
+        scanned += 1
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
         if suffix in IMAGE_EXTS or suffix in VIDEO_EXTS:
             files.append(path)
     files.sort()
+    print_info(f"[stage 0] discovered {len(files)} supported media files from {scanned} paths")
     return files
 
 
@@ -911,7 +1060,7 @@ def migrate_legacy_records_for_scan(
     media_paths: list[Path],
 ) -> None:
     rename_pairs: list[tuple[str, str]] = []
-    for path in media_paths:
+    for path in progress(media_paths, desc="Stage 0d/9 Startup check legacy DB keys", unit="file"):
         legacy_key = relative_file_name(cfg.input_dir, path)
         new_key = scoped_file_name(cfg, path)
         if new_key in records:
@@ -919,10 +1068,12 @@ def migrate_legacy_records_for_scan(
         if legacy_key in records:
             rename_pairs.append((legacy_key, new_key))
     if not rename_pairs:
+        print_info("[stage 0] legacy DB key migration not needed")
         return
 
+    print_info(f"[stage 0] migrating {len(rename_pairs)} legacy DB keys")
     remap = {old: new for old, new in rename_pairs}
-    for old_key, new_key in rename_pairs:
+    for old_key, new_key in progress(rename_pairs, desc="Stage 0e/9 Startup migrate legacy DB keys", unit="row"):
         row = dict(records[old_key])
         row["file_name"] = new_key
         row["collection_id"] = cfg.collection_id
@@ -954,6 +1105,10 @@ def default_record(
         "file_name": file_name,
         "collection_id": collection_id,
         "is_video": is_video_file,
+        "source_size": None,
+        "source_mtime_ns": None,
+        "image_width": None,
+        "image_height": None,
         "faces": None,
         "phash_hex": None,
         "video_frame_phashes": None,
@@ -985,26 +1140,43 @@ def db_table_names(db) -> set[str]:
 
 
 def connect_table(db_dir: Path, table_name: str):
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db = lancedb.connect(str(db_dir))
-    if table_name not in db_table_names(db):
+    with TimedStep(f"Stage 0b/9 Startup open LanceDB table {table_name}"):
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db = lancedb.connect(str(db_dir))
+        if table_name not in db_table_names(db):
+            table = db.create_table(table_name, data=[], schema=SCHEMA)
+            ensure_file_name_index(table)
+            return table
+
+        table = db.open_table(table_name)
+        existing_fields = {field.name: field.type for field in table.schema}
+        missing_fields = [field for field in SCHEMA if field.name not in existing_fields]
+        incompatible_fields = [
+            field.name
+            for field in SCHEMA
+            if field.name in existing_fields and existing_fields[field.name] != field.type
+        ]
+        if not incompatible_fields and missing_fields:
+            print_info(
+                f"[db] adding nullable columns to {table_name}: "
+                + ", ".join(field.name for field in missing_fields)
+            )
+            table.add_columns(missing_fields)
+            existing_fields.update({field.name: field.type for field in missing_fields})
+        if not incompatible_fields and all(field.name in existing_fields for field in SCHEMA):
+            ensure_file_name_index(table)
+            return table
+
+        print_info(f"[db] migrating {table_name} to the current schema; existing rows will be preserved")
+        old_rows = table.to_arrow().to_pylist()
+        db.drop_table(table_name)
         table = db.create_table(table_name, data=[], schema=SCHEMA)
+        migrated = [migrate_row_to_current_schema(row) for row in old_rows]
+        if migrated:
+            table.add(migrated)
+        print_info(f"[db] migrated {len(migrated)} rows")
         ensure_file_name_index(table)
         return table
-
-    table = db.open_table(table_name)
-    if list(table.schema.names) == list(SCHEMA.names):
-        ensure_file_name_index(table)
-        return table
-
-    old_rows = table.to_arrow().to_pylist()
-    db.drop_table(table_name)
-    table = db.create_table(table_name, data=[], schema=SCHEMA)
-    migrated = [migrate_row_to_current_schema(row) for row in old_rows]
-    if migrated:
-        table.add(migrated)
-    ensure_file_name_index(table)
-    return table
 
 
 def ensure_file_name_index(table) -> None:
@@ -1021,9 +1193,11 @@ def ensure_file_name_index(table) -> None:
     if index_name in index_names:
         return
     try:
+        print_info("[stage 0] creating file_name scalar index")
         table.create_scalar_index("file_name", replace=False, name=index_name)
+        print_info("[stage 0] file_name scalar index ready")
     except Exception as exc:
-        print(f"[db] warning: failed to create file_name scalar index: {exc}")
+        print_warning(f"[db] warning: failed to create file_name scalar index: {exc}")
 
 
 def migrate_row_to_current_schema(old_row: dict[str, Any]) -> dict[str, Any]:
@@ -1076,6 +1250,10 @@ def migrate_row_to_current_schema(old_row: dict[str, Any]) -> dict[str, Any]:
             ]
 
     rec["faces"] = old_row.get("faces")
+    rec["source_size"] = old_row.get("source_size")
+    rec["source_mtime_ns"] = old_row.get("source_mtime_ns")
+    rec["image_width"] = old_row.get("image_width")
+    rec["image_height"] = old_row.get("image_height")
     rec["phash_hex"] = old_row.get("phash_hex")
     rec["video_frame_phashes"] = normalize_video_frame_phashes(old_row.get("video_frame_phashes"))
     rec["skip_processing"] = old_row.get("skip_processing")
@@ -1095,18 +1273,23 @@ def migrate_row_to_current_schema(old_row: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_records(table) -> dict[str, dict[str, Any]]:
-    try:
-        rows = table.to_arrow().to_pylist()
-    except Exception:
-        return {}
+    with TimedStep("Stage 0c/9 Startup load DB rows into memory"):
+        try:
+            rows = table.to_arrow().to_pylist()
+        except Exception:
+            return {}
 
     records: dict[str, dict[str, Any]] = {}
-    for row in rows:
+    for row in progress(rows, desc="Stage 0c/9 Startup normalize DB rows", unit="row"):
         file_name = row["file_name"]
         records[file_name] = {
             "file_name": file_name,
             "collection_id": row.get("collection_id"),
             "is_video": row.get("is_video"),
+            "source_size": row.get("source_size"),
+            "source_mtime_ns": row.get("source_mtime_ns"),
+            "image_width": row.get("image_width"),
+            "image_height": row.get("image_height"),
             "faces": row.get("faces"),
             "phash_hex": row.get("phash_hex"),
             "video_frame_phashes": normalize_video_frame_phashes(row.get("video_frame_phashes")),
@@ -1126,6 +1309,7 @@ def load_records(table) -> dict[str, dict[str, Any]]:
             "clip_groups": row.get("clip_groups"),
             "ocr_groups": row.get("ocr_groups"),
         }
+    print_info(f"[stage 0] loaded {len(records)} DB rows")
     return records
 
 
@@ -1540,13 +1724,66 @@ def safe_image_dimensions(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
-def image_master_sort_key(item: MediaItem) -> tuple[int, int, int, int, str]:
-    width, height = safe_image_dimensions(item.source_path)
+def cached_image_master_sort_key(
+    item: MediaItem,
+    records: dict[str, dict[str, Any]],
+) -> tuple[int, int, int, int, str]:
+    record = records.get(item.file_name) or {}
+    width = int(record.get("image_width") or 0)
+    height = int(record.get("image_height") or 0)
     max_side = max(width, height)
     area = width * height
-    file_size = safe_file_size(item.source_path)
+    file_size = int(record.get("source_size") or 0)
     is_thumb = 1 if is_likely_thumbnail(item.source_path) else 0
     return (-max_side, -area, -file_size, is_thumb, item.file_name)
+
+
+def cache_image_metadata(
+    table,
+    records: dict[str, dict[str, Any]],
+    image_items: list[MediaItem],
+    force: bool = False,
+) -> set[str]:
+    pending: list[tuple[MediaItem, os.stat_result]] = []
+    for item in progress(image_items, desc="Stage 3a/9 check cached image metadata", unit="image"):
+        try:
+            stat = item.source_path.stat()
+        except OSError:
+            continue
+        record = records.get(item.file_name)
+        if not force and (
+            record is not None
+            and record.get("source_size") == stat.st_size
+            and record.get("source_mtime_ns") == stat.st_mtime_ns
+            and record.get("image_width") is not None
+            and record.get("image_height") is not None
+        ):
+            continue
+        pending.append((item, stat))
+
+    if not pending:
+        report_stage_complete("Stage 3a/9 cached image metadata", len(image_items), "images")
+        return set()
+
+    changed: set[str] = set()
+    upsert_batch: list[dict[str, Any]] = []
+    for item, stat in progress(pending, desc="Stage 3a/9 cache image metadata", unit="image"):
+        width, height = safe_image_dimensions(item.source_path)
+        record = records.get(
+            item.file_name,
+            default_record(item.file_name, False, item.collection_id),
+        )
+        record["collection_id"] = item.collection_id
+        record["is_video"] = False
+        record["source_size"] = int(stat.st_size)
+        record["source_mtime_ns"] = int(stat.st_mtime_ns)
+        record["image_width"] = int(width)
+        record["image_height"] = int(height)
+        append_stage_upsert(table, records, upsert_batch, record)
+        changed.add(item.file_name)
+    upsert_records_batch(table, records, upsert_batch)
+    report_stage_complete("Stage 3a/9 cached image metadata", len(image_items), "images")
+    return changed
 
 
 def clear_processing_fields(record: dict[str, Any]) -> None:
@@ -1571,8 +1808,14 @@ def run_hash_gate_for_items(
     stage_label: str,
     hash_func: Any,
     hash_workers: int,
+    apply_stage_label: str | None = None,
+    before_apply: Any | None = None,
+    force_hash: bool = False,
+    force_apply: bool = False,
 ) -> set[str]:
     if not items:
+        report_stage_complete(stage_label, 0, "files")
+        report_stage_complete(apply_stage_label or f"{stage_label} apply", 0, "files")
         return set()
 
     max_distance = max_hamming_for_similarity(similarity_pct)
@@ -1601,15 +1844,20 @@ def run_hash_gate_for_items(
                 item.file_name,
                 default_record(item.file_name, item.is_video, item.collection_id),
             )
-            if base.get("skip_processing") is True and base.get("processing_error"):
+            if not force_hash and base.get("skip_processing") is True and base.get("processing_error"):
                 continue
             existing_hash = normalize_phash_hex(base.get("phash_hex"))
-            if existing_hash is not None and hash_gate_record_complete(base, item, is_video_items):
+            if (
+                not force_hash
+                and not force_apply
+                and existing_hash is not None
+                and hash_gate_record_complete(base, item, is_video_items)
+            ):
                 if should_add_record_to_hash_tree(base):
                     tree.add(int(existing_hash, 16), item.file_name)
                 continue
             active_items.append(item)
-            if existing_hash is not None:
+            if existing_hash is not None and not force_hash:
                 hash_results[item.file_name] = (existing_hash, None)
                 continue
             futures[executor.submit(compute_item_hash, item, hash_func)] = item
@@ -1627,15 +1875,22 @@ def run_hash_gate_for_items(
                 except Exception as exc:
                     hash_results[item.file_name] = (None, exc)
 
+    if not futures:
+        report_stage_complete(stage_label, len(items), "files")
+    if before_apply is not None:
+        changed |= before_apply()
+
     upsert_batch: list[dict[str, Any]] = []
-    for item in progress(active_items, desc=f"{stage_label} apply", unit="file"):
+    if not active_items:
+        report_stage_complete(apply_stage_label or f"{stage_label} apply", len(items), "files")
+    for item in progress(active_items, desc=apply_stage_label or f"{stage_label} apply", unit="file"):
         base = records.get(
             item.file_name,
             default_record(item.file_name, item.is_video, item.collection_id),
         )
         existing_hash, hash_error = hash_results.get(item.file_name, (None, None))
         if hash_error is not None:
-            print(f"[hash] failed: {item.file_name}: {hash_error}")
+            print_error(f"[hash] failed: {item.file_name}: {hash_error}")
             failed = mark_hash_failure_record(records, item, is_video_items, hash_error)
             upsert_batch.append(failed)
             changed.add(item.file_name)
@@ -1644,7 +1899,7 @@ def run_hash_gate_for_items(
             continue
         if existing_hash is None:
             exc = RuntimeError("hash result missing")
-            print(f"[hash] failed: {item.file_name}: {exc}")
+            print_error(f"[hash] failed: {item.file_name}: {exc}")
             failed = mark_hash_failure_record(records, item, is_video_items, exc)
             upsert_batch.append(failed)
             changed.add(item.file_name)
@@ -1749,17 +2004,46 @@ def run_phash_gate_stage(
     table,
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
+    video_paths: list[Path],
+    extracted_video_frame_map: dict[Path, list[FrameRef]],
 ) -> set[str]:
-    image_items = sorted([item for item in media_items if not item.is_video], key=image_master_sort_key)
-    return run_hash_gate_for_items(
+    image_items = [item for item in media_items if not item.is_video]
+    metadata_changed = cache_image_metadata(
+        table,
+        records,
+        image_items,
+        force=should_rerun_stage(cfg, "3a"),
+    )
+    image_items.sort(key=lambda item: cached_image_master_sort_key(item, records))
+    if not image_items:
+        report_stage_complete("Stage 3b/9 pHash images", 0, "files")
+        report_stage_complete("Stage 3d/9 apply image pHash groups", 0, "files")
+        return metadata_changed | run_video_frame_phash_stage(
+            cfg,
+            table,
+            records,
+            video_paths,
+            extracted_video_frame_map,
+        )
+    return metadata_changed | run_hash_gate_for_items(
         table=table,
         records=records,
         items=image_items,
         is_video_items=False,
         similarity_pct=cfg.phash_skip_similarity_pct,
-        stage_label="Stage 3/8 pHash (images)",
+        stage_label="Stage 3b/9 pHash images",
         hash_func=lambda item: compute_phash_hex(item.source_path),
         hash_workers=cfg.hash_workers,
+        apply_stage_label="Stage 3d/9 apply image pHash groups",
+        before_apply=lambda: run_video_frame_phash_stage(
+            cfg,
+            table,
+            records,
+            video_paths,
+            extracted_video_frame_map,
+        ),
+        force_hash=should_rerun_stage(cfg, "3b"),
+        force_apply=should_rerun_stage(cfg, "3d"),
     )
 
 
@@ -1769,13 +2053,15 @@ def repair_image_masters(
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
 ) -> tuple[set[str], set[str]]:
-    image_items = sorted([item for item in media_items if not item.is_video], key=image_master_sort_key)
+    image_items = [item for item in media_items if not item.is_video]
+    metadata_changed = cache_image_metadata(table, records, image_items)
+    image_items.sort(key=lambda item: cached_image_master_sort_key(item, records))
     if not image_items:
-        return set(), set()
+        return metadata_changed, set()
 
     max_distance = max_hamming_for_similarity(cfg.phash_skip_similarity_pct)
     tree = HammingBkTree()
-    changed: set[str] = set()
+    changed: set[str] = set(metadata_changed)
     cleared_processing: set[str] = set()
     masters = 0
     demoted = 0
@@ -1921,9 +2207,12 @@ def run_video_hash_gate_stage(
         items=video_items,
         is_video_items=True,
         similarity_pct=cfg.video_hash_skip_similarity_pct,
-        stage_label="Stage 1/8 VideoHash (videos)",
+        stage_label="Stage 1a/9 VideoHash (videos)",
         hash_func=lambda item: compute_video_hash_hex(item.source_path),
         hash_workers=cfg.hash_workers,
+        apply_stage_label="Stage 1b/9 VideoHash apply",
+        force_hash=should_rerun_stage(cfg, "1a"),
+        force_apply=should_rerun_stage(cfg, "1b"),
     )
 
 
@@ -2134,10 +2423,11 @@ class FaceWorker:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             text=True,
             env=env,
         )
+        start_worker_stderr_forwarder(self.process)
         ready = self._read_json_line(self.init_timeout_seconds)
         if ready is None:
             self.terminate()
@@ -2289,58 +2579,6 @@ class ClipEmbedder:
         return [vec.tolist() for vec in vectors_np]
 
 
-class DinoImageEmbedder:
-    def __init__(self, model_name: str, batch_size: int) -> None:
-        from transformers import AutoImageProcessor, AutoModel
-
-        self.model_name = model_name
-        self.batch_size = batch_size
-        if not torch.cuda.is_available():
-            raise RuntimeError("DINOv2 SIFT candidate embeddings require CUDA but CUDA is unavailable.")
-        self.device = torch.device("cuda")
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
-        self.model.eval()
-        self.dim = int(getattr(self.model.config, "hidden_size", 0))
-        if self.dim <= 0:
-            raise RuntimeError(f"Could not determine embedding dimension for {model_name}")
-
-    def embed_paths(self, paths: list[Path]) -> list[np.ndarray | None]:
-        vectors: list[np.ndarray | None] = [None] * len(paths)
-        with torch.inference_mode():
-            for start in range(0, len(paths), self.batch_size):
-                batch_paths = paths[start : start + self.batch_size]
-                valid_indices: list[int] = []
-                images: list[Image.Image] = []
-                for offset, path in enumerate(batch_paths):
-                    try:
-                        with Image.open(path) as image:
-                            images.append(ImageOps.exif_transpose(image).convert("RGB"))
-                        valid_indices.append(start + offset)
-                    except Exception:
-                        continue
-                if not images:
-                    continue
-                inputs = self.processor(images=images, return_tensors="pt")
-                inputs = {
-                    key: value.to(self.device, non_blocking=True)
-                    for key, value in inputs.items()
-                    if isinstance(value, torch.Tensor)
-                }
-                outputs = self.model(**inputs)
-                features = getattr(outputs, "pooler_output", None)
-                if features is None:
-                    hidden = getattr(outputs, "last_hidden_state", None)
-                    if hidden is None:
-                        raise RuntimeError(f"{self.model_name} produced no usable image features")
-                    features = hidden[:, 0]
-                features = torch.nn.functional.normalize(features.float(), dim=-1)
-                features_np = features.detach().cpu().numpy().astype(np.float32)
-                for idx, vector in zip(valid_indices, features_np, strict=True):
-                    vectors[idx] = vector
-        return vectors
-
-
 class PaddleTextDetector:
     def __init__(self, python_exe: Path, model_name: str, device: str) -> None:
         self._next_job_id = 1
@@ -2358,11 +2596,12 @@ class PaddleTextDetector:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
             bufsize=1,
         )
+        start_worker_stderr_forwarder(self.process)
         ready = self._read_json_line(PADDLE_WORKER_READY_TIMEOUT_SECONDS)
         if ready.get("status") != "ready":
             diag = ""
@@ -2523,11 +2762,12 @@ class EasyOcrWorker:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
             bufsize=1,
         )
+        start_worker_stderr_forwarder(self.process)
         ready = self._read_json_line(EASYOCR_WORKER_READY_TIMEOUT_SECONDS)
         if ready.get("status") != "ready":
             raise RuntimeError(f"EasyOCR worker did not report ready: {ready}")
@@ -2694,7 +2934,8 @@ class TextEmbedder:
         self.batch_size = batch_size
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("OCR text embedding model was configured for CUDA but CUDA is unavailable.")
-        self.model = SentenceTransformer(model_name, device=device)
+        with TimedStep(f"load OCR text embedding model {model_name} on {device}"):
+            self.model = SentenceTransformer(model_name, device=device)
         if getattr(self.model, "device", None) is None:
             raise RuntimeError("Could not verify OCR text embedding model device.")
         if self.model.device.type != device:
@@ -2703,14 +2944,20 @@ class TextEmbedder:
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        vectors = self.model.encode(
-            texts,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        vectors_np = np.asarray(vectors, dtype=np.float32)
+        chunks: list[np.ndarray] = []
+        ranges = range(0, len(texts), self.batch_size)
+        iterator = progress(ranges, desc="Stage 9c/9 OCR text search index embed text", unit="batch") if len(texts) > self.batch_size else ranges
+        for start in iterator:
+            batch_texts = texts[start : start + self.batch_size]
+            vectors = self.model.encode(
+                batch_texts,
+                batch_size=self.batch_size,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            chunks.append(np.asarray(vectors, dtype=np.float32))
+        vectors_np = np.concatenate(chunks, axis=0)
         if vectors_np.ndim == 1:
             vectors_np = np.expand_dims(vectors_np, axis=0)
         return [vec.tolist() for vec in vectors_np]
@@ -2759,11 +3006,15 @@ def run_face_stage(
     table,
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
-) -> None:
+) -> set[str]:
     mark_stale_face_status_if_needed(cfg, table, records, media_items)
     pending: list[MediaItem] = []
+    force = should_rerun_stage(cfg, "6")
     for item in media_items:
         rec = records.get(item.file_name)
+        if force and not skip_processing_applies(rec):
+            pending.append(item)
+            continue
         is_complete = face_stage_complete(rec, item)
         if not is_complete:
             pending.append(item)
@@ -2771,7 +3022,8 @@ def run_face_stage(
         if should_rerun_face_row(cfg, rec, item):
             pending.append(item)
     if not pending:
-        return
+        report_stage_complete("Stage 6/9 Faces", len(media_items), "files")
+        return set()
 
     worker = FaceWorker(
         cfg.insightface_root,
@@ -2781,8 +3033,9 @@ def run_face_stage(
         dedupe_cosine=cfg.face_dedupe_cosine,
     )
     upsert_batch: list[dict[str, Any]] = []
+    changed: set[str] = set()
     consecutive_face_timeouts = 0
-    pbar = progress(pending, desc="Stage 5/8 Faces", unit="file")
+    pbar = progress(pending, desc="Stage 6/9 Faces", unit="file")
     try:
         for file_index, item in enumerate(pbar, start=1):
             pbar.set_postfix_str(shorten_for_status(item.file_name), refresh=True)
@@ -2856,9 +3109,10 @@ def run_face_stage(
                         f"Timeouts: {consecutive_face_timeouts}/{cfg.max_consecutive_face_timeouts}. "
                         f"Last file: {item.file_name}. Error: {exc}"
                     ) from exc
-                print(f"[faces] timeout: {item.file_name}: {exc}")
+                print_warning(f"[faces] timeout: {item.file_name}: {exc}")
                 failed = mark_face_failure_record(records, item, compact_error_message(exc))
                 append_stage_upsert(table, records, upsert_batch, failed)
+                changed.add(item.file_name)
                 continue
             except FaceWorkerPipeError as exc:
                 raise RuntimeError(
@@ -2867,7 +3121,7 @@ def run_face_stage(
                 ) from exc
             except Exception as exc:
                 consecutive_face_timeouts = 0
-                print(f"[faces] failed: {item.file_name}: {exc}")
+                print_error(f"[faces] failed: {item.file_name}: {exc}")
                 failed = mark_face_failure_record(records, item, compact_error_message(exc))
                 if len(upsert_batch) + 1 >= UPSERT_BATCH_SIZE:
                     write_status(
@@ -2880,6 +3134,7 @@ def run_face_stage(
                         pending_records=len(upsert_batch) + 1,
                     )
                 append_stage_upsert(table, records, upsert_batch, failed)
+                changed.add(item.file_name)
                 continue
 
             consecutive_face_timeouts = 0
@@ -2901,11 +3156,13 @@ def run_face_stage(
                     pending_records=len(upsert_batch) + 1,
                 )
             append_stage_upsert(table, records, upsert_batch, base)
+            changed.add(item.file_name)
     finally:
         worker.close()
     write_status(cfg, stage="faces", state="flushing_db_batch", pending_records=len(upsert_batch))
     upsert_records_batch(table, records, upsert_batch)
     write_status(cfg, stage="faces", state="complete", file_total=len(pending))
+    return changed
 
 
 def run_clip_stage(
@@ -2913,14 +3170,16 @@ def run_clip_stage(
     table,
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
-) -> None:
+) -> set[str]:
     pending: list[MediaItem] = []
+    force = should_rerun_stage(cfg, "4")
     for item in media_items:
         rec = records.get(item.file_name)
-        if not clip_stage_complete(rec, item):
+        if (force and not skip_processing_applies(rec)) or not clip_stage_complete(rec, item):
             pending.append(item)
     if not pending:
-        return
+        report_stage_complete("Stage 4/9 CLIP images and video stills", len(media_items), "files")
+        return set()
 
     try:
         embedder = ClipEmbedder(cfg.clip_model, cfg.clip_batch_size)
@@ -2929,7 +3188,8 @@ def run_clip_stage(
             f"CLIP stage failed to initialize on CUDA/OpenCLIP: {compact_error_message(exc)}"
         ) from exc
     upsert_batch: list[dict[str, Any]] = []
-    for item in progress(pending, desc="Stage 6/8 CLIP", unit="file"):
+    changed: set[str] = set()
+    for item in progress(pending, desc="Stage 4/9 CLIP images and video stills", unit="file"):
         base = records.get(
             item.file_name,
             default_record(item.file_name, item.is_video, item.collection_id),
@@ -2938,7 +3198,7 @@ def run_clip_stage(
             frames = [read_image_bgr(frame.image_path) for frame in item.frame_refs]
             vectors = embedder.embed_frames(frames)
         except Exception as exc:
-            print(f"[clip] failed: {item.file_name}: {exc}")
+            print_error(f"[clip] failed: {item.file_name}: {exc}")
             continue
 
         base["is_video"] = item.is_video
@@ -2950,11 +3210,12 @@ def run_clip_stage(
             }
             for i, frame_ref in enumerate(item.frame_refs)
         ]
-        # SIFT master links are now independent of CLIP and may run earlier.
-        # Keep existing SIFT linkage when refreshing CLIP embeddings.
+        # Keep existing SIFT linkage when refreshing the shortlist embeddings.
         recompute_aggregate_fields(base)
         append_stage_upsert(table, records, upsert_batch, base)
+        changed.add(item.file_name)
     upsert_records_batch(table, records, upsert_batch)
+    return changed
 
 
 def run_paddle_detection_stage(
@@ -2962,22 +3223,25 @@ def run_paddle_detection_stage(
     table,
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
-) -> None:
+) -> set[str]:
     pending: list[MediaItem] = []
+    force = cfg.rerun_paddle_ocr or should_rerun_stage(cfg, "7")
     for item in media_items:
         rec = records.get(item.file_name)
         if skip_processing_applies(rec):
             continue
-        if cfg.rerun_paddle_ocr or not paddle_stage_complete(rec, item):
+        if force or not paddle_stage_complete(rec, item):
             pending.append(item)
     if not pending:
-        return
+        report_stage_complete("Stage 7/9 PaddleOCR", len(media_items), "files")
+        return set()
 
     print(f"[paddle] worker interpreter: {cfg.paddle_python}")
     detector = PaddleTextDetector(cfg.paddle_python, cfg.paddle_det_model, cfg.paddle_device)
     upsert_batch: list[dict[str, Any]] = []
+    changed: set[str] = set()
     try:
-        for item in progress(pending, desc="Stage 7/8 PaddleOCR", unit="file"):
+        for item in progress(pending, desc="Stage 7/9 PaddleOCR", unit="file"):
             base = records.get(
                 item.file_name,
                 default_record(item.file_name, item.is_video, item.collection_id),
@@ -2995,9 +3259,10 @@ def run_paddle_detection_stage(
                     )
             except Exception as exc:
                 message = compact_error_message(exc)
-                print(f"[paddle] failed: {item.file_name}: {message}")
+                print_error(f"[paddle] failed: {item.file_name}: {message}")
                 base = mark_paddle_failure_record(records, item, message)
                 append_stage_upsert(table, records, upsert_batch, base)
+                changed.add(item.file_name)
                 continue
 
             base["is_video"] = item.is_video
@@ -3008,6 +3273,7 @@ def run_paddle_detection_stage(
                 base["processing_error"] = None
             recompute_aggregate_fields(base)
             append_stage_upsert(table, records, upsert_batch, base)
+            changed.add(item.file_name)
     finally:
         detector.close()
     write_status(
@@ -3018,6 +3284,7 @@ def run_paddle_detection_stage(
     )
     upsert_records_batch(table, records, upsert_batch)
     write_status(cfg, stage="paddle_ocr", state="complete", file_total=len(pending))
+    return changed
 
 
 def run_easyocr_stage(
@@ -3025,30 +3292,42 @@ def run_easyocr_stage(
     table,
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
-) -> None:
+) -> set[str]:
     pending: list[MediaItem] = []
+    force = should_rerun_stage(cfg, "8")
     for item in media_items:
         rec = records.get(item.file_name)
-        if easyocr_stage_needed(rec, item):
+        groups = rec.get("ocr_groups") if rec else None
+        can_rerun = (
+            force
+            and not skip_processing_applies(rec)
+            and groups_match_item(groups, item)
+            and any(group.get("text_detected") is True for group in groups)
+        )
+        if can_rerun or easyocr_stage_needed(rec, item):
             pending.append(item)
     if not pending:
-        return
+        report_stage_complete("Stage 8/9 EasyOCR", len(media_items), "files")
+        return set()
 
     extractor = start_easyocr_worker(cfg, cfg.easyocr_gpu)
     upsert_batch: list[dict[str, Any]] = []
+    changed: set[str] = set()
     try:
-        for item in progress(pending, desc="Stage 8/8 EasyOCR", unit="file"):
+        for item in progress(pending, desc="Stage 8/9 EasyOCR", unit="file"):
             base = records[item.file_name]
             try:
                 groups = [dict(group) for group in base["ocr_groups"]]
                 for i, group in enumerate(groups):
-                    if group.get("text_detected") is True and group.get("text") is None:
+                    if group.get("text_detected") is True and (
+                        force or group.get("text") is None
+                    ):
                         text = extractor.extract_text(item.frame_refs[i].image_path, cfg.easyocr_max_side)
                         group["text"] = text
                     elif group.get("text_detected") is False and group.get("text") is None:
                         group["text"] = ""
             except Exception as exc:
-                print(f"[easyocr] failed: {item.file_name}: {exc}")
+                print_error(f"[easyocr] failed: {item.file_name}: {exc}")
                 if not extractor.is_alive():
                     extractor.close()
                     if cfg.easyocr_gpu:
@@ -3063,9 +3342,11 @@ def run_easyocr_stage(
             base["ocr_groups"] = groups
             recompute_aggregate_fields(base)
             append_stage_upsert(table, records, upsert_batch, base)
+            changed.add(item.file_name)
     finally:
         extractor.close()
     upsert_records_batch(table, records, upsert_batch)
+    return changed
 
 
 def start_easyocr_worker(cfg: AppConfig, gpu: bool) -> EasyOcrWorker:
@@ -3225,11 +3506,16 @@ def existing_stills_valid(
     return True
 
 
-def extract_stills_for_video(video_path: Path, cfg: AppConfig, video_dir: Path) -> list[FrameRef]:
+def extract_stills_for_video(
+    video_path: Path,
+    cfg: AppConfig,
+    video_dir: Path,
+    force: bool = False,
+) -> list[FrameRef]:
     video_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = video_dir / "manifest.json"
     manifest = load_manifest(manifest_path)
-    if existing_stills_valid(manifest, video_path, cfg, video_dir):
+    if not force and existing_stills_valid(manifest, video_path, cfg, video_dir):
         return [
             FrameRef(
                 timestamp_sec=round_timestamp(float(frame["timestamp_sec"])),
@@ -3302,26 +3588,35 @@ def extract_video_stills(
     frame_map: dict[Path, list[FrameRef]] = {}
 
     videos_to_extract: list[Path] = []
+    failed_count = 0
+    force = should_rerun_stage(cfg, "2")
     for video_path in video_paths:
         file_name = scoped_file_name(cfg, video_path)
         existing = records.get(file_name)
-        if existing is not None and skip_processing_applies(existing):
+        if not force and existing is not None and skip_processing_applies(existing):
             continue
-        if existing is not None and (
-            existing.get("face_groups") is not None
-            and existing.get("clip_groups") is not None
-            and existing.get("ocr_groups") is not None
-        ):
+        if not force and load_existing_video_frame_refs(cfg, video_path):
             continue
         videos_to_extract.append(video_path)
 
-    for video_path in progress(videos_to_extract, desc="Stage 2/8 PySceneDetect", unit="video"):
+    for video_path in progress(videos_to_extract, desc="Stage 2/9 PySceneDetect", unit="video"):
         video_dir = build_video_output_dir(cfg.input_dir, video_path, root)
         try:
-            frame_map[video_path] = extract_stills_for_video(video_path, cfg, video_dir)
+            frame_map[video_path] = extract_stills_for_video(video_path, cfg, video_dir, force=force)
         except Exception as exc:
-            print(f"[scenedetect] failed: {relative_file_name(cfg.input_dir, video_path)}: {exc}")
+            print_error(f"[scenedetect] failed: {relative_file_name(cfg.input_dir, video_path)}: {exc}")
             frame_map[video_path] = []
+            failed_count += 1
+    if failed_count:
+        report_stage_incomplete(
+            "Stage 2/9 PySceneDetect",
+            len(video_paths) - failed_count,
+            len(video_paths),
+            "videos",
+            f"{failed_count} failed",
+        )
+    else:
+        report_stage_complete("Stage 2/9 PySceneDetect", len(video_paths), "videos")
     return root, frame_map
 
 
@@ -3348,7 +3643,9 @@ def build_media_items(
             )
         )
     for path in video_paths:
-        frames = video_frames.get(path, [])
+        frames = video_frames.get(path)
+        if frames is None:
+            frames = load_existing_video_frame_refs(cfg, path)
         if not frames:
             continue
         items.append(
@@ -3427,17 +3724,12 @@ def load_existing_video_frame_refs(
     return result
 
 
-def compute_video_frame_phashes(frame_refs: list[FrameRef]) -> list[dict[str, Any]]:
-    groups: list[dict[str, Any]] = []
-    for frame_ref in frame_refs:
-        phash_hex = compute_phash_hex(frame_ref.image_path)
-        groups.append(
-            {
-                "timestamp_sec": float(round_timestamp(frame_ref.timestamp_sec)),
-                "phash_hex": phash_hex,
-            }
-        )
-    return normalize_video_frame_phashes(groups) or []
+def video_frame_phashes_by_timestamp(value: Any) -> dict[float, str]:
+    groups = normalize_video_frame_phashes(value) or []
+    return {
+        round_timestamp(float(group["timestamp_sec"])): str(group["phash_hex"])
+        for group in groups
+    }
 
 
 def filtered_cross_media_matches(
@@ -3505,18 +3797,151 @@ def build_video_frame_hash_index(
     return tree, refs_by_key
 
 
+def run_video_frame_phash_stage(
+    cfg: AppConfig,
+    table,
+    records: dict[str, dict[str, Any]],
+    video_paths: list[Path],
+    extracted_video_frame_map: dict[Path, list[FrameRef]],
+) -> set[str]:
+    changed: set[str] = set()
+    upsert_batch: list[dict[str, Any]] = []
+    current_video_frame_refs: dict[str, list[FrameRef]] = {}
+    current_video_hashes: dict[str, dict[float, str]] = {}
+    pending_frame_hashes: list[tuple[str, FrameRef]] = []
+    reused_frame_count = 0
+    force = should_rerun_stage(cfg, "3c")
+
+    for video_path in video_paths:
+        file_name = scoped_file_name(cfg, video_path)
+        record = records.get(file_name, default_record(file_name, True, cfg.collection_id))
+        frame_refs = extracted_video_frame_map.get(video_path)
+        allow_existing_hashes = frame_refs is None and not force
+        if frame_refs is None:
+            frame_refs = load_existing_video_frame_refs(cfg, video_path)
+        current_video_frame_refs[file_name] = frame_refs
+        existing_hashes = (
+            video_frame_phashes_by_timestamp(record.get("video_frame_phashes"))
+            if allow_existing_hashes
+            else {}
+        )
+        current_hashes: dict[float, str] = {}
+        if not frame_refs:
+            current_hashes.update(existing_hashes)
+        for frame_ref in frame_refs:
+            timestamp_sec = round_timestamp(frame_ref.timestamp_sec)
+            existing_hash = existing_hashes.get(timestamp_sec)
+            if existing_hash is not None:
+                current_hashes[timestamp_sec] = existing_hash
+                reused_frame_count += 1
+            else:
+                pending_frame_hashes.append((file_name, frame_ref))
+        current_video_hashes[file_name] = current_hashes
+
+    print(
+        f"[video-frame-phash] reusing {reused_frame_count} existing video-still pHashes; "
+        f"hashing {len(pending_frame_hashes)} new or changed frames"
+    )
+    if not pending_frame_hashes:
+        report_stage_complete("Stage 3c/9 pHash video stills", reused_frame_count, "frames")
+    write_status(
+        cfg,
+        stage="video_frame_phash",
+        state="running",
+        reused_frames=reused_frame_count,
+        frame_total=len(pending_frame_hashes),
+    )
+    failed_frame_count = 0
+    with ThreadPoolExecutor(max_workers=max(1, cfg.hash_workers)) as executor:
+        futures = {
+            executor.submit(compute_phash_hex, frame_ref.image_path): (file_name, frame_ref)
+            for file_name, frame_ref in pending_frame_hashes
+        }
+        for future in progress(
+            as_completed(futures),
+            desc="Stage 3c/9 pHash video stills",
+            unit="frame",
+            total=len(futures),
+        ):
+            file_name, frame_ref = futures[future]
+            try:
+                phash_hex = future.result()
+            except Exception as exc:
+                failed_frame_count += 1
+                print_error(f"[video-frame-phash] failed: {file_name}: {frame_ref.image_path}: {exc}")
+                continue
+            timestamp_sec = round_timestamp(frame_ref.timestamp_sec)
+            current_video_hashes[file_name][timestamp_sec] = phash_hex
+    write_status(
+        cfg,
+        stage="video_frame_phash",
+        state="complete",
+        reused_frames=reused_frame_count,
+        frame_total=len(pending_frame_hashes),
+        failed_frames=failed_frame_count,
+    )
+
+    for video_path in video_paths:
+        file_name = scoped_file_name(cfg, video_path)
+        record = records.get(file_name, default_record(file_name, True, cfg.collection_id))
+        frame_hash_groups = normalize_video_frame_phashes(
+            [
+                {
+                    "timestamp_sec": float(round_timestamp(frame_ref.timestamp_sec)),
+                    "phash_hex": current_video_hashes[file_name][round_timestamp(frame_ref.timestamp_sec)],
+                }
+                for frame_ref in current_video_frame_refs[file_name]
+                if round_timestamp(frame_ref.timestamp_sec) in current_video_hashes[file_name]
+            ]
+        ) or []
+        if not current_video_frame_refs[file_name]:
+            frame_hash_groups = normalize_video_frame_phashes(record.get("video_frame_phashes")) or []
+        if normalize_video_frame_phashes(record.get("video_frame_phashes")) != frame_hash_groups:
+            record["video_frame_phashes"] = frame_hash_groups
+            record["collection_id"] = cfg.collection_id
+            record["is_video"] = True
+            append_stage_upsert(table, records, upsert_batch, record)
+            changed.add(file_name)
+
+    flush_hash_upserts(table, records, upsert_batch)
+    return changed
+
+
 def run_cross_media_match_stage(
     cfg: AppConfig,
     table,
     records: dict[str, dict[str, Any]],
     image_paths: list[Path],
     video_paths: list[Path],
-    extracted_video_frame_map: dict[Path, list[FrameRef]],
 ) -> set[str]:
     current_image_files = {scoped_file_name(cfg, path) for path in image_paths}
     current_video_files = {scoped_file_name(cfg, path) for path in video_paths}
     current_files = current_image_files | current_video_files
     if not current_files:
+        report_stage_complete("Stage 3e/9 image↔video frame match", 0, "images")
+        report_stage_complete("Stage 3f/9 video frame↔image match", 0, "videos")
+        return set()
+
+    print("[cross-media] checking completion fingerprint")
+    input_fingerprint = cross_media_input_fingerprint(
+        cfg,
+        records,
+        current_image_files,
+        current_video_files,
+    )
+    state = read_cross_media_state(cfg)
+    collections = state.get("collections")
+    if not isinstance(collections, dict):
+        collections = {}
+    collection_state = collections.get(cfg.collection_id)
+    force = should_rerun_stage(cfg, "3e") or should_rerun_stage(cfg, "3f")
+    if (
+        not force
+        and isinstance(collection_state, dict)
+        and collection_state.get("fingerprint") == input_fingerprint
+    ):
+        report_stage_complete("Stage 3e/9 image↔video frame match", len(image_paths), "images")
+        report_stage_complete("Stage 3f/9 video frame↔image match", len(video_paths), "videos")
         return set()
 
     changed: set[str] = set()
@@ -3533,28 +3958,13 @@ def run_cross_media_match_stage(
             append_stage_upsert(table, records, upsert_batch, record)
             changed.add(file_name)
 
-    current_video_hash_groups: dict[str, list[dict[str, Any]]] = {}
-    for video_path in video_paths:
-        file_name = scoped_file_name(cfg, video_path)
-        record = records.get(file_name, default_record(file_name, True, cfg.collection_id))
-        frame_refs = extracted_video_frame_map.get(video_path)
-        if frame_refs is None:
-            frame_refs = load_existing_video_frame_refs(cfg, video_path)
-        frame_hash_groups = normalize_video_frame_phashes(record.get("video_frame_phashes")) or []
-        if frame_refs:
-            try:
-                frame_hash_groups = compute_video_frame_phashes(frame_refs)
-            except Exception as exc:
-                print(f"[cross-media] failed to hash video stills: {file_name}: {exc}")
-        current_video_hash_groups[file_name] = frame_hash_groups
-        if record.get("video_frame_phashes") != frame_hash_groups:
-            record["video_frame_phashes"] = frame_hash_groups
-            record["collection_id"] = cfg.collection_id
-            record["is_video"] = True
-            append_stage_upsert(table, records, upsert_batch, record)
-            changed.add(file_name)
-
-    flush_hash_upserts(table, records, upsert_batch)
+    current_video_hash_groups = {
+        scoped_file_name(cfg, video_path): normalize_video_frame_phashes(
+            records.get(scoped_file_name(cfg, video_path), {}).get("video_frame_phashes")
+        )
+        or []
+        for video_path in video_paths
+    }
 
     image_tree = HammingBkTree()
     for file_name, record in records.items():
@@ -3569,7 +3979,13 @@ def run_cross_media_match_stage(
     max_distance = max_hamming_for_similarity(cfg.phash_skip_similarity_pct)
     desired_by_file: dict[str, list[dict[str, Any]]] = {file_name: [] for file_name in current_files}
 
-    for image_path in progress(image_paths, desc="Stage 3b/8 image↔video frame match", unit="image"):
+    write_status(
+        cfg,
+        stage="cross_media_image_to_video",
+        state="running",
+        image_total=len(image_paths),
+    )
+    for image_path in progress(image_paths, desc="Stage 3e/9 image↔video frame match", unit="image"):
         file_name = scoped_file_name(cfg, image_path)
         record = records.get(file_name)
         if not record:
@@ -3603,7 +4019,19 @@ def run_cross_media_match_stage(
                 similarity_pct=float(entry["similarity_pct"]),
             )
 
-    for video_path in progress(video_paths, desc="Stage 3c/8 video frame↔image match", unit="video"):
+    write_status(
+        cfg,
+        stage="cross_media_image_to_video",
+        state="complete",
+        image_total=len(image_paths),
+    )
+    write_status(
+        cfg,
+        stage="cross_media_video_to_image",
+        state="running",
+        video_total=len(video_paths),
+    )
+    for video_path in progress(video_paths, desc="Stage 3f/9 video frame↔image match", unit="video"):
         file_name = scoped_file_name(cfg, video_path)
         frame_hash_groups = current_video_hash_groups.get(file_name) or []
         per_image_best: dict[str, dict[str, Any]] = {}
@@ -3633,6 +4061,12 @@ def run_cross_media_match_stage(
                 similarity_pct=float(entry["similarity_pct"]),
             )
 
+    write_status(
+        cfg,
+        stage="cross_media_video_to_image",
+        state="complete",
+        video_total=len(video_paths),
+    )
     for file_name, desired_matches in desired_by_file.items():
         record = records.get(file_name)
         if record is None:
@@ -3651,6 +4085,15 @@ def run_cross_media_match_stage(
             changed.add(file_name)
 
     upsert_records_batch(table, records, upsert_batch)
+    collections[cfg.collection_id] = {
+        "fingerprint": input_fingerprint,
+        "image_total": len(image_paths),
+        "video_total": len(video_paths),
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    state["version"] = 1
+    state["collections"] = collections
+    write_cross_media_state(cfg, state)
     return changed
 
 
@@ -3838,132 +4281,41 @@ def sift_match_pair(
     }
 
 
-def sift_dino_model_slug(model_name: str) -> str:
-    slug = "".join(char.lower() if char.isalnum() else "_" for char in model_name)
-    slug = "_".join(part for part in slug.split("_") if part)
-    return slug[:96] or "model"
+def clip_vector_for_record(record: dict[str, Any] | None) -> np.ndarray | None:
+    if not record:
+        return None
+    groups = record.get("clip_groups")
+    if not isinstance(groups, list):
+        return None
+    for group in groups:
+        vector = group.get("clip_embedding")
+        if isinstance(vector, (list, tuple)) and vector:
+            return np.asarray(vector, dtype=np.float32)
+    return None
 
 
-def make_sift_dino_ann_schema(vector_dim: int) -> pa.Schema:
-    return pa.schema(
-        [
-            pa.field("id", pa.string()),
-            pa.field("file_name", pa.string()),
-            pa.field("vector", pa.list_(pa.float32(), vector_dim)),
-        ]
-    )
-
-
-def sift_dino_ann_table_name(cfg: AppConfig) -> str:
-    return ann_table_name(cfg.table_name, f"sift_dino_{sift_dino_model_slug(cfg.sift_candidate_model)}")
-
-
-def load_sift_dino_vector_map(table) -> dict[str, np.ndarray]:
-    result: dict[str, np.ndarray] = {}
-    for row in table.to_arrow().to_pylist():
-        file_name = row.get("file_name")
-        vec = row.get("vector")
-        if not isinstance(file_name, str) or not isinstance(vec, (list, tuple)) or not vec:
-            continue
-        result[file_name] = np.asarray(vec, dtype=np.float32)
-    return result
-
-
-def load_or_create_sift_dino_ann_table(cfg: AppConfig, vector_dim: int):
-    db = lancedb.connect(str(cfg.db_dir))
-    table_name = sift_dino_ann_table_name(cfg)
-    if table_name in db_table_names(db):
-        table = db.open_table(table_name)
-        if get_fixed_vector_dim(table.schema) == vector_dim:
-            try:
-                row_count = table.to_arrow().num_rows
-            except Exception:
-                row_count = 0
-            if row_count:
-                ensure_ann_index(table, f"{table_name}_vec_idx")
-            print(f"[sift-dino] reusing existing DINO ANN table {table_name} ({row_count} rows)")
-            return table
-        print(f"[sift-dino] existing ANN table has wrong dimension; rebuilding {table_name}.")
-        db.drop_table(table_name)
-    return db.create_table(table_name, data=[], schema=make_sift_dino_ann_schema(vector_dim))
-
-
-def ensure_sift_dino_vectors_for_items(
-    cfg: AppConfig,
-    table,
-    master_items: list[MediaItem],
-    embedder: DinoImageEmbedder,
-) -> dict[str, np.ndarray]:
-    existing_vectors = load_sift_dino_vector_map(table)
-    missing_items = [item for item in master_items if item.file_name not in existing_vectors]
-    if not missing_items:
-        if existing_vectors:
-            ensure_ann_index(table, f"{sift_dino_ann_table_name(cfg)}_vec_idx")
-        print("[sift-dino] all current masters already have DINO vectors")
-        return existing_vectors
-
-    print(f"[sift-dino] embedding {len(missing_items)} missing DINO candidate vectors")
-    rows: list[dict[str, Any]] = []
-    added = 0
-    failed = 0
-    pbar = HumanTqdm(
-        total=len(missing_items),
-        desc="Stage 4/8 SIFT DINO embed",
-        unit="file",
-        delay=PROGRESS_DELAY_SECONDS,
-        smoothing=0.05,
-        dynamic_ncols=True,
-        bar_format=PROGRESS_BAR_FORMAT,
-    )
-    try:
-        for start in range(0, len(missing_items), cfg.sift_candidate_batch_size):
-            batch_items = missing_items[start : start + cfg.sift_candidate_batch_size]
-            vectors = embedder.embed_paths([item.source_path for item in batch_items])
-            for item, vector in zip(batch_items, vectors, strict=True):
-                if vector is None:
-                    failed += 1
-                    continue
-                vector = np.asarray(vector, dtype=np.float32)
-                existing_vectors[item.file_name] = vector
-                rows.append(
-                    {
-                        "id": item.file_name,
-                        "file_name": item.file_name,
-                        "vector": vector.tolist(),
-                    }
-                )
-                added += 1
-                if len(rows) >= SIFT_DINO_ADD_BATCH_SIZE:
-                    table.add(rows)
-                    rows.clear()
-            pbar.update(len(batch_items))
-    finally:
-        pbar.close()
-    if rows:
-        table.add(rows)
-    if added:
-        refresh_ann_index(table, f"{sift_dino_ann_table_name(cfg)}_vec_idx")
-    if failed:
-        print(f"[sift-dino] skipped {failed} masters whose images could not be embedded")
-    return existing_vectors
-
-
-def sift_dino_ann_candidates(
+def sift_clip_ann_candidates(
     table,
     file_name: str,
     vector: np.ndarray,
     topk: int,
-    max_distance: float,
+    eligible_files: set[str],
 ) -> list[str]:
-    rows = table.search(vector).limit(topk + 1).to_list()
+    # Over-fetch because the shared CLIP ANN table also contains videos,
+    # extracted video frames, and pHash duplicates that SIFT does not compare.
+    rows = table.search(vector).limit(max(topk * 16, topk + 1)).to_list()
     candidates: list[str] = []
+    seen: set[str] = set()
     for row in rows:
         candidate = row.get("file_name")
-        if not isinstance(candidate, str) or candidate == file_name:
+        if (
+            not isinstance(candidate, str)
+            or candidate == file_name
+            or candidate not in eligible_files
+            or candidate in seen
+        ):
             continue
-        distance = row.get("_distance")
-        if isinstance(distance, (float, int)) and float(distance) > max_distance:
-            continue
+        seen.add(candidate)
         candidates.append(candidate)
         if len(candidates) >= topk:
             break
@@ -4074,12 +4426,6 @@ def run_sift_master_match_stage(
     records: dict[str, dict[str, Any]],
     media_items: list[MediaItem],
 ) -> set[str]:
-    if not cfg.run_sift_master_match:
-        return set()
-    if not hasattr(cv2, "SIFT_create"):
-        print("[sift] OpenCV SIFT is unavailable; skipping SIFT master matching stage.")
-        return set()
-
     image_paths = build_image_path_map(media_items)
     item_by_name = {item.file_name: item for item in media_items if not item.is_video}
     master_items: list[MediaItem] = []
@@ -4096,52 +4442,83 @@ def run_sift_master_match_stage(
         master_items.append(item)
 
     if not master_items:
-        print("[sift-dino] no eligible image masters; skipping.")
+        report_stage_complete("Stage 5a/9 SIFT CLIP ANN shortlist", 0, "image masters")
+        report_stage_complete("Stage 5b/9 SIFT master match", 0, "image masters")
         return set()
 
-    master_items.sort(key=image_master_sort_key)
-    dino_embedder = DinoImageEmbedder(cfg.sift_candidate_model, cfg.sift_candidate_batch_size)
-    dino_table = load_or_create_sift_dino_ann_table(cfg, dino_embedder.dim)
-    dino_vectors_by_name = ensure_sift_dino_vectors_for_items(
-        cfg,
-        dino_table,
-        master_items,
-        dino_embedder,
+    master_items.sort(key=lambda item: cached_image_master_sort_key(item, records))
+    force = (
+        cfg.rerun_sift_master_match
+        or should_rerun_stage(cfg, "5a")
+        or should_rerun_stage(cfg, "5b")
     )
+    checked_count = sum(
+        1
+        for item in master_items
+        if records.get(item.file_name, {}).get("sift_match_checked") is True
+    )
+    if not cfg.run_sift_master_match and not force:
+        if checked_count == len(master_items):
+            report_stage_complete("Stage 5a/9 SIFT CLIP ANN shortlist", checked_count, "image masters")
+            report_stage_complete("Stage 5b/9 SIFT master match", checked_count, "image masters")
+        else:
+            report_stage_skipped(
+                "Stage 5a/9 SIFT CLIP ANN shortlist",
+                f"{checked_count}/{len(master_items)} image masters complete; "
+                "pass --run-sift-master-match to process unchecked rows",
+            )
+            report_stage_skipped(
+                "Stage 5b/9 SIFT master match",
+                f"{checked_count}/{len(master_items)} image masters complete; "
+                "pass --run-sift-master-match to process unchecked rows",
+            )
+        return set()
+    if not hasattr(cv2, "SIFT_create"):
+        report_stage_skipped("Stage 5a/9 SIFT CLIP ANN shortlist", "OpenCV SIFT is unavailable")
+        report_stage_skipped("Stage 5b/9 SIFT master match", "OpenCV SIFT is unavailable")
+        return set()
+
+    db = lancedb.connect(str(cfg.db_dir))
+    clip_table_name = ann_table_name(cfg.table_name, "clip")
+    if clip_table_name not in db_table_names(db):
+        report_stage_skipped("Stage 5a/9 SIFT CLIP ANN shortlist", "CLIP ANN table is unavailable")
+        report_stage_skipped("Stage 5b/9 SIFT master match", "CLIP ANN table is unavailable")
+        return set()
+    clip_table = db.open_table(clip_table_name)
+    eligible_files = {item.file_name for item in master_items}
 
     changed: set[str] = set()
     upsert_batch: list[dict[str, Any]] = []
     pending = master_items
     print(
-        f"[sift-dino] master-only mode: evaluating {len(pending)} pHash-surviving masters "
-        f"with {cfg.sift_candidate_model} top{cfg.sift_candidate_topk} candidates "
-        f"(max distance {cfg.sift_candidate_max_distance:.3f})"
+        f"[sift-clip] master-only mode: evaluating {len(pending)} pHash-surviving masters "
+        f"with top{cfg.sift_candidate_topk} CLIP candidates"
     )
     jobs: list[tuple[str, str, list[str]]] = []
     total_candidates = 0
     zero_candidate_jobs = 0
     for item in progress(
         pending,
-        desc="Stage 4/8 SIFT DINO ANN shortlist",
+        desc="Stage 5a/9 SIFT CLIP ANN shortlist",
         unit="file",
     ):
         base = records.get(item.file_name)
         if not base:
             continue
-        if not cfg.rerun_sift_master_match and base.get("sift_match_checked") is True:
+        if not force and base.get("sift_match_checked") is True:
             continue
-        query_vector = dino_vectors_by_name.get(item.file_name)
+        query_vector = clip_vector_for_record(base)
         if query_vector is None:
             zero_candidate_jobs += 1
             jobs.append((item.file_name, item.collection_id, []))
             continue
 
-        candidates = sift_dino_ann_candidates(
-            dino_table,
+        candidates = sift_clip_ann_candidates(
+            clip_table,
             item.file_name,
             query_vector,
             cfg.sift_candidate_topk,
-            cfg.sift_candidate_max_distance,
+            eligible_files,
         )
         total_candidates += len(candidates)
         if not candidates:
@@ -4149,10 +4526,13 @@ def run_sift_master_match_stage(
         jobs.append((item.file_name, item.collection_id, candidates))
 
     if not jobs:
+        report_stage_complete("Stage 5a/9 SIFT CLIP ANN shortlist", len(master_items), "image masters")
+        report_stage_complete("Stage 5b/9 SIFT master match", len(master_items), "image masters")
         return changed
+    report_stage_complete("Stage 5a/9 SIFT CLIP ANN shortlist", len(master_items), "image masters")
     avg_candidates = total_candidates / max(1, len(jobs))
     print(
-        f"[sift-dino] candidate shortlist ready for {len(jobs)} masters; "
+        f"[sift-clip] candidate shortlist ready for {len(jobs)} masters; "
         f"{total_candidates} SIFT candidate pairs, avg {avg_candidates:.2f}/master, "
         f"{zero_candidate_jobs} with no candidates"
     )
@@ -4187,7 +4567,7 @@ def run_sift_master_match_stage(
 
         pbar = HumanTqdm(
             total=len(jobs),
-            desc="Stage 4/8 SIFT master match",
+            desc=format_stage_label("Stage 5b/9 SIFT master match", stream=sys.stderr),
             unit="file",
             delay=PROGRESS_DELAY_SECONDS,
             smoothing=0.05,
@@ -4204,7 +4584,7 @@ def run_sift_master_match_stage(
                     try:
                         best_match, best_metrics = future.result()
                     except Exception as exc:
-                        print(f"[sift] failed: {file_name}: {exc}")
+                        print_error(f"[sift] failed: {file_name}: {exc}")
                         best_match = None
                         best_metrics = None
                     results[file_name] = (best_match, best_metrics)
@@ -4260,20 +4640,16 @@ def run_sift_master_match_stage(
     for name in scope_names:
         groups.setdefault(uf_find(name), []).append(name)
 
-    dimension_cache: dict[str, tuple[int, int]] = {}
-
     def image_rank(name: str) -> tuple[int, int, int, int, str]:
         path = image_paths.get(name)
         if path is None:
             return (0, 0, 0, 0, name)
-        dims = dimension_cache.get(name)
-        if dims is None:
-            dims = safe_image_dimensions(path)
-            dimension_cache[name] = dims
-        width, height = dims
+        record = records.get(name) or {}
+        width = int(record.get("image_width") or 0)
+        height = int(record.get("image_height") or 0)
         max_side = max(width, height)
         area = width * height
-        file_size = safe_file_size(path)
+        file_size = int(record.get("source_size") or 0)
         non_thumb = 1 if not is_likely_thumbnail(path) else 0
         return (max_side, area, file_size, non_thumb, name)
 
@@ -4354,6 +4730,7 @@ def run_sift_master_match_stage(
             append_stage_upsert(table, records, upsert_batch, base)
             changed.add(file_name)
     upsert_records_batch(table, records, upsert_batch)
+    report_stage_complete("Stage 5b/9 SIFT master match", len(master_items), "image masters")
     return changed
 
 
@@ -4437,9 +4814,16 @@ def safe_vector(vec: Any, expected_dim: int) -> list[float] | None:
         return None
 
 
+def iter_file_names_for_ann(file_names: set[str], desc: str) -> Iterable[str]:
+    sorted_names = sorted(file_names)
+    if len(sorted_names) >= 100:
+        return progress(sorted_names, desc=desc, unit="file")
+    return sorted_names
+
+
 def build_face_ann_rows(records: dict[str, dict[str, Any]], file_names: set[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for file_name in sorted(file_names):
+    for file_name in iter_file_names_for_ann(file_names, "Stage 9a/9 Face search index build rows"):
         rec = records.get(file_name)
         if not rec:
             continue
@@ -4472,7 +4856,7 @@ def build_clip_ann_rows(
 ) -> tuple[list[dict[str, Any]], int | None]:
     rows: list[dict[str, Any]] = []
     dim = expected_dim
-    for file_name in sorted(file_names):
+    for file_name in iter_file_names_for_ann(file_names, "Stage 9b/9 CLIP search index build rows"):
         rec = records.get(file_name)
         if not rec:
             continue
@@ -4520,7 +4904,7 @@ def collect_ocr_entries(
     file_names: set[str],
 ) -> list[tuple[str, float, str]]:
     entries: list[tuple[str, float, str]] = []
-    for file_name in sorted(file_names):
+    for file_name in iter_file_names_for_ann(file_names, "Stage 9c/9 OCR text search index collect text"):
         rec = records.get(file_name)
         if not rec:
             continue
@@ -4538,16 +4922,15 @@ def collect_ocr_entries(
     return entries
 
 
-def build_ocr_ann_rows(
-    records: dict[str, dict[str, Any]],
-    file_names: set[str],
+def build_ocr_ann_rows_from_entries(
+    entries: list[tuple[str, float, str]],
     embedder: TextEmbedder,
     expected_dim: int | None = None,
 ) -> tuple[list[dict[str, Any]], int | None]:
-    entries = collect_ocr_entries(records, file_names)
     if not entries:
         return [], expected_dim
 
+    print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: embedding {len(entries)} OCR text entries")
     texts = [entry[2] for entry in entries]
     vectors = embedder.embed(texts)
     if not vectors:
@@ -4555,7 +4938,10 @@ def build_ocr_ann_rows(
 
     dim = expected_dim if expected_dim is not None else len(vectors[0])
     rows: list[dict[str, Any]] = []
-    for i, (file_name, ts, text) in enumerate(entries):
+    row_iter = enumerate(entries)
+    if len(entries) >= 100:
+        row_iter = progress(row_iter, desc="Stage 9c/9 OCR text search index build rows", unit="row", total=len(entries))
+    for i, (file_name, ts, text) in row_iter:
         vec = vectors[i]
         clean = safe_vector(vec, dim)
         if clean is None:
@@ -4572,8 +4958,13 @@ def build_ocr_ann_rows(
     return rows, dim
 
 
-def delete_ann_rows_for_files(table, file_names: set[str]) -> None:
-    for file_name in sorted(file_names):
+def delete_ann_rows_for_files(table, file_names: set[str], label: str = "Stage 9/9 Search index sync delete rows") -> None:
+    iterator: Iterable[str]
+    if len(file_names) >= 100:
+        iterator = progress(sorted(file_names), desc=label, unit="file")
+    else:
+        iterator = sorted(file_names)
+    for file_name in iterator:
         table.delete(f"file_name = '{escape_sql(file_name)}'")
 
 
@@ -4585,20 +4976,20 @@ def delete_ann_rows_for_files_from_all_ann(cfg: AppConfig, file_names: set[str])
         ann_table_name(cfg.table_name, "face"),
         ann_table_name(cfg.table_name, "clip"),
         ann_table_name(cfg.table_name, "ocr"),
-        sift_dino_ann_table_name(cfg),
     ):
         if table_name not in db_table_names(db):
             continue
         table = db.open_table(table_name)
-        delete_ann_rows_for_files(table, file_names)
+        delete_ann_rows_for_files(table, file_names, label=f"Stage 9/9 Search index sync {table_name} delete rows")
 
 
-def ensure_ann_index(table, index_name: str) -> None:
+def ensure_ann_index(table, index_name: str, stage_label: str) -> None:
     if table.to_arrow().num_rows == 0:
         return
     index_names = {index.name for index in table.list_indices()}
     if index_name in index_names:
         return
+    print_info(f"{format_stage_label(stage_label)}: building vector index")
     table.create_index(
         vector_column_name="vector",
         metric=ANN_DISTANCE_METRIC,
@@ -4607,19 +4998,7 @@ def ensure_ann_index(table, index_name: str) -> None:
         name=index_name,
     )
     table.wait_for_index([index_name])
-
-
-def refresh_ann_index(table, index_name: str) -> None:
-    if table.to_arrow().num_rows == 0:
-        return
-    table.create_index(
-        vector_column_name="vector",
-        metric=ANN_DISTANCE_METRIC,
-        index_type=ANN_INDEX_TYPE,
-        replace=True,
-        name=index_name,
-    )
-    table.wait_for_index([index_name])
+    print_info(f"{format_stage_label(stage_label)}: vector index ready")
 
 
 def sync_face_ann_table(
@@ -4630,12 +5009,17 @@ def sync_face_ann_table(
 ) -> None:
     table_name = ann_table_name(base_table_name, "face")
     schema = make_face_ann_schema(FACE_VECTOR_DIM)
-    table, _ = ensure_ann_table(db, table_name, schema)
-    delete_ann_rows_for_files(table, target_file_names)
+    table, recreated = ensure_ann_table(db, table_name, schema)
+    print_info(f"{format_stage_label('Stage 9a/9 Face search index sync')}: syncing {len(target_file_names)} files")
+    if recreated:
+        print_info(f"{format_stage_label('Stage 9a/9 Face search index sync')}: {table_name} was created/recreated; skipping delete pass")
+    else:
+        delete_ann_rows_for_files(table, target_file_names, label="Stage 9a/9 Face search index delete stale rows")
     rows = build_face_ann_rows(records, target_file_names)
     if rows:
+        print_info(f"{format_stage_label('Stage 9a/9 Face search index sync')}: adding {len(rows)} face vectors")
         table.add(rows)
-    ensure_ann_index(table, f"{table_name}_vec_idx")
+    ensure_ann_index(table, f"{table_name}_vec_idx", "Stage 9a/9 Face search index sync")
 
 
 def sync_clip_ann_table(
@@ -4649,6 +5033,7 @@ def sync_clip_ann_table(
     existing_dim = get_fixed_vector_dim(table.schema) if table is not None else None
     target_dim = infer_clip_vector_dim(records, target_file_names)
     if existing_dim is not None and target_dim is not None and target_dim != existing_dim:
+        print_info(f"{format_stage_label('Stage 9b/9 CLIP search index sync')}: recreating {table_name}; vector dimension changed {existing_dim} -> {target_dim}")
         db.drop_table(table_name)
         table = None
         existing_dim = None
@@ -4658,11 +5043,16 @@ def sync_clip_ann_table(
         return
 
     schema = make_clip_ann_schema(dim)
-    table, _ = ensure_ann_table(db, table_name, schema)
-    delete_ann_rows_for_files(table, target_file_names)
+    table, recreated = ensure_ann_table(db, table_name, schema)
+    print_info(f"{format_stage_label('Stage 9b/9 CLIP search index sync')}: syncing {len(target_file_names)} files")
+    if recreated:
+        print_info(f"{format_stage_label('Stage 9b/9 CLIP search index sync')}: {table_name} was created/recreated; skipping delete pass")
+    else:
+        delete_ann_rows_for_files(table, target_file_names, label="Stage 9b/9 CLIP search index delete stale rows")
     if rows:
+        print_info(f"{format_stage_label('Stage 9b/9 CLIP search index sync')}: adding {len(rows)} CLIP vectors")
         table.add(rows)
-    ensure_ann_index(table, f"{table_name}_vec_idx")
+    ensure_ann_index(table, f"{table_name}_vec_idx", "Stage 9b/9 CLIP search index sync")
 
 
 def sync_ocr_ann_table(
@@ -4680,9 +5070,13 @@ def sync_ocr_ann_table(
         return
     if not entries and existing_dim is not None:
         schema = make_ocr_ann_schema(existing_dim)
-        table, _ = ensure_ann_table(db, table_name, schema)
-        delete_ann_rows_for_files(table, target_file_names)
-        ensure_ann_index(table, f"{table_name}_vec_idx")
+        table, recreated = ensure_ann_table(db, table_name, schema)
+        print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: clearing rows for {len(target_file_names)} files")
+        if recreated:
+            print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: {table_name} was created/recreated; skipping delete pass")
+        else:
+            delete_ann_rows_for_files(table, target_file_names, label="Stage 9c/9 OCR text search index delete stale rows")
+        ensure_ann_index(table, f"{table_name}_vec_idx", "Stage 9c/9 OCR text search index sync")
         return
 
     embedder = TextEmbedder(cfg.ocr_text_model, cfg.ann_text_batch_size, cfg.ocr_text_device)
@@ -4692,6 +5086,7 @@ def sync_ocr_ann_table(
     else:
         target_dim = None
     if existing_dim is not None and target_dim is not None and target_dim != existing_dim:
+        print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: recreating {table_name}; vector dimension changed {existing_dim} -> {target_dim}")
         db.drop_table(table_name)
         table = None
         existing_dim = None
@@ -4706,11 +5101,16 @@ def sync_ocr_ann_table(
         return
 
     schema = make_ocr_ann_schema(dim)
-    table, _ = ensure_ann_table(db, table_name, schema)
-    delete_ann_rows_for_files(table, target_file_names)
+    table, recreated = ensure_ann_table(db, table_name, schema)
+    print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: syncing {len(target_file_names)} files")
+    if recreated:
+        print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: {table_name} was created/recreated; skipping delete pass")
+    else:
+        delete_ann_rows_for_files(table, target_file_names, label="Stage 9c/9 OCR text search index delete stale rows")
     if rows:
+        print_info(f"{format_stage_label('Stage 9c/9 OCR text search index sync')}: adding {len(rows)} OCR text vectors")
         table.add(rows)
-    ensure_ann_index(table, f"{table_name}_vec_idx")
+    ensure_ann_index(table, f"{table_name}_vec_idx", "Stage 9c/9 OCR text search index sync")
 
 
 def sync_ann_indexes(
@@ -4721,12 +5121,29 @@ def sync_ann_indexes(
     if not records:
         return
     db = lancedb.connect(str(cfg.db_dir))
-    target_file_names = set(records.keys()) if ann_tables_missing(db, cfg.table_name, records) else changed_file_names
-    if not target_file_names:
+    missing_tables = missing_ann_tables(db, cfg.table_name, records)
+    all_file_names = set(records.keys())
+    if not changed_file_names and not missing_tables:
+        print_info(f"{format_stage_label('Stage 9/9 Search index sync')}: complete; no changed rows")
         return
-    sync_face_ann_table(db, cfg.table_name, records, target_file_names)
-    sync_clip_ann_table(db, cfg.table_name, records, target_file_names)
-    sync_ocr_ann_table(db, cfg, cfg.table_name, records, target_file_names)
+    if missing_tables:
+        print_info(f"{format_stage_label('Stage 9/9 Search index sync')}: missing side tables: " + ", ".join(sorted(missing_tables)))
+    else:
+        print_info(f"{format_stage_label('Stage 9/9 Search index sync')}: incremental update for {len(changed_file_names)} files")
+
+    face_table = ann_table_name(cfg.table_name, "face")
+    clip_table = ann_table_name(cfg.table_name, "clip")
+    ocr_table = ann_table_name(cfg.table_name, "ocr")
+    face_targets = all_file_names if face_table in missing_tables else changed_file_names
+    clip_targets = all_file_names if clip_table in missing_tables else changed_file_names
+    ocr_targets = all_file_names if ocr_table in missing_tables else changed_file_names
+    if face_targets:
+        sync_face_ann_table(db, cfg.table_name, records, face_targets)
+    if clip_targets:
+        sync_clip_ann_table(db, cfg.table_name, records, clip_targets)
+    if ocr_targets:
+        sync_ocr_ann_table(db, cfg, cfg.table_name, records, ocr_targets)
+    print_info(f"{format_stage_label('Stage 9/9 Search index sync')}: complete")
 
 
 def has_searchable_ocr_text(records: dict[str, dict[str, Any]]) -> bool:
@@ -4741,6 +5158,10 @@ def has_searchable_ocr_text(records: dict[str, dict[str, Any]]) -> bool:
 
 
 def ann_tables_missing(db, base_table_name: str, records: dict[str, dict[str, Any]]) -> bool:
+    return bool(missing_ann_tables(db, base_table_name, records))
+
+
+def missing_ann_tables(db, base_table_name: str, records: dict[str, dict[str, Any]]) -> set[str]:
     required = {
         ann_table_name(base_table_name, "face"),
         ann_table_name(base_table_name, "clip"),
@@ -4748,7 +5169,7 @@ def ann_tables_missing(db, base_table_name: str, records: dict[str, dict[str, An
     if has_searchable_ocr_text(records):
         required.add(ann_table_name(base_table_name, "ocr"))
     existing = db_table_names(db)
-    return not required.issubset(existing)
+    return required - existing
 
 
 def main() -> None:
@@ -4756,19 +5177,21 @@ def main() -> None:
     if not cfg.input_dir.exists() or not cfg.input_dir.is_dir():
         raise RuntimeError(f"Input directory does not exist or is not a directory: {cfg.input_dir}")
 
-    media_paths = discover_media_files(cfg.input_dir)
+    with TimedStep(f"scan media under {cfg.input_dir}"):
+        media_paths = discover_media_files(cfg.input_dir)
     if not media_paths:
         print("No supported photos/videos found.")
         return
 
     image_paths, video_paths = split_media(media_paths)
+    print_info(f"{format_stage_label('Stage 0a/9 Startup scan media files')}: media split: {len(image_paths)} images, {len(video_paths)} videos")
     table = connect_table(cfg.db_dir, cfg.table_name)
     records = load_records(table)
     migrate_legacy_records_for_scan(cfg, table, records, media_paths)
 
     if cfg.repair_only:
         media_items = build_media_items(cfg, image_paths, [], {})
-        changed_file_names = run_phash_gate_stage(cfg, table, records, media_items)
+        changed_file_names = run_phash_gate_stage(cfg, table, records, media_items, [], {})
         cleared_processing: set[str] = set()
         if cfg.repair_image_masters:
             repair_changed, cleared_processing = repair_image_masters(cfg, table, records, media_items)
@@ -4784,41 +5207,81 @@ def main() -> None:
     _, video_frame_map = extract_video_stills(cfg, video_paths, records)
     media_items = build_media_items(cfg, image_paths, video_paths, video_frame_map)
     if not media_items:
+        report_stage_complete("Stage 3a/9 cached image metadata", 0, "images")
+        report_stage_complete("Stage 3b/9 pHash images", 0, "files")
+        report_stage_complete("Stage 3d/9 apply image pHash groups", 0, "files")
+        changed_file_names |= run_video_frame_phash_stage(
+            cfg,
+            table,
+            records,
+            video_paths,
+            video_frame_map,
+        )
+        changed_file_names |= run_cross_media_match_stage(
+            cfg,
+            table,
+            records,
+            image_paths,
+            video_paths,
+        )
         db = lancedb.connect(str(cfg.db_dir))
         if ann_tables_missing(db, cfg.table_name, records):
-            sync_ann_indexes(cfg, records, changed_file_names=set(records.keys()))
+            sync_ann_indexes(cfg, records, changed_file_names=set())
             print("No new media required processing. ANN indexes were backfilled from existing records.")
         else:
             print("No new or incomplete media items require processing.")
+        report_stage_complete("Stage 4/9 CLIP images and video stills", 0, "files")
+        report_stage_complete("Stage 5a/9 SIFT CLIP ANN shortlist", 0, "image masters")
+        report_stage_complete("Stage 5b/9 SIFT master match", 0, "image masters")
+        report_stage_complete("Stage 6/9 Faces", 0, "files")
+        if cfg.skip_paddle_ocr and not should_rerun_stage(cfg, "7"):
+            report_stage_skipped("Stage 7/9 PaddleOCR", "--skip-paddle-ocr was requested")
+        else:
+            report_stage_complete("Stage 7/9 PaddleOCR", 0, "files")
+        report_stage_complete("Stage 8/9 EasyOCR", 0, "files")
         return
 
-    changed_file_names |= run_phash_gate_stage(cfg, table, records, media_items)
+    changed_file_names |= run_phash_gate_stage(
+        cfg,
+        table,
+        records,
+        media_items,
+        video_paths,
+        video_frame_map,
+    )
     changed_file_names |= run_cross_media_match_stage(
         cfg,
         table,
         records,
         image_paths,
         video_paths,
-        video_frame_map,
     )
     if cfg.repair_image_masters:
         repair_changed, cleared_processing = repair_image_masters(cfg, table, records, media_items)
         changed_file_names |= repair_changed
         delete_ann_rows_for_files_from_all_ann(cfg, cleared_processing)
+    clip_changed = run_clip_stage(cfg, table, records, media_items)
+    changed_file_names |= clip_changed
+    db = lancedb.connect(str(cfg.db_dir))
+    clip_table_name = ann_table_name(cfg.table_name, "clip")
+    clip_sync_files = set(records.keys()) if clip_table_name not in db_table_names(db) else clip_changed
+    if clip_sync_files:
+        sync_clip_ann_table(db, cfg.table_name, records, clip_sync_files)
     changed_file_names |= run_sift_master_match_stage(cfg, table, records, media_items)
-    run_face_stage(cfg, table, records, media_items)
-    run_clip_stage(cfg, table, records, media_items)
+    changed_file_names |= run_face_stage(cfg, table, records, media_items)
     if cfg.wipe_paddle_failures_before_run:
         reset_count = wipe_failed_paddle_rows_for_run(table, records, media_items)
         if reset_count > 0:
             print(f"[paddle] cleared {reset_count} previously failed paddle_ocr rows for this run")
-    if not cfg.skip_paddle_ocr:
-        run_paddle_detection_stage(cfg, table, records, media_items)
-    run_easyocr_stage(cfg, table, records, media_items)
+    if not cfg.skip_paddle_ocr or should_rerun_stage(cfg, "7"):
+        changed_file_names |= run_paddle_detection_stage(cfg, table, records, media_items)
+    else:
+        report_stage_skipped("Stage 7/9 PaddleOCR", "--skip-paddle-ocr was requested")
+    changed_file_names |= run_easyocr_stage(cfg, table, records, media_items)
     sync_ann_indexes(
         cfg,
         records,
-        changed_file_names=changed_file_names | {item.file_name for item in media_items},
+        changed_file_names=changed_file_names,
     )
     print_summary(records, media_items)
 
