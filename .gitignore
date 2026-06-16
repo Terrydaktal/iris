@@ -47,5 +47,8 @@ thumb_phash_results.txt
 failure_report*.json
 failure_report*.txt
 
+# Local generated scratch images
+ChatGPT Image*.png
+
 # Generated extracted video still folders, when created inside the repo.
 *-video/

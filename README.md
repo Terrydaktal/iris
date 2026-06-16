@@ -57,15 +57,15 @@ The Python indexing pipeline that builds and updates the LanceDB database. It ha
 
 - Collection-aware media indexing using `<collection_id>/<relative/path>` file keys.
 - Collection root mapping through the `collection_roots` table.
-- VideoHash for videos.
-- PySceneDetect still extraction for videos.
-- Image pHash and video-still pHash generation.
+- A custom OpenCV video hash built from 16 sampled 64-bit DCT pHashes.
+- PySceneDetect `ContentDetector` still extraction through the OpenCV backend.
+- Custom OpenCV 64-bit DCT pHash generation for images and video stills.
 - Cross-media image-to-video and video-to-image relationships when an image matches a video still.
-- CLIP embeddings for images and video stills.
-- SIFT duplicate grouping using CLIP ANN candidates.
-- Face detection and embeddings.
-- PaddleOCR text detection and EasyOCR text extraction.
-- Face, CLIP, and OCR text ANN side tables for Iris search.
+- OpenCLIP image embeddings using `hf-hub:timm/ViT-L-16-SigLIP2-384` by default.
+- OpenCV SIFT duplicate grouping using SigLIP2 ANN candidates.
+- InsightFace `buffalo_l` face detection and ArcFace-compatible 512-dimensional embeddings.
+- PaddleOCR `PP-OCRv5_mobile_det` text detection and EasyOCR text extraction.
+- LanceDB `IVF_HNSW_SQ` cosine indexes for face, CLIP/SigLIP2, and OCR text search.
 
 See [tools/media_indexer/README.md](tools/media_indexer/README.md) for the full indexing pipeline and stage details.
 
@@ -161,34 +161,48 @@ Use stable collection ids. Iris resolves database paths such as `my_collection/s
 
 ## Indexing Stages
 
-The media indexer prints numbered stages and completion status. Current stages are:
+The media indexer prints numbered stages and completion status. The concrete implementation used by every stage is:
 
-- `Stage 0a/9`: startup scan media files.
-- `Stage 0b/9`: split images and videos.
-- `Stage 0c/9`: open LanceDB table and check schema.
-- `Stage 0d/9`: ensure `file_name` scalar index.
-- `Stage 0e/9`: load DB rows into memory.
-- `Stage 0f/9`: normalize DB rows.
-- `Stage 0g/9`: check legacy DB keys.
-- `Stage 0h/9`: migrate legacy DB keys if needed.
-- `Stage 1a/9`: VideoHash videos.
-- `Stage 1b/9`: apply VideoHash groups.
-- `Stage 2/9`: PySceneDetect video still extraction.
-- `Stage 3a/9`: cached image metadata.
-- `Stage 3b/9`: image pHash.
-- `Stage 3c/9`: video-still pHash.
-- `Stage 3d/9`: apply image pHash groups.
-- `Stage 3e/9`: image-to-video-frame matching.
-- `Stage 3f/9`: video-frame-to-image matching.
-- `Stage 4/9`: CLIP embeddings for images and video stills.
-- `Stage 5a/9`: SIFT CLIP ANN shortlist.
-- `Stage 5b/9`: SIFT master match.
-- `Stage 6/9`: faces.
-- `Stage 7/9`: PaddleOCR text detection.
-- `Stage 8/9`: EasyOCR text extraction.
-- `Stage 9/9`: search-index sync for Face, CLIP, and OCR ANN tables.
+| Stage | Purpose | Model, algorithm, or tool |
+| --- | --- | --- |
+| `0a` | Scan media files | Python `Path.rglob` filesystem traversal and supported-extension filtering |
+| `0b` | Split images and videos | Extension-based classification |
+| `0c` | Open/check the database | LanceDB with a PyArrow schema; creates or migrates `media_index` |
+| `0d` | Ensure the file-name index | LanceDB scalar index on `file_name` |
+| `0e` | Load database rows | LanceDB/Apache Arrow table read |
+| `0f` | Normalize rows | Python schema normalization into the in-memory record map |
+| `0g` | Check legacy keys | Filesystem-to-database key comparison |
+| `0h` | Migrate legacy keys | LanceDB row delete/upsert migration |
+| `1a` | Hash videos | Iris custom VideoHash: OpenCV `VideoCapture`, up to 16 evenly spaced frames, a custom 64-bit DCT pHash per frame, then per-bit majority vote |
+| `1b` | Apply video duplicate groups | Hamming-distance BK-tree; default duplicate threshold `80%` |
+| `2` | Extract video stills | PySceneDetect `ContentDetector` using the OpenCV backend; defaults: threshold `27`, minimum scene length `15`, scene-midpoint JPEGs, maximum `100` stills per video |
+| `3a` | Cache image metadata | Filesystem stat plus Pillow dimensions |
+| `3b` | Hash images | Iris custom OpenCV 64-bit DCT pHash: grayscale, `32x32`, DCT, median threshold over the low-frequency `8x8` block |
+| `3c` | Hash video stills | The same custom 64-bit DCT pHash used by Stage `3b` |
+| `3d` | Apply image pHash groups | Hamming-distance BK-tree; default threshold `95%`; prefers the highest-resolution image as group master |
+| `3e` | Match images to video frames | BK-tree comparison of image pHashes against extracted-video-still pHashes; default threshold `95%` |
+| `3f` | Match video frames to images | Reverse BK-tree comparison using the same pHashes and cross-media threshold |
+| `4a` | Embed images and video stills | OpenCLIP `model.encode_image` on CUDA; default model `hf-hub:timm/ViT-L-16-SigLIP2-384`; output vectors are mean-pooled when needed and L2-normalized; default batch size `8` |
+| `4b` | Build/delete CLIP/SigLIP2 ANN rows | LanceDB side-table sync for changed rows, or a full rebuild when the ANN table is missing/recreated |
+| `4c` | Build/finalize the CLIP/SigLIP2 ANN index | LanceDB `IVF_HNSW_SQ` vector index with cosine distance |
+| `5a` | Shortlist SIFT candidates | LanceDB cosine search over the Stage `4b` SigLIP2 index; default top `64` eligible image masters |
+| `5b` | Verify and group SIFT matches | OpenCV SIFT, L2 brute-force KNN matcher, Lowe ratio test, and homography RANSAC; defaults: ratio `0.75`, minimum `10` inliers, minimum inlier ratio `0.75` |
+| `6a` | Detect and embed faces | InsightFace `buffalo_l` detection/recognition through ONNX Runtime CUDA; normalized 512-dimensional ArcFace-compatible vectors, with rotation and larger-detector fallback |
+| `6b` | Build/delete face ANN rows | LanceDB side-table sync for changed rows, or a full rebuild when the ANN table is missing/recreated |
+| `6c` | Build/finalize the face ANN index | LanceDB `IVF_HNSW_SQ` vector index with cosine distance |
+| `7` | Detect whether text exists | PaddleOCR `TextDetection`; default model `PP-OCRv5_mobile_det`, default device `gpu:0` |
+| `8a` | Extract detected text | EasyOCR; default language `en`, default device CUDA, with reduced-GPU then per-frame CPU fallback after CUDA failure |
+| `8b` | Build/delete OCR ANN rows | SentenceTransformers `sentence-transformers/all-MiniLM-L6-v2` on CUDA by default; LanceDB side-table sync for changed text rows, or a full rebuild when the ANN table is missing/recreated |
+| `8c` | Build/finalize the OCR ANN index | LanceDB `IVF_HNSW_SQ` vector index with cosine distance |
 
-Most stages are incremental. Completed rows are skipped unless a rerun flag is used. Cross-media work writes a resumable work file before final DB application, so a crash during DB upsert can resume from saved `3e`/`3f` results.
+Most stages are incremental. Completed rows are skipped unless a rerun flag is used. Cross-media work writes a resumable work file before final DB application, so a crash during DB upsert can resume from saved `3e`/`3f` results. Search-index sync is also incremental: CLIP, face, and OCR ANN side tables update immediately after the stage that produces their source data, and missing ANN side tables are rebuilt in the relevant `4b`/`4c`, `6b`/`6c`, or `8b`/`8c` stage rather than by a separate final stage.
+
+The application calls Stage `4a` and its search mode "CLIP," but its default image
+embedder is specifically SigLIP2, loaded with
+`open_clip.create_model_and_transforms`. Iris text-to-image search uses an ONNX export
+of the text tower from the same default SigLIP2 model, stored under
+`tools/media_indexer/models/clip-text`. On-demand image and face embedding also imports
+the same OpenCLIP and InsightFace implementations from the media indexer.
 
 Force a stage to rerun:
 

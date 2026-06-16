@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Receiver;
@@ -1160,6 +1161,128 @@ struct SimilarFile {
     similarity_pct: Option<f32>,
 }
 
+#[derive(Clone)]
+struct VideoFramePhash {
+    timestamp_sec: f32,
+    phash: u64,
+}
+
+fn parse_phash_hex(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(value, 16).ok()
+}
+
+fn phash_similarity_pct(a: u64, b: u64) -> f32 {
+    (64 - (a ^ b).count_ones()) as f32 * 100.0 / 64.0
+}
+
+fn similarity_to_active(
+    active_file: &str,
+    candidate_file: &str,
+    phash_by_file: &HashMap<String, u64>,
+    video_frame_phashes_by_file: &HashMap<String, Vec<VideoFramePhash>>,
+) -> Option<f32> {
+    let active_frames = video_frame_phashes_by_file.get(active_file);
+    let candidate_frames = video_frame_phashes_by_file.get(candidate_file);
+    match (active_frames, candidate_frames) {
+        (Some(_), Some(_)) => {
+            let active_hash = phash_by_file.get(active_file)?;
+            let candidate_hash = phash_by_file.get(candidate_file)?;
+            Some(phash_similarity_pct(*active_hash, *candidate_hash))
+        }
+        (Some(frames), None) => {
+            let candidate_hash = phash_by_file.get(candidate_file)?;
+            frames
+                .iter()
+                .map(|frame| phash_similarity_pct(frame.phash, *candidate_hash))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        }
+        (None, Some(frames)) => {
+            let active_hash = phash_by_file.get(active_file)?;
+            frames
+                .iter()
+                .map(|frame| phash_similarity_pct(*active_hash, frame.phash))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        }
+        (None, None) => {
+            let active_hash = phash_by_file.get(active_file)?;
+            let candidate_hash = phash_by_file.get(candidate_file)?;
+            Some(phash_similarity_pct(*active_hash, *candidate_hash))
+        }
+    }
+}
+
+fn duplicate_database_detail_lines(
+    file_name: &str,
+    reference_file: &str,
+    is_video: bool,
+    phash_by_file: &HashMap<String, u64>,
+    video_frame_phashes_by_file: &HashMap<String, Vec<VideoFramePhash>>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("Reference: {reference_file}"));
+    match phash_by_file.get(file_name) {
+        Some(hash) => lines.push(format!(
+            "{}: {:016x}",
+            if is_video { "VideoHash" } else { "pHash" },
+            hash
+        )),
+        None => lines.push(format!(
+            "{}: not stored",
+            if is_video { "VideoHash" } else { "pHash" }
+        )),
+    }
+
+    if is_video {
+        let frames = video_frame_phashes_by_file.get(file_name);
+        lines.push(format!("Video still pHashes: {}", frames.map_or(0, Vec::len)));
+        if let (Some(frames), Some(reference_hash)) = (frames, phash_by_file.get(reference_file)) {
+            if let Some(best) = frames.iter().max_by(|a, b| {
+                phash_similarity_pct(a.phash, *reference_hash)
+                    .partial_cmp(&phash_similarity_pct(b.phash, *reference_hash))
+                    .unwrap_or(Ordering::Equal)
+            }) {
+                lines.push(format!(
+                    "Best still vs reference: {:.3}s | pHash {:016x} | {:.2}%",
+                    best.timestamp_sec,
+                    best.phash,
+                    phash_similarity_pct(best.phash, *reference_hash)
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn draw_embedding_markers(ui: &mut egui::Ui, has_clip: bool, has_ocr: bool, skipped: bool) {
+    let missing_color = if skipped { egui::Color32::GRAY } else { egui::Color32::YELLOW };
+    ui.colored_label(
+        if has_clip { egui::Color32::LIGHT_GREEN } else { missing_color },
+        "C",
+    )
+    .on_hover_text(if has_clip {
+        "CLIP embedded"
+    } else if skipped {
+        "CLIP not embedded: skipped as a pHash similar"
+    } else {
+        "CLIP not embedded: processing incomplete or failed"
+    });
+    ui.colored_label(
+        if has_ocr { egui::Color32::LIGHT_GREEN } else { missing_color },
+        "O",
+    )
+    .on_hover_text(if has_ocr {
+        "OCR embedded"
+    } else if skipped {
+        "OCR not embedded: skipped as a pHash similar"
+    } else {
+        "OCR has no searchable text, processing is incomplete, or processing failed"
+    });
+}
+
 #[derive(Clone, Default)]
 struct SiftInfo {
     match_file: Option<String>,
@@ -1180,11 +1303,16 @@ struct DatabaseIndices {
     clip_index: Arc<ClipIndex>,
     face_index: Arc<FaceIndex>,
     ocr_index: Arc<OcrIndex>,
+    clip_embedded_files: Arc<HashSet<String>>,
+    ocr_embedded_files: Arc<HashSet<String>>,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
     phash_master_by_file: HashMap<String, String>,
+    phash_by_file: HashMap<String, u64>,
+    video_frame_phashes_by_file: HashMap<String, Vec<VideoFramePhash>>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
+    skipped_processing_files: Arc<HashSet<String>>,
     basename_to_db_filename: HashMap<String, String>,
     encoder: ClipTextEncoder,
 }
@@ -1192,11 +1320,15 @@ struct DatabaseIndices {
 struct SupplementalDbData {
     face_index: FaceIndex,
     ocr_index: OcrIndex,
+    ocr_embedded_files: HashSet<String>,
     similar_by_master: HashMap<String, Vec<SimilarFile>>,
     phash_master_by_file: HashMap<String, String>,
+    phash_by_file: HashMap<String, u64>,
+    video_frame_phashes_by_file: HashMap<String, Vec<VideoFramePhash>>,
     sift_info_by_file: HashMap<String, SiftInfo>,
     sift_root_by_file: HashMap<String, String>,
     sift_members_by_root: HashMap<String, Vec<String>>,
+    skipped_processing_files: HashSet<String>,
 }
 
 enum DatabaseLoadMessage {
@@ -1251,6 +1383,8 @@ async fn load_supplemental_database_indices(
         "ocr_groups",
         "dedupe_match_file",
         "dedupe_similarity_pct",
+        "phash_hex",
+        "video_frame_phashes",
         "sift_match_file",
         "sift_match_score",
         "sift_match_inliers",
@@ -1276,9 +1410,12 @@ async fn load_supplemental_database_indices(
 
     let mut similar_by_master: HashMap<String, Vec<SimilarFile>> = HashMap::new();
     let mut phash_master_by_file: HashMap<String, String> = HashMap::new();
+    let mut phash_by_file: HashMap<String, u64> = HashMap::new();
+    let mut video_frame_phashes_by_file: HashMap<String, Vec<VideoFramePhash>> = HashMap::new();
     let mut sift_info_by_file: HashMap<String, SiftInfo> = HashMap::new();
     let mut master_images = HashSet::new();
     let mut direct_root_by_file: HashMap<String, String> = HashMap::new();
+    let mut skipped_processing_files = HashSet::new();
 
     for batch in &batches {
         // Parse Face
@@ -1292,9 +1429,54 @@ async fn load_supplemental_database_indices(
         let is_video = bool_col(batch, "is_video")?;
         let dedupe_match = string_col(batch, "dedupe_match_file")?;
         let similarity_col = batch.column_by_name("dedupe_similarity_pct");
+        let phash_hex = string_col(batch, "phash_hex")?;
+        let video_frame_phashes = list_col(batch, "video_frame_phashes")?;
         let cross_media_matches = batch
             .column_by_name("cross_media_matches")
             .and_then(|column| column.as_any().downcast_ref::<ListArray>());
+
+        for row in 0..batch.num_rows() {
+            if file_names.is_null(row) {
+                continue;
+            }
+            let file_name = file_names.value(row).to_string();
+            if !phash_hex.is_null(row) {
+                if let Some(hash) = parse_phash_hex(phash_hex.value(row)) {
+                    phash_by_file.insert(file_name.clone(), hash);
+                }
+            }
+            if !video_frame_phashes.is_null(row) {
+                let groups_any = video_frame_phashes.value(row);
+                let groups = groups_any
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| anyhow!("video_frame_phashes value is not a struct array"))?;
+                let hashes = groups
+                    .column_by_name("phash_hex")
+                    .ok_or_else(|| anyhow!("video_frame_phashes missing phash_hex"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("video_frame_phashes phash_hex is not string"))?;
+                let timestamps = groups
+                    .column_by_name("timestamp_sec")
+                    .ok_or_else(|| anyhow!("video_frame_phashes missing timestamp_sec"))?
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("video_frame_phashes timestamp_sec is not float32"))?;
+                let parsed: Vec<VideoFramePhash> = (0..hashes.len())
+                    .filter(|&idx| !hashes.is_null(idx) && !timestamps.is_null(idx))
+                    .filter_map(|idx| {
+                        parse_phash_hex(hashes.value(idx)).map(|phash| VideoFramePhash {
+                            timestamp_sec: timestamps.value(idx),
+                            phash,
+                        })
+                    })
+                    .collect();
+                if !parsed.is_empty() {
+                    video_frame_phashes_by_file.insert(file_name, parsed);
+                }
+            }
+        }
 
         for row in 0..batch.num_rows() {
             if dedupe_match.is_null(row) || file_names.is_null(row) {
@@ -1378,6 +1560,9 @@ async fn load_supplemental_database_indices(
                 continue;
             }
             let file_name = file_names.value(row).to_string();
+            if bool_value(skip_processing, row) == Some(true) {
+                skipped_processing_files.insert(file_name.clone());
+            }
             let match_file = if sift_match_file.is_null(row) {
                 None
             } else {
@@ -1525,11 +1710,15 @@ async fn load_supplemental_database_indices(
     Ok(SupplementalDbData {
         face_index,
         ocr_index,
+        ocr_embedded_files: ocr_seen,
         similar_by_master,
         phash_master_by_file,
+        phash_by_file,
+        video_frame_phashes_by_file,
         sift_info_by_file,
         sift_root_by_file,
         sift_members_by_root,
+        skipped_processing_files,
     })
 }
 
@@ -2098,7 +2287,7 @@ fn search_ocr_index(
     rows
 }
 
-const FACE_MATCH_MIN_SCORE: f32 = 0.35;
+const FACE_MATCH_MIN_SCORE: f32 = 0.30;
 
 fn search_face_index(
     index: &FaceIndex,
@@ -2731,6 +2920,60 @@ fn text_edit_enter_pressed(response: &egui::Response) -> bool {
         })
 }
 
+fn bounded_edit_distance(a: &str, b: &str, max_distance: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > max_distance {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0; b.len() + 1];
+    for (row, a_byte) in a.bytes().enumerate() {
+        current[0] = row + 1;
+        let mut row_min = current[0];
+        for (col, b_byte) in b.bytes().enumerate() {
+            current[col + 1] = (previous[col + 1] + 1)
+                .min(current[col] + 1)
+                .min(previous[col] + usize::from(a_byte != b_byte));
+            row_min = row_min.min(current[col + 1]);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[b.len()] <= max_distance).then_some(previous[b.len()])
+}
+
+fn fuzzy_path_component_matches(query: &str, candidate: &str) -> bool {
+    if candidate.contains(query) || query.contains(candidate) {
+        return true;
+    }
+    let max_distance = if query.len() >= 12 {
+        2
+    } else if query.len() >= 5 {
+        1
+    } else {
+        0
+    };
+    max_distance > 0 && bounded_edit_distance(query, candidate, max_distance).is_some()
+}
+
+fn partial_path_matches(query: &str, candidate: &str) -> bool {
+    if candidate.contains(query) {
+        return true;
+    }
+    let query_parts: Vec<&str> = query.split('/').filter(|part| !part.is_empty()).collect();
+    let candidate_parts: Vec<&str> = candidate.split('/').filter(|part| !part.is_empty()).collect();
+    if query_parts.is_empty() || query_parts.len() > candidate_parts.len() {
+        return false;
+    }
+    candidate_parts.windows(query_parts.len()).any(|window| {
+        query_parts
+            .iter()
+            .zip(window)
+            .all(|(query_part, candidate_part)| fuzzy_path_component_matches(query_part, candidate_part))
+    })
+}
+
 fn resolve_media_path(
     roots: &HashMap<String, PathBuf>,
     db_dir: &Path,
@@ -3225,6 +3468,8 @@ struct ImageViewer {
     db_rx: Option<Receiver<DatabaseLoadMessage>>,
     db_indices: Option<DatabaseIndices>,
     semantic_query: String,
+    applied_filename_query: String,
+    filename_search_results: Option<Vec<usize>>,
     semantic_folder: String,
     semantic_limit: usize,
     semantic_video_only: bool,
@@ -3239,6 +3484,7 @@ struct ImageViewer {
     // Duplicates & SIFT states
     compare_target: Option<PathBuf>,
     sift_pair_overlay: Option<String>,
+    expanded_duplicate_rows: HashSet<String>,
     sift_running: bool,
     sift_rx: Option<Receiver<Result<String, String>>>,
     selected_grid_files: Vec<String>,
@@ -3535,6 +3781,45 @@ fn save_clipboard_image_to_temp(pasted_text: Option<&str>) -> Result<Option<Path
     rgba.save(&path)
         .with_context(|| format!("failed to save clipboard image to {}", path.display()))?;
     Ok(Some(path))
+}
+
+fn copy_image_file_to_clipboard(path: &Path) -> Result<()> {
+    let img = image::open(path)
+        .with_context(|| format!("failed to open image for clipboard copy: {}", path.display()))?;
+    if command_available("wl-copy") {
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png_bytes, image::ImageFormat::Png)
+            .context("failed to encode image as PNG for clipboard copy")?;
+        let mut child = Command::new("wl-copy")
+            .args(["--type", "image/png"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to start wl-copy")?;
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().context("wl-copy stdin is unavailable")?;
+            stdin
+                .write_all(png_bytes.get_ref())
+                .context("failed to send image to wl-copy")?;
+        }
+        let status = child.wait().context("failed waiting for wl-copy")?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("wl-copy exited with status {status}");
+    }
+
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut clipboard = arboard::Clipboard::new().context("failed to open clipboard")?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: Cow::Owned(rgba.into_raw()),
+        })
+        .context("failed to copy image to clipboard")?;
+    Ok(())
 }
 
 fn get_system_disks() -> Vec<PathBuf> {
@@ -3857,6 +4142,8 @@ impl ImageViewer {
             db_rx: None,
             db_indices: None,
             semantic_query: String::new(),
+            applied_filename_query: String::new(),
+            filename_search_results: None,
             semantic_folder: String::new(),
             semantic_limit: 80,
             semantic_video_only: false,
@@ -3871,6 +4158,7 @@ impl ImageViewer {
             // SIFT defaults
             compare_target: None,
             sift_pair_overlay: None,
+            expanded_duplicate_rows: HashSet::new(),
             sift_running: false,
             sift_rx: None,
             selected_grid_files: Vec::new(),
@@ -3962,6 +4250,11 @@ impl ImageViewer {
         };
         match rx.try_recv() {
             Ok(DatabaseLoadMessage::ClipReady(Ok((clip_index, encoder)))) => {
+                let clip_embedded_files: HashSet<String> = clip_index
+                    .entries
+                    .iter()
+                    .map(|entry| entry.file_name.to_string())
+                    .collect();
                 let mut basename_to_db_filename = HashMap::new();
                 for entry in &clip_index.entries {
                     if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
@@ -3974,11 +4267,16 @@ impl ImageViewer {
                     clip_index: Arc::new(clip_index),
                     face_index: Arc::new(FaceIndex { entries: Vec::new(), file_count: 0 }),
                     ocr_index: Arc::new(OcrIndex { entries: Vec::new(), file_count: 0 }),
+                    clip_embedded_files: Arc::new(clip_embedded_files),
+                    ocr_embedded_files: Arc::new(HashSet::new()),
                     similar_by_master: HashMap::new(),
                     phash_master_by_file: HashMap::new(),
+                    phash_by_file: HashMap::new(),
+                    video_frame_phashes_by_file: HashMap::new(),
                     sift_info_by_file: HashMap::new(),
                     sift_root_by_file: HashMap::new(),
                     sift_members_by_root: HashMap::new(),
+                    skipped_processing_files: Arc::new(HashSet::new()),
                     basename_to_db_filename,
                     encoder,
                 });
@@ -3999,11 +4297,15 @@ impl ImageViewer {
                 if let Some(indices) = self.db_indices.as_mut() {
                     indices.face_index = Arc::new(data.face_index);
                     indices.ocr_index = Arc::new(data.ocr_index);
+                    indices.ocr_embedded_files = Arc::new(data.ocr_embedded_files);
                     indices.similar_by_master = data.similar_by_master;
                     indices.phash_master_by_file = data.phash_master_by_file;
+                    indices.phash_by_file = data.phash_by_file;
+                    indices.video_frame_phashes_by_file = data.video_frame_phashes_by_file;
                     indices.sift_info_by_file = data.sift_info_by_file;
                     indices.sift_root_by_file = data.sift_root_by_file;
                     indices.sift_members_by_root = data.sift_members_by_root;
+                    indices.skipped_processing_files = Arc::new(data.skipped_processing_files);
                     for key in indices
                         .phash_master_by_file
                         .keys()
@@ -4363,9 +4665,76 @@ impl ImageViewer {
         }
     }
 
+    fn apply_filename_search(&mut self) {
+        self.applied_filename_query = self.semantic_query.trim().to_string();
+        if self.applied_filename_query.is_empty() {
+            self.filename_search_results = None;
+            self.semantic_status = "Filename filter cleared.".to_string();
+            return;
+        }
+
+        let query = self.applied_filename_query.to_lowercase().replace('\\', "/");
+        let query_is_path = query.contains('/');
+        let query_basename = query
+            .rsplit('/')
+            .next()
+            .filter(|name| name.contains('.'));
+        let roots = get_db_roots();
+        let mut matches = Vec::new();
+        for (index, path) in self.recursive_images.iter().enumerate() {
+            let matched = if query_is_path {
+                if query_basename.is_some_and(|query_name| {
+                    !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(query_name))
+                }) {
+                    false
+                } else {
+                    let physical_path = path.to_string_lossy().replace('\\', "/").to_lowercase();
+                    if partial_path_matches(&query, &physical_path) {
+                        true
+                    } else if let Some(db_name) = self.resolve_db_filename(path) {
+                        let db_name = db_name.to_lowercase();
+                        let relative_name =
+                            db_name.split_once('/').map(|(_, rel)| rel).unwrap_or(&db_name);
+                        partial_path_matches(&query, &db_name)
+                            || partial_path_matches(&query, relative_name)
+                            || db_name.split_once('/').is_some_and(|(collection, rel)| {
+                                roots.get(collection).is_some_and(|root| {
+                                    let full_path = root
+                                        .join(rel)
+                                        .to_string_lossy()
+                                        .replace('\\', "/")
+                                        .to_lowercase();
+                                    partial_path_matches(&query, &full_path)
+                                })
+                            })
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_lowercase().contains(&query))
+            };
+            if matched {
+                matches.push(index);
+            }
+        }
+
+        self.semantic_status = format!(
+            "Filename search found {} item(s) for {}.",
+            matches.len(),
+            self.applied_filename_query
+        );
+        self.filename_search_results = Some(matches);
+    }
+
     fn submit_semantic_search(&mut self, ctx: &egui::Context) {
         if self.semantic_mode == SearchMode::Filename {
-            self.semantic_status = "Select CLIP or OCR before pressing Search.".to_string();
+            self.apply_filename_search();
             return;
         }
 
@@ -4868,6 +5237,8 @@ impl ImageViewer {
     fn start_recursive_scan(&mut self) {
         self.grid_loading = true;
         self.recursive_images.clear();
+        self.applied_filename_query.clear();
+        self.filename_search_results = None;
         self.thumbnail_textures.clear();
         self.thumbnail_loading.clear();
         self.thumbnail_failed.clear();
@@ -5719,34 +6090,19 @@ impl ImageViewer {
             }
             ui.add_space(8.0);
 
-            // Real-time Filename Filtering
-            let filter = self.semantic_query.to_lowercase();
-            let filter_looks_like_path = filter.contains('/') || filter.contains('\\');
-            let filtered_images: Vec<usize> = self.recursive_images.iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    if self.semantic_video_only && !is_video_path(p) {
-                        return false;
-                    }
-                    if self.semantic_mode == SearchMode::Filename && !filter.is_empty() {
-                        if filter_looks_like_path {
-                            let path_text = p.to_string_lossy().replace('\\', "/").to_lowercase();
-                            if path_text.contains(&filter) {
-                                return true;
-                            }
-                            if let Some(db_name) = self.resolve_db_filename(p) {
-                                return db_name.to_lowercase().contains(&filter);
-                            }
-                            false
-                        } else {
-                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                            name.contains(&filter)
-                        }
-                    } else {
-                        true
-                    }
+            // Submitted filename searches are cached so path resolution does not run every frame.
+            let filename_candidates: Vec<usize> = if self.semantic_mode == SearchMode::Filename {
+                self.filename_search_results
+                    .clone()
+                    .unwrap_or_else(|| (0..self.recursive_images.len()).collect())
+            } else {
+                (0..self.recursive_images.len()).collect()
+            };
+            let filtered_images: Vec<usize> = filename_candidates
+                .into_iter()
+                .filter(|&index| {
+                    !self.semantic_video_only || is_video_path(&self.recursive_images[index])
                 })
-                .map(|(idx, _)| idx)
                 .collect();
 
             let is_active_semantic_search = match self.semantic_mode {
@@ -5922,19 +6278,10 @@ impl ImageViewer {
                                             ui.close();
                                         }
                                         if ui.button("📋 Copy image").clicked() {
-                                            let path_clone = path.clone();
-                                            let ctx = ui.ctx().clone();
-                                            std::thread::spawn(move || {
-                                                if let Ok(img) = image::open(&path_clone) {
-                                                    let rgba = img.to_rgba8();
-                                                    let (width, height) = rgba.dimensions();
-                                                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                                                        [width as usize, height as usize],
-                                                        rgba.as_raw(),
-                                                    );
-                                                    ctx.copy_image(color);
-                                                }
-                                            });
+                                            let resolved_path = self.get_thumbnail_path(path);
+                                            if let Err(err) = copy_image_file_to_clipboard(&resolved_path) {
+                                                self.semantic_status = format!("Copy image failed: {err}");
+                                            }
                                             ui.close();
                                         }
                                         if ui.button("📋 Copy full path").clicked() {
@@ -5957,7 +6304,7 @@ impl ImageViewer {
                                                     .spawn();
                                                 ui.close();
                                             }
-                                        } else if ui.button("Edit image").clicked() {
+                                        } else if ui.button("✏ Edit image").clicked() {
                                             self.start_image_editor(path, ui.ctx());
                                             ui.close();
                                         }
@@ -7054,24 +7401,63 @@ impl eframe::App for ImageViewer {
                                     }
                                     seeds
                                 };
+                                let clip_embedded_files = Arc::clone(&indices.clip_embedded_files);
+                                let ocr_embedded_files = Arc::clone(&indices.ocr_embedded_files);
+                                let skipped_processing_files = Arc::clone(&indices.skipped_processing_files);
+                                let use_sift_seed_similarity = sift_members.len() > 1;
 
-                                let mut phash_similar_groups: Vec<(String, Vec<SimilarFile>)> = Vec::new();
-                                for seed in &phash_group_seeds {
+                                let mut phash_similar_groups: Vec<(String, String, Vec<SimilarFile>)> = Vec::new();
+                                for (seed_index, seed) in phash_group_seeds.iter().enumerate() {
                                     if let Some(items) = indices.similar_by_master.get(seed.as_str()) {
                                         let mut group_items = items.clone();
+                                        let similarity_reference = if use_sift_seed_similarity {
+                                            seed
+                                        } else {
+                                            &filename
+                                        };
+                                        for item in &mut group_items {
+                                            item.similarity_pct = similarity_to_active(
+                                                similarity_reference,
+                                                &item.file_name,
+                                                &indices.phash_by_file,
+                                                &indices.video_frame_phashes_by_file,
+                                            );
+                                        }
+                                        if !group_items.iter().any(|item| item.file_name == *seed) {
+                                            group_items.push(SimilarFile {
+                                                file_name: seed.clone(),
+                                                is_video: is_video_path(Path::new(seed)),
+                                                similarity_pct: similarity_to_active(
+                                                    similarity_reference,
+                                                    seed,
+                                                    &indices.phash_by_file,
+                                                    &indices.video_frame_phashes_by_file,
+                                                ),
+                                            });
+                                        }
+                                        group_items.retain(|item| item.file_name != filename);
                                         group_items.sort_by(|a, b| {
                                             b.similarity_pct
                                                 .unwrap_or(f32::NEG_INFINITY)
                                                 .partial_cmp(&a.similarity_pct.unwrap_or(f32::NEG_INFINITY))
                                                 .unwrap_or(Ordering::Equal)
+                                                .then_with(|| a.file_name.cmp(&b.file_name))
                                         });
                                         if !group_items.is_empty() {
-                                            phash_similar_groups.push((seed.clone(), group_items));
+                                            let section_label = if use_sift_seed_similarity {
+                                                format!("SIFT master {} pHash/VideoHash similars", seed_index + 1)
+                                            } else {
+                                                "Active image pHash/VideoHash similars".to_string()
+                                            };
+                                            phash_similar_groups.push((seed.clone(), section_label, group_items));
                                         }
                                     }
                                 }
                                 let mut phash_unique_files = HashSet::new();
-                                for (_, items) in &phash_similar_groups {
+                                for (seed, _, items) in &phash_similar_groups {
+                                    if seed != &filename {
+                                        phash_unique_files.insert(seed.clone());
+                                    }
                                     for item in items {
                                         phash_unique_files.insert(item.file_name.clone());
                                     }
@@ -7097,7 +7483,43 @@ impl eframe::App for ImageViewer {
                                     } else {
                                         sift_info_line(&indices.sift_info_by_file, member)
                                     };
-                                    displayed_sift_metadata.push((member.clone(), source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str));
+                                    let has_clip = clip_embedded_files.contains(member);
+                                    let has_ocr = ocr_embedded_files.contains(member);
+                                    let skipped = skipped_processing_files.contains(member);
+                                    displayed_sift_metadata.push((member.clone(), source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str, has_clip, has_ocr, skipped));
+                                }
+                                let mut database_details: HashMap<(String, String), Vec<String>> = HashMap::new();
+                                for (member, _, _, member_is_video, _, _, _, _, _) in &displayed_sift_metadata {
+                                    if !self.expanded_duplicate_rows.contains(member) {
+                                        continue;
+                                    }
+                                    database_details.insert(
+                                        (master_file_name.clone(), member.clone()),
+                                        duplicate_database_detail_lines(
+                                            member,
+                                            &master_file_name,
+                                            *member_is_video,
+                                            &indices.phash_by_file,
+                                            &indices.video_frame_phashes_by_file,
+                                        ),
+                                    );
+                                }
+                                for (group_seed, _, group_items) in &phash_similar_groups {
+                                    for item in group_items {
+                                        if !self.expanded_duplicate_rows.contains(&item.file_name) {
+                                            continue;
+                                        }
+                                        database_details.insert(
+                                            (group_seed.clone(), item.file_name.clone()),
+                                            duplicate_database_detail_lines(
+                                                &item.file_name,
+                                                group_seed,
+                                                item.is_video,
+                                                &indices.phash_by_file,
+                                                &indices.video_frame_phashes_by_file,
+                                            ),
+                                        );
+                                    }
                                 }
 
                                 ui.heading("👥 Duplicate Matches");
@@ -7122,7 +7544,12 @@ impl eframe::App for ImageViewer {
                                         });
                                         ui.add_space(6.0);
                                         
-                                        for (member, source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str) in &displayed_sift_metadata {
+                                        for (member, source_path_opt, preview_path_opt, member_is_video, res_size_str, sift_str, has_clip, has_ocr, skipped) in &displayed_sift_metadata {
+                                            let detail_lines = database_details
+                                                .get(&(master_file_name.clone(), member.clone()))
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            let expanded = self.expanded_duplicate_rows.contains(member);
                                             ui.horizontal(|ui| {
                                                 // Left: Thumbnail preview (use preview_path for video stills)
                                                 let thumb_path = preview_path_opt.as_ref().or(source_path_opt.as_ref());
@@ -7143,6 +7570,7 @@ impl eframe::App for ImageViewer {
                                                             if *member_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
                                                             if *member_is_video { "📹 Video" } else { "🖼 Image" }
                                                         );
+                                                        draw_embedding_markers(ui, *has_clip, *has_ocr, *skipped);
                                                         if member == &filename {
                                                             ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
                                                         }
@@ -7165,7 +7593,7 @@ impl eframe::App for ImageViewer {
                                                                         .arg(s_path)
                                                                         .spawn();
                                                                 }
-                                                            } else if member != &filename {
+                                                            } else {
                                                                 if ui.button("👁 View").clicked() {
                                                                     if let Some(pos) = self.images.iter().position(|p| p == s_path) {
                                                                         self.current_index = pos;
@@ -7180,22 +7608,20 @@ impl eframe::App for ImageViewer {
                                                                     self.update_side_panel_metadata_if_needed();
                                                                 }
                                                             }
-                                                            
-                                                            if !*member_is_video {
-                                                                let is_active_compare = self.compare_target.as_ref() == Some(s_path);
-                                                                let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                                if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                                    if is_active_compare {
-                                                                        self.compare_target = None;
-                                                                        self.sift_pair_overlay = None;
-                                                                    } else {
-                                                                        self.compare_target = Some(s_path.clone());
-                                                                        self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
-                                                                    }
-                                                                }
+                                                        }
+                                                        if ui.button(if expanded { "Collapse" } else { "Expand" }).clicked() {
+                                                            if expanded {
+                                                                self.expanded_duplicate_rows.remove(member);
+                                                            } else {
+                                                                self.expanded_duplicate_rows.insert(member.clone());
                                                             }
                                                         }
                                                     });
+                                                    if expanded {
+                                                        for line in &detail_lines {
+                                                            ui.monospace(line);
+                                                        }
+                                                    }
                                                 });
                                             });
                                             ui.add_space(8.0);
@@ -7213,16 +7639,7 @@ impl eframe::App for ImageViewer {
                                         });
                                         ui.add_space(6.0);
                                         
-                                        for (group_seed, group_items) in &phash_similar_groups {
-                                            let group_role = if !sift_members.is_empty() && group_seed == &master_file_name {
-                                                "SIFT group root"
-                                            } else if sift_members.iter().any(|member| member == group_seed) {
-                                                "SIFT group member"
-                                            } else {
-                                                "pHash/VideoHash seed"
-                                            };
-                                            let group_label = group_seed.split_once('/').map(|x| x.1).unwrap_or(group_seed);
-
+                                        for (group_seed, section_label, group_items) in &phash_similar_groups {
                                             egui::Frame::NONE
                                                 .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.35))
                                                 .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.35)))
@@ -7230,10 +7647,13 @@ impl eframe::App for ImageViewer {
                                                 .corner_radius(6.0)
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.colored_label(egui::Color32::from_rgb(120, 190, 255), group_role);
+                                                        ui.colored_label(egui::Color32::from_rgb(120, 190, 255), section_label);
                                                     });
-                                                    wrapping_monospace_path(ui, group_label);
-                                                    ui.weak(format!("{} similar file(s) linked to this seed", group_items.len()));
+                                                    let linked_count = group_items
+                                                        .iter()
+                                                        .filter(|item| item.file_name != *group_seed)
+                                                        .count();
+                                                    ui.weak(format!("{linked_count} similar file(s) linked to this reference"));
                                                     ui.add_space(6.0);
 
                                                     let row_height = side_thumb + 24.0;
@@ -7246,6 +7666,14 @@ impl eframe::App for ImageViewer {
                                                         let res_size_str = source_path_opt.as_ref()
                                                             .map(|p| self.get_file_resolution_and_size(p))
                                                             .unwrap_or_else(|| "n/a".to_string());
+                                                        let item_has_clip = clip_embedded_files.contains(&item.file_name);
+                                                        let item_has_ocr = ocr_embedded_files.contains(&item.file_name);
+                                                        let item_skipped = skipped_processing_files.contains(&item.file_name);
+                                                        let detail_lines = database_details
+                                                            .get(&(group_seed.clone(), item.file_name.clone()))
+                                                            .cloned()
+                                                            .unwrap_or_default();
+                                                        let expanded = self.expanded_duplicate_rows.contains(&item.file_name);
 
                                                         ui.allocate_ui(egui::vec2(ui.available_width(), row_height), |ui| {
                                                             ui.horizontal(|ui| {
@@ -7268,14 +7696,30 @@ impl eframe::App for ImageViewer {
                                                                             if item_is_video { egui::Color32::LIGHT_BLUE } else { egui::Color32::LIGHT_GREEN },
                                                                             if item_is_video { "📹 Video" } else { "🖼 Image" }
                                                                         );
+                                                                        draw_embedding_markers(ui, item_has_clip, item_has_ocr, item_skipped);
                                                                         if item.file_name == filename {
                                                                             ui.colored_label(egui::Color32::from_rgb(255, 180, 50), "• Active");
+                                                                        }
+                                                                        if item.file_name == *group_seed {
+                                                                            ui.colored_label(egui::Color32::from_rgb(120, 190, 255), "• Seed");
                                                                         }
                                                                     });
                                                                     
                                                                     let similarity_label = item.similarity_pct
-                                                                        .map(|v| format!("similarity {:.2}%", v))
-                                                                        .unwrap_or_else(|| "similarity n/a".to_string());
+                                                                        .map(|v| {
+                                                                            if use_sift_seed_similarity {
+                                                                                format!("similarity to this SIFT master {:.2}%", v)
+                                                                            } else {
+                                                                                format!("similarity to active {:.2}%", v)
+                                                                            }
+                                                                        })
+                                                                        .unwrap_or_else(|| {
+                                                                            if use_sift_seed_similarity {
+                                                                                "similarity to this SIFT master n/a".to_string()
+                                                                            } else {
+                                                                                "similarity to active n/a".to_string()
+                                                                            }
+                                                                        });
                                                                     ui.colored_label(egui::Color32::from_rgb(100, 180, 255), similarity_label);
                                                                     
                                                                     ui.weak(&res_size_str);
@@ -7294,7 +7738,7 @@ impl eframe::App for ImageViewer {
                                                                                         .arg(s_path)
                                                                                         .spawn();
                                                                                 }
-                                                                            } else if item.file_name != filename {
+                                                                            } else {
                                                                                 if ui.button("👁 View").clicked() {
                                                                                     if let Some(pos) = self.images.iter().position(|p| p == s_path) {
                                                                                         self.current_index = pos;
@@ -7309,22 +7753,20 @@ impl eframe::App for ImageViewer {
                                                                                     self.update_side_panel_metadata_if_needed();
                                                                                 }
                                                                             }
-                                                                            
-                                                                            if !item_is_video {
-                                                                                let is_active_compare = self.compare_target.as_ref() == Some(s_path);
-                                                                                let btn_label = if is_active_compare { "🎯 Comparing" } else { "⚖ Compare" };
-                                                                                if ui.selectable_label(is_active_compare, btn_label).clicked() {
-                                                                                    if is_active_compare {
-                                                                                        self.compare_target = None;
-                                                                                        self.sift_pair_overlay = None;
-                                                                                    } else {
-                                                                                        self.compare_target = Some(s_path.clone());
-                                                                                        self.start_sift_alignment(path.clone(), s_path.clone(), ui.ctx().clone());
-                                                                                    }
-                                                                                }
+                                                                        }
+                                                                        if ui.button(if expanded { "Collapse" } else { "Expand" }).clicked() {
+                                                                            if expanded {
+                                                                                self.expanded_duplicate_rows.remove(&item.file_name);
+                                                                            } else {
+                                                                                self.expanded_duplicate_rows.insert(item.file_name.clone());
                                                                             }
                                                                         }
                                                                     });
+                                                                    if expanded {
+                                                                        for line in &detail_lines {
+                                                                            ui.monospace(line);
+                                                                        }
+                                                                    }
                                                                 });
                                                             });
                                                         });
@@ -7375,7 +7817,7 @@ impl eframe::App for ImageViewer {
  
                 // Interaction / Zoom
                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll_delta != 0.0 {
+                if response.hovered() && scroll_delta != 0.0 {
                     let zoom_factor = (scroll_delta / 200.0).exp();
                     
                     if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -7405,18 +7847,12 @@ impl eframe::App for ImageViewer {
                     }
                     if ui.button("🖼 Copy Image").clicked() {
                         let resolved_path = self.get_thumbnail_path(&path);
-                        if let Ok(img) = image::open(&resolved_path) {
-                            let size = [img.width() as usize, img.height() as usize];
-                            let img_rgba = img.to_rgba8();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                size,
-                                img_rgba.as_raw(),
-                            );
-                            ui.ctx().copy_image(color_image);
+                        if let Err(err) = copy_image_file_to_clipboard(&resolved_path) {
+                            self.semantic_status = format!("Copy image failed: {err}");
                         }
                         ui.close();
                     }
-                    if !is_video_item && ui.button("Edit image").clicked() {
+                    if !is_video_item && ui.button("✏ Edit image").clicked() {
                         self.start_image_editor(&path, ui.ctx());
                         ui.close();
                     }
