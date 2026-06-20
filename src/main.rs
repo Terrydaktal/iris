@@ -319,6 +319,40 @@ fn load_ffprobe_metadata(path: &Path) -> String {
     }
 }
 
+fn load_video_duration(path: &Path) -> Option<f32> {
+    let ffprobe_path = resolve_ffprobe_path()?;
+    let out = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let duration = text.trim().parse::<f32>().ok()?;
+    duration.is_finite().then_some(duration).filter(|value| *value > 0.0)
+}
+
+fn format_video_duration(duration_sec: f32) -> String {
+    let total = duration_sec.max(0.0).round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidePanelMode {
     Layout,
@@ -2760,9 +2794,6 @@ fn load_or_discover_db_roots(db_dir: &Path) -> HashMap<String, PathBuf> {
         let mut roots = load_collection_roots_from_table(db_dir)
             .await
             .unwrap_or_default();
-        if !roots.is_empty() {
-            return roots;
-        }
 
         let samples = collect_collection_samples_from_media_index(db_dir)
             .await
@@ -3458,6 +3489,10 @@ struct ImageViewer {
     thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
     thumbnail_active_threads: usize,
+    video_duration_cache: HashMap<PathBuf, Option<f32>>,
+    video_duration_loading: HashSet<PathBuf>,
+    video_duration_rx: std::sync::mpsc::Receiver<(PathBuf, Option<f32>)>,
+    video_duration_tx: std::sync::mpsc::Sender<(PathBuf, Option<f32>)>,
     
     // AI Database & Explorer States
     db_loaded: bool,
@@ -4095,6 +4130,8 @@ impl ImageViewer {
         }
 
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel::<(PathBuf, egui::ColorImage)>();
+        let (video_duration_tx, video_duration_rx) =
+            std::sync::mpsc::channel::<(PathBuf, Option<f32>)>();
 
         let mut viewer = Self {
             images,
@@ -4132,6 +4169,10 @@ impl ImageViewer {
             thumbnail_rx,
             thumbnail_tx,
             thumbnail_active_threads: 0,
+            video_duration_cache: HashMap::new(),
+            video_duration_loading: HashSet::new(),
+            video_duration_rx,
+            video_duration_tx,
             
             // AI Explorer defaults
             db_loaded: false,
@@ -4145,7 +4186,7 @@ impl ImageViewer {
             applied_filename_query: String::new(),
             filename_search_results: None,
             semantic_folder: String::new(),
-            semantic_limit: 80,
+            semantic_limit: 300,
             semantic_video_only: false,
             semantic_mode: SearchMode::Filename,
             semantic_results: Vec::new(),
@@ -4559,6 +4600,33 @@ impl ImageViewer {
         path.to_path_buf()
     }
 
+    fn video_source_path_for_tile(&self, path: &Path, db_filename: Option<&str>) -> PathBuf {
+        if let Some(db_name) = db_filename {
+            let roots = get_db_roots();
+            if let Ok(source) = resolve_source_path(&roots, db_name) {
+                return source;
+            }
+        }
+        self.resolve_actual_path(path)
+    }
+
+    fn cached_video_duration(&mut self, path: &Path, ctx: &egui::Context) -> Option<f32> {
+        if let Some(duration) = self.video_duration_cache.get(path) {
+            return *duration;
+        }
+        if self.video_duration_loading.insert(path.to_path_buf()) {
+            let path_clone = path.to_path_buf();
+            let tx = self.video_duration_tx.clone();
+            let ctx_clone = ctx.clone();
+            rayon::spawn(move || {
+                let duration = load_video_duration(&path_clone);
+                let _ = tx.send((path_clone, duration));
+                ctx_clone.request_repaint();
+            });
+        }
+        None
+    }
+
     fn get_file_resolution_and_size(&self, path: &Path) -> String {
         if let Some(cached) = self.resolution_size_cache.borrow().get(path) {
             return cached.clone();
@@ -4723,6 +4791,8 @@ impl ImageViewer {
                 matches.push(index);
             }
         }
+
+        matches.reverse();
 
         self.semantic_status = format!(
             "Filename search found {} item(s) for {}.",
@@ -5243,6 +5313,8 @@ impl ImageViewer {
         self.thumbnail_loading.clear();
         self.thumbnail_failed.clear();
         self.thumbnail_active_threads = 0;
+        self.video_duration_cache.clear();
+        self.video_duration_loading.clear();
 
         let start_dir = if self.open_target_is_dir {
             self.open_target.clone()
@@ -6090,8 +6162,18 @@ impl ImageViewer {
             }
             ui.add_space(8.0);
 
-            // Submitted filename searches are cached so path resolution does not run every frame.
-            let filename_candidates: Vec<usize> = if self.semantic_mode == SearchMode::Filename {
+            let is_active_semantic_search = match self.semantic_mode {
+                SearchMode::Filename => false,
+                SearchMode::Clip | SearchMode::Ocr => {
+                    self.semantic_results_mode == Some(self.semantic_mode)
+                }
+            };
+
+            // Keep the folder grid empty until the recursive scan has completed so the
+            // user does not see a transient partial ordering before the final sorted set.
+            let filename_candidates: Vec<usize> = if !is_active_semantic_search && self.grid_loading {
+                Vec::new()
+            } else if self.semantic_mode == SearchMode::Filename {
                 self.filename_search_results
                     .clone()
                     .unwrap_or_else(|| (0..self.recursive_images.len()).collect())
@@ -6104,13 +6186,6 @@ impl ImageViewer {
                     !self.semantic_video_only || is_video_path(&self.recursive_images[index])
                 })
                 .collect();
-
-            let is_active_semantic_search = match self.semantic_mode {
-                SearchMode::Filename => false,
-                SearchMode::Clip | SearchMode::Ocr => {
-                    self.semantic_results_mode == Some(self.semantic_mode)
-                }
-            };
 
             // Status message label
             ui.horizontal(|ui| {
@@ -6479,18 +6554,19 @@ impl ImageViewer {
                                         );
                                     }
 
-                                    // Overlay 3: Video Indicator badge with timestamp in the top-right
+                                    // Overlay 3: Video indicator badge with full duration in the top-right.
                                     if item.is_video {
-                                        let badge_text = if item.timestamp_sec > 0.0 {
-                                            let ts_mins = (item.timestamp_sec / 60.0).floor() as i32;
-                                            let ts_secs = (item.timestamp_sec % 60.0).floor() as i32;
-                                            format!("📹 {:02}:{:02}", ts_mins, ts_secs)
-                                        } else {
-                                            "📹 Video".to_string()
-                                        };
+                                        let video_source_path = self.video_source_path_for_tile(
+                                            path,
+                                            item.db_filename.as_deref(),
+                                        );
+                                        let badge_text = self
+                                            .cached_video_duration(&video_source_path, ctx)
+                                            .map(|duration| format!("📹 {}", format_video_duration(duration)))
+                                            .unwrap_or_else(|| "📹 Video".to_string());
                                         
                                         let badge_rect = egui::Rect::from_min_max(
-                                            egui::pos2(rect.max.x - 66.0, rect.min.y + 6.0),
+                                            egui::pos2(rect.max.x - 78.0, rect.min.y + 6.0),
                                             egui::pos2(rect.max.x - 6.0, rect.min.y + 22.0)
                                         );
                                         ui.painter().rect_filled(badge_rect, 4.0, egui::Color32::from_black_alpha(160));
@@ -7009,6 +7085,12 @@ impl eframe::App for ImageViewer {
             ctx.request_repaint();
         }
 
+        while let Ok((path, duration)) = self.video_duration_rx.try_recv() {
+            self.video_duration_loading.remove(&path);
+            self.video_duration_cache.insert(path, duration);
+            ctx.request_repaint();
+        }
+
         if let Ok(new_path) = self.rx.try_recv() {
             self.open_image_path(new_path);
             self.show_home_page = false;
@@ -7033,7 +7115,7 @@ impl eframe::App for ImageViewer {
                 ctx.request_repaint();
             }
             if disconnected {
-                self.recursive_images.sort();
+                self.recursive_images.sort_by(|a, b| b.cmp(a));
                 self.grid_loading = false;
                 self.recursive_rx = None;
                 ctx.request_repaint();
@@ -7579,8 +7661,7 @@ impl eframe::App for ImageViewer {
                                                     ui.weak(res_size_str);
                                                     ui.weak(sift_str);
                                                     
-                                                    let display_name = member.split_once('/').map(|x| x.1).unwrap_or(member);
-                                                    wrapping_monospace_path(ui, display_name);
+                                                    wrapping_monospace_path(ui, member);
                                                     
                                                     ui.horizontal_wrapped(|ui| {
                                                         if let Some(s_path) = source_path_opt.as_ref() {
@@ -7724,8 +7805,7 @@ impl eframe::App for ImageViewer {
                                                                     
                                                                     ui.weak(&res_size_str);
                                                                     
-                                                                    let display_name = item.file_name.split_once('/').map(|x| x.1).unwrap_or(&item.file_name);
-                                                                    wrapping_monospace_path(ui, display_name);
+                                                                    wrapping_monospace_path(ui, &item.file_name);
                                                                     
                                                                     ui.horizontal_wrapped(|ui| {
                                                                         if let Some(s_path) = source_path_opt.as_ref() {

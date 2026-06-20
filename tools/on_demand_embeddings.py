@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -44,6 +45,33 @@ def resolve_imagesearch_root() -> Path:
     return Path("tools/media_indexer")
 
 
+def clear_cuda_cache() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def compute_clip_embedding(frame, clip_embedder_cls, model_name: str, oom_predicate) -> list[float] | None:
+    clip = None
+    try:
+        clip = clip_embedder_cls(model_name, 1)
+        vectors = clip.embed_frames([frame])
+        return vectors[0] if vectors else None
+    except Exception as exc:
+        if not oom_predicate(exc):
+            raise
+        clip = None
+        clear_cuda_cache()
+        clip = clip_embedder_cls(model_name, 1, device="cpu")
+        vectors = clip.embed_frames([frame])
+        return vectors[0] if vectors else None
+
+
 def main() -> int:
     args = parse_args()
     if not args.clip and not args.faces:
@@ -63,6 +91,7 @@ def main() -> int:
             DEFAULT_CLIP_MODEL,
             FaceEmbedder,
             default_insightface_root,
+            is_cuda_oom_error,
             read_image_bgr,
         )
     except Exception as exc:
@@ -74,10 +103,12 @@ def main() -> int:
         face_embeddings: list[list[float]] = []
 
         if args.clip:
-            clip = ClipEmbedder(DEFAULT_CLIP_MODEL, 1)
-            vectors = clip.embed_frames([frame])
-            if vectors:
-                clip_embedding = vectors[0]
+            clip_embedding = compute_clip_embedding(
+                frame,
+                ClipEmbedder,
+                DEFAULT_CLIP_MODEL,
+                is_cuda_oom_error,
+            )
 
         if args.faces:
             face = FaceEmbedder(default_insightface_root())

@@ -2689,13 +2689,16 @@ def normalize_clip_model_name(model_name: str) -> str:
 
 
 class ClipEmbedder:
-    def __init__(self, model_name: str, batch_size: int) -> None:
+    def __init__(self, model_name: str, batch_size: int, device: str = "cuda") -> None:
         import open_clip
 
         self.batch_size = batch_size
-        if not torch.cuda.is_available():
+        requested_device = device.lower()
+        if requested_device not in {"cuda", "cpu"}:
+            raise ValueError(f"unsupported CLIP device: {device}")
+        if requested_device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CLIP/SigLIP image embeddings require CUDA but CUDA is unavailable.")
-        self.device = torch.device("cuda")
+        self.device = torch.device(requested_device)
         resolved_model_name = normalize_clip_model_name(model_name)
         self.model, _, self.transform = open_clip.create_model_and_transforms(
             resolved_model_name,
