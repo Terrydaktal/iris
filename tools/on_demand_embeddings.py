@@ -24,20 +24,16 @@ def emit(payload: dict) -> int:
     return 0
 
 
-def resolve_imagesearch_root() -> Path:
-    from_env = os.environ.get("IRIS_IMAGESEARCH_DIR", "").strip()
+def resolve_media_indexer_root() -> Path:
+    from_env = os.environ.get("IRIS_MEDIA_INDEXER_DIR", "").strip()
     if from_env:
         return Path(from_env).expanduser()
 
     here = Path(__file__).resolve()
     candidates = [
         here.parent / "media_indexer",
-        here.parent.parent / "imagesearch",
         here.parent.parent / "tools" / "media_indexer",
-        Path.cwd(),
         Path.cwd() / "tools" / "media_indexer",
-        Path.cwd() / "../imagesearch",
-        Path.cwd() / "imagesearch",
     ]
     for candidate in candidates:
         if candidate.is_dir():
@@ -83,8 +79,8 @@ def main() -> int:
         return emit({"ok": False, "error": f"image does not exist: {image_path}"})
 
     # Reuse the integrated media indexer implementation and model configuration.
-    imagesearch_root = resolve_imagesearch_root()
-    sys.path.insert(0, str(imagesearch_root))
+    media_indexer_root = resolve_media_indexer_root()
+    sys.path.insert(0, str(media_indexer_root))
     try:
         from main import (
             ClipEmbedder,

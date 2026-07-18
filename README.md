@@ -102,7 +102,7 @@ For this repo, the expected default is the repo-local `lancedb/`. That directory
 Environment variables:
 
 - `IRIS_DB_DIR`: override LanceDB directory.
-- `IRIS_IMAGESEARCH_DIR`: override the media indexer/runtime helper directory. Defaults to `tools/media_indexer`.
+- `IRIS_MEDIA_INDEXER_DIR`: override the integrated media indexer/runtime helper directory. Defaults to `tools/media_indexer`.
 - `IRIS_ON_DEMAND_EMBED_SCRIPT`: override the on-demand embedding helper path.
 - `IRIS_EXIFTOOL`: explicit `exiftool` path.
 - `IRIS_FFPROBE`: explicit `ffprobe` path.

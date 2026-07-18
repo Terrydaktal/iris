@@ -23,10 +23,28 @@ use rayon::prelude::*;
 use serde_json::Value;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
+const IMAGE_VIEWER_TOP_BAR_HEIGHT: f32 = 32.0;
+const INITIAL_IMAGE_DISPLAY_HEIGHT: f32 = 1200.0;
+
 fn get_socket_path() -> PathBuf {
     let username = std::env::var("USER")
         .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string()));
     std::env::temp_dir().join(format!("iris_{}.sock", username))
+}
+
+fn initial_window_size(path: &Path, start_on_home_page: bool) -> [f32; 2] {
+    if !start_on_home_page && path.is_file() && !is_video_path(path) {
+        if let Ok((width, height)) = image::image_dimensions(path) {
+            if width > 0 && height > 0 {
+                let scale = INITIAL_IMAGE_DISPLAY_HEIGHT / height as f32;
+                return [
+                    width as f32 * scale,
+                    INITIAL_IMAGE_DISPLAY_HEIGHT + IMAGE_VIEWER_TOP_BAR_HEIGHT,
+                ];
+            }
+        }
+    }
+    [1200.0, 800.0]
 }
 
 fn main() -> eframe::Result {
@@ -132,10 +150,11 @@ fn main() -> eframe::Result {
         });
     }
 
+    let window_size = initial_window_size(&image_path, start_on_home_page);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("iris")
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size(window_size)
             .with_title("Iris"),
         ..Default::default()
     };
@@ -2527,8 +2546,8 @@ fn get_db_dir() -> PathBuf {
         .clone()
 }
 
-fn resolve_imagesearch_dir() -> PathBuf {
-    if let Ok(raw) = std::env::var("IRIS_IMAGESEARCH_DIR") {
+fn resolve_media_indexer_dir() -> PathBuf {
+    if let Ok(raw) = std::env::var("IRIS_MEDIA_INDEXER_DIR") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -2538,11 +2557,8 @@ fn resolve_imagesearch_dir() -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("tools/media_indexer"));
-        candidates.push(cwd.join("../imagesearch"));
-        candidates.push(cwd.join("imagesearch"));
     }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/media_indexer"));
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../imagesearch"));
 
     for candidate in candidates {
         if candidate.is_dir() {
@@ -3215,9 +3231,9 @@ fn resolve_video_still(
 }
 
 fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
-    let imagesearch_dir = resolve_imagesearch_dir();
+    let media_indexer_dir = resolve_media_indexer_dir();
     let output = Command::new("uv")
-        .current_dir(&imagesearch_dir)
+        .current_dir(&media_indexer_dir)
         .args([
             "run",
             "python",
@@ -3290,10 +3306,10 @@ fn run_sift_repair_for_files(file_names: &[String]) -> Result<SiftRepairResult> 
     let payload = serde_json::to_string(file_names).context("failed to serialize selected file list")?;
     std::fs::write(&temp_path, payload).context("failed to write selected file list")?;
 
-    let imagesearch_dir = resolve_imagesearch_dir();
+    let media_indexer_dir = resolve_media_indexer_dir();
     let mut command = Command::new("uv");
     command
-        .current_dir(&imagesearch_dir)
+        .current_dir(&media_indexer_dir)
         .args([
             "run",
             "python",
@@ -3349,10 +3365,10 @@ fn compute_on_demand_embeddings(
     need_clip: bool,
     need_faces: bool,
 ) -> Result<(Option<Vec<f32>>, Vec<Vec<f32>>)> {
-    let imagesearch_dir = resolve_imagesearch_dir();
+    let media_indexer_dir = resolve_media_indexer_dir();
     let helper_script = resolve_on_demand_embeddings_script_path();
     let mut cmd = Command::new("uv");
-    cmd.current_dir(&imagesearch_dir);
+    cmd.current_dir(&media_indexer_dir);
     cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
     cmd.args(["run", "python"]);
     cmd.arg(&helper_script);
@@ -3373,7 +3389,7 @@ fn compute_on_demand_embeddings(
         bail!(
         "embedding helper failed (status {}) using {} and {}: {}",
             output.status,
-            imagesearch_dir.display(),
+            media_indexer_dir.display(),
             helper_script.display(),
             if stderr.is_empty() {
                 "unknown error"
@@ -4252,9 +4268,9 @@ impl ImageViewer {
                 let db_dir_buf = get_db_dir();
                 let db_dir = db_dir_buf.as_path();
                 let table_name = MEDIA_INDEX_TABLE;
-                let imagesearch_dir = resolve_imagesearch_dir();
-                let onnx_path_buf = imagesearch_dir.join("models/clip-text/clip_text.onnx");
-                let tokenizer_path_buf = imagesearch_dir.join("models/clip-text/tokenizer.json");
+                let media_indexer_dir = resolve_media_indexer_dir();
+                let onnx_path_buf = media_indexer_dir.join("models/clip-text/clip_text.onnx");
+                let tokenizer_path_buf = media_indexer_dir.join("models/clip-text/tokenizer.json");
                 let onnx_path = onnx_path_buf.as_path();
                 let tokenizer_path = tokenizer_path_buf.as_path();
 
@@ -7210,7 +7226,9 @@ impl eframe::App for ImageViewer {
             return;
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(IMAGE_VIEWER_TOP_BAR_HEIGHT)
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Iris");
                 ui.separator();
