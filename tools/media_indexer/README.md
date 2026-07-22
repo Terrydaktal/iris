@@ -44,6 +44,12 @@ Iris text-to-image search uses an ONNX export of the same model's text tower fro
 `models/clip-text`. On-demand image and face embedding imports the same OpenCLIP and
 InsightFace implementations from this directory.
 
+`tools/sift_similarity.py` is the viewer's on-demand SIFT helper. Its normal mode
+returns pairwise match statistics as JSON. Its `--align-all` mode compares each
+candidate with a reference image, computes a RANSAC homography, and writes
+temporary reference-sized aligned PNGs for Iris to display; it does not modify
+the source media or the database.
+
 The searchable vector indexes are maintained in LanceDB side tables:
 
 - `<table>_face_ann`

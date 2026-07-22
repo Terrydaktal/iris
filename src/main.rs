@@ -14,6 +14,7 @@ use arrow_array::{
     RecordBatchIterator,
     StringArray, StructArray,
 };
+use chrono::{DateTime, Local};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::AddDataMode;
@@ -47,11 +48,16 @@ fn initial_window_size(path: &Path, start_on_home_page: bool) -> [f32; 2] {
     [1200.0, 800.0]
 }
 
+enum OpenRequest {
+    Single(PathBuf),
+    Comparison(Vec<PathBuf>),
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     let mut reuse_window = false;
     let mut no_daemon = false;
-    let mut image_arg = None;
+    let mut image_args = Vec::new();
 
     for arg in args.iter().skip(1) {
         if arg == "--same-window" || arg == "-s" || arg == "--reuse-window" || arg == "-r" {
@@ -61,17 +67,40 @@ fn main() -> eframe::Result {
         } else if arg == "--no-daemon" {
             no_daemon = true;
         } else {
-            image_arg = Some(arg.clone());
+            image_args.push(arg.clone());
         }
     }
 
-    let mut start_on_home_page = false;
-    let image_path = match image_arg {
-        Some(path_str) => PathBuf::from(&path_str).canonicalize().unwrap_or_else(|_| PathBuf::from(&path_str)),
-        None => {
-            start_on_home_page = true;
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        }
+    if image_args.len() > 6 {
+        eprintln!("Iris comparison mode accepts at most six paths.");
+        return Ok(());
+    }
+    let requested_paths: Vec<PathBuf> = image_args
+        .into_iter()
+        .map(|path| {
+            let path = PathBuf::from(path);
+            path.canonicalize().unwrap_or(path)
+        })
+        .collect();
+    let start_on_home_page = requested_paths.is_empty();
+    let comparison_paths = (requested_paths.len() >= 2).then(|| requested_paths.clone());
+    let image_path = requested_paths.first().cloned().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+
+    let request_payload = || {
+        comparison_paths
+            .as_ref()
+            .map(|paths| {
+                serde_json::to_string(
+                    &paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("comparison paths should be serializable")
+            })
+            .unwrap_or_else(|| image_path.to_string_lossy().to_string())
     };
 
     let socket_path = get_socket_path();
@@ -82,11 +111,11 @@ fn main() -> eframe::Result {
         socket_active = true;
         if reuse_window {
             use std::io::Write;
-            let path_str = image_path.to_string_lossy().to_string();
-            if let Err(e) = stream.write_all(path_str.as_bytes()) {
+            let payload = request_payload();
+            if let Err(e) = stream.write_all(payload.as_bytes()) {
                 eprintln!("Error sending path to existing instance: {}", e);
             } else {
-                println!("Opened {} in the existing window.", path_str);
+                println!("Opened requested path(s) in the existing window.");
                 std::process::exit(0);
             }
         }
@@ -114,7 +143,7 @@ fn main() -> eframe::Result {
     }
 
     let ctx_shared: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
-    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let (tx, rx) = std::sync::mpsc::channel::<OpenRequest>();
     let bind_socket = !socket_active;
 
     if bind_socket {
@@ -134,8 +163,14 @@ fn main() -> eframe::Result {
                         if let Ok(_) = stream.read_to_end(&mut buf) {
                             if !buf.is_empty() {
                                 if let Ok(path_str) = String::from_utf8(buf) {
-                                    let new_path = PathBuf::from(path_str);
-                                    let _ = tx_clone.send(new_path);
+                                    let request = serde_json::from_str::<Vec<String>>(&path_str)
+                                        .map(|paths| {
+                                            OpenRequest::Comparison(
+                                                paths.into_iter().map(PathBuf::from).collect(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|_| OpenRequest::Single(PathBuf::from(path_str)));
+                                    let _ = tx_clone.send(request);
                                     if let Ok(lock) = ctx_shared_clone.lock() {
                                         if let Some(ctx) = lock.as_ref() {
                                             ctx.request_repaint();
@@ -162,6 +197,7 @@ fn main() -> eframe::Result {
     let rx_shared = Arc::new(Mutex::new(Some(rx)));
     let rx_shared_clone = rx_shared.clone();
     let image_path_clone = image_path.clone();
+    let comparison_paths_clone = comparison_paths.clone();
     let ctx_shared_clone = ctx_shared.clone();
 
     let mut result = eframe::run_native(
@@ -170,7 +206,13 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let rx_taken = rx_shared_clone.lock().unwrap().take().unwrap();
-            Ok(Box::new(ImageViewer::new(image_path_clone, rx_taken, ctx_shared_clone, start_on_home_page)))
+            Ok(Box::new(ImageViewer::new(
+                image_path_clone,
+                rx_taken,
+                ctx_shared_clone,
+                start_on_home_page,
+                comparison_paths_clone,
+            )))
         }),
     );
 
@@ -183,7 +225,13 @@ fn main() -> eframe::Result {
             Box::new(move |cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 let rx_taken = rx_shared.lock().unwrap().take().unwrap();
-                Ok(Box::new(ImageViewer::new(image_path, rx_taken, ctx_shared, start_on_home_page)))
+                Ok(Box::new(ImageViewer::new(
+                    image_path,
+                    rx_taken,
+                    ctx_shared,
+                    start_on_home_page,
+                    comparison_paths,
+                )))
             }),
         );
     }
@@ -338,16 +386,23 @@ fn load_ffprobe_metadata(path: &Path) -> String {
     }
 }
 
-fn load_video_duration(path: &Path) -> Option<f32> {
+#[derive(Clone, Copy)]
+struct VideoMetadata {
+    duration_sec: Option<f32>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+fn load_video_metadata(path: &Path) -> Option<VideoMetadata> {
     let ffprobe_path = resolve_ffprobe_path()?;
     let out = Command::new(ffprobe_path)
         .args([
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "format=duration:stream=codec_type,width,height",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "json",
         ])
         .arg(path)
         .output()
@@ -355,9 +410,38 @@ fn load_video_duration(path: &Path) -> Option<f32> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let duration = text.trim().parse::<f32>().ok()?;
-    duration.is_finite().then_some(duration).filter(|value| *value > 0.0)
+    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let duration_sec = json
+        .get("format")
+        .and_then(|format| format.get("duration"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .map(|duration| duration as f32)
+                .or_else(|| value.as_str()?.parse::<f32>().ok())
+        })
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    let video_stream = json
+        .get("streams")
+        .and_then(Value::as_array)
+        .and_then(|streams| {
+            streams.iter().find(|stream| {
+                stream.get("codec_type").and_then(Value::as_str) == Some("video")
+            })
+        });
+    let width = video_stream
+        .and_then(|stream| stream.get("width"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let height = video_stream
+        .and_then(|stream| stream.get("height"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    (duration_sec.is_some() || width.is_some() || height.is_some()).then_some(VideoMetadata {
+        duration_sec,
+        width,
+        height,
+    })
 }
 
 fn format_video_duration(duration_sec: f32) -> String {
@@ -1121,11 +1205,51 @@ fn collect_images_recursive(dir: &Path, tx: &std::sync::mpsc::Sender<PathBuf>, v
     }
 }
 
+fn collect_flat_images(dir: &Path) -> Vec<PathBuf> {
+    let mut collected = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_file() && is_supported_media_path(&path) && !is_video_path(&path) {
+                collected.push(path);
+            }
+        }
+    }
+    collected.sort();
+    collected
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchMode {
     Filename,
     Clip,
     Ocr,
+}
+
+#[derive(Clone)]
+struct SearchSnapshot {
+    semantic_query: String,
+    applied_filename_query: String,
+    filename_search_results: Option<Vec<usize>>,
+    semantic_folder: String,
+    semantic_limit: usize,
+    semantic_video_only: bool,
+    semantic_mode: SearchMode,
+    semantic_results: Vec<SearchResult>,
+    semantic_results_mode: Option<SearchMode>,
+    semantic_status: String,
+}
+
+#[derive(Clone)]
+struct GalleryImageSnapshot {
+    images: Vec<PathBuf>,
+    current_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ImageViewState {
+    zoom: f32,
+    offset: egui::Vec2,
 }
 
 struct ClipIndex {
@@ -1205,6 +1329,14 @@ struct OnDemandEmbedResult {
 struct SiftRepairResult {
     summary: String,
     files: usize,
+}
+
+struct SiftAlignAllResult {
+    reference: PathBuf,
+    aligned_paths: HashMap<PathBuf, PathBuf>,
+    summary: String,
+    details: Vec<String>,
+    output_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -3283,6 +3415,112 @@ fn compute_sift_summary(path_a: &Path, path_b: &Path) -> Result<String> {
     ))
 }
 
+fn run_sift_alignment_batch(
+    reference: &Path,
+    candidates: &[PathBuf],
+    output_dir: &Path,
+) -> Result<SiftAlignAllResult> {
+    if candidates.is_empty() {
+        bail!("there are no comparison images to align");
+    }
+
+    let media_indexer_dir = resolve_media_indexer_dir();
+    let mut command = Command::new("uv");
+    command
+        .current_dir(&media_indexer_dir)
+        .args(["run", "python", "tools/sift_similarity.py", "--align-all"])
+        .arg(reference)
+        .arg(output_dir);
+    for candidate in candidates {
+        command.arg(candidate);
+    }
+
+    let output = command
+        .output()
+        .context("failed to run the SIFT alignment helper")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("SIFT alignment helper failed: {}", stderr.trim());
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .context("invalid SIFT alignment helper JSON")?;
+    if let Some(err) = payload.get("error").and_then(Value::as_str) {
+        bail!("{err}");
+    }
+
+    let reference = payload
+        .get("reference")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| reference.to_path_buf());
+    let mut aligned_paths = HashMap::new();
+    let mut details = Vec::new();
+    let mut aligned_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for item in payload
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        let inliers = item
+            .get("inlier_matches")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let good_matches = item
+            .get("good_matches")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let inlier_ratio = item
+            .get("inlier_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("comparison image");
+
+        if let Some(aligned_path) = item.get("aligned_path").and_then(Value::as_str) {
+            aligned_count += 1;
+            aligned_paths.insert(path.clone(), PathBuf::from(aligned_path));
+            details.push(format!(
+                "{name}: aligned, score {score:.4}, {inliers}/{good_matches} inliers ({:.1}%)",
+                inlier_ratio * 100.0
+            ));
+        } else {
+            failed_count += 1;
+            let error = item
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("no aligned output");
+            details.push(format!("{name}: not aligned ({error})"));
+        }
+    }
+
+    let summary = format!(
+        "SIFT alignment complete: {aligned_count}/{} comparison images aligned{}.",
+        candidates.len(),
+        if failed_count > 0 {
+            format!("; {failed_count} could not be aligned")
+        } else {
+            String::new()
+        }
+    );
+    Ok(SiftAlignAllResult {
+        reference,
+        aligned_paths,
+        summary,
+        details,
+        output_dir: output_dir.to_path_buf(),
+    })
+}
+
 fn run_sift_repair_for_files(file_names: &[String]) -> Result<SiftRepairResult> {
     if file_names.len() < 2 {
         bail!("select at least two indexed images");
@@ -3472,6 +3710,13 @@ struct ImageEditor {
 struct ImageViewer {
     images: Vec<PathBuf>,
     current_index: usize,
+    comparison_paths: Option<Vec<PathBuf>>,
+    comparison_view_states: HashMap<PathBuf, ImageViewState>,
+    comparison_aligned_paths: HashMap<PathBuf, PathBuf>,
+    comparison_alignment_temp_dir: Option<PathBuf>,
+    comparison_alignment_status: String,
+    comparison_path_dialog_open: bool,
+    comparison_path_input: String,
     zoom: f32,
     offset: egui::Vec2,
     exif_data: String,
@@ -3484,9 +3729,11 @@ struct ImageViewer {
     side_panel_open_pending_frames: u8,
     chunks: Vec<FileChunk>,
     viewport_bg: Option<egui::Color32>,
-    rx: Receiver<PathBuf>,
+    rx: Receiver<OpenRequest>,
     show_grid: bool,
     recursive_images: Vec<PathBuf>,
+    recursive_video_indices: Vec<usize>,
+    gallery_thumbnail_scale: f32,
     grid_loading: bool,
     recursive_rx: Option<Receiver<PathBuf>>,
     back_target_is_gallery: bool,
@@ -3495,6 +3742,9 @@ struct ImageViewer {
     open_target: PathBuf,
     open_target_is_dir: bool,
     flat_loading: bool,
+    flat_refresh_in_flight: bool,
+    flat_last_refresh_check: Instant,
+    flat_directory_mtime: Option<SystemTime>,
     flat_images_shared: Arc<Mutex<Option<Vec<PathBuf>>>>,
     current_dimensions: String,
     current_file_size: String,
@@ -3505,10 +3755,10 @@ struct ImageViewer {
     thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
     thumbnail_active_threads: usize,
-    video_duration_cache: HashMap<PathBuf, Option<f32>>,
-    video_duration_loading: HashSet<PathBuf>,
-    video_duration_rx: std::sync::mpsc::Receiver<(PathBuf, Option<f32>)>,
-    video_duration_tx: std::sync::mpsc::Sender<(PathBuf, Option<f32>)>,
+    video_duration_cache: std::cell::RefCell<HashMap<PathBuf, Option<VideoMetadata>>>,
+    video_duration_loading: std::cell::RefCell<HashSet<PathBuf>>,
+    video_duration_rx: std::sync::mpsc::Receiver<(PathBuf, Option<VideoMetadata>)>,
+    video_duration_tx: std::sync::mpsc::Sender<(PathBuf, Option<VideoMetadata>)>,
     
     // AI Database & Explorer States
     db_loaded: bool,
@@ -3519,6 +3769,9 @@ struct ImageViewer {
     db_rx: Option<Receiver<DatabaseLoadMessage>>,
     db_indices: Option<DatabaseIndices>,
     semantic_query: String,
+    search_history: Vec<SearchSnapshot>,
+    search_forward_history: Vec<SearchSnapshot>,
+    gallery_image_forward: Option<GalleryImageSnapshot>,
     applied_filename_query: String,
     filename_search_results: Option<Vec<usize>>,
     semantic_folder: String,
@@ -3538,6 +3791,8 @@ struct ImageViewer {
     expanded_duplicate_rows: HashSet<String>,
     sift_running: bool,
     sift_rx: Option<Receiver<Result<String, String>>>,
+    sift_align_all_running: bool,
+    sift_align_all_rx: Option<Receiver<Result<SiftAlignAllResult, String>>>,
     selected_grid_files: Vec<String>,
     sift_repair_running: bool,
     sift_repair_rx: Option<Receiver<Result<SiftRepairResult, String>>>,
@@ -3560,11 +3815,14 @@ struct ImageViewer {
     show_home_page: bool,
     home_current_dir: Option<PathBuf>,
     home_selected_dir: Option<PathBuf>,
+    viewer_rotation_quarter_turns: u8,
+    viewer_rotation_path: Option<PathBuf>,
 }
 
-fn file_resolution_and_size(path: &Path) -> String {
-    let size_label = match std::fs::metadata(path) {
-        Ok(meta) => {
+fn file_size_and_modified(path: &Path) -> String {
+    let metadata = std::fs::metadata(path).ok();
+    let size_label = match metadata.as_ref() {
+        Some(meta) => {
             let bytes = meta.len();
             const KB: u64 = 1024;
             const MB: u64 = KB * 1024;
@@ -3579,11 +3837,25 @@ fn file_resolution_and_size(path: &Path) -> String {
                 format!("{} B", bytes)
             }
         }
-        Err(_) => "n/a".to_string(),
+        None => "n/a".to_string(),
     };
+    let modified_label = metadata
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .map(|modified| {
+            DateTime::<Local>::from(modified)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{} | Modified {}", size_label, modified_label)
+}
+
+fn file_resolution_and_size(path: &Path) -> String {
+    let size_modified = file_size_and_modified(path);
     match image::image_dimensions(path) {
-        Ok((w, h)) => format!("{}x{} | {}", w, h, size_label),
-        Err(_) => size_label,
+        Ok((w, h)) => format!("{}x{} | {}", w, h, size_modified),
+        Err(_) => size_modified,
     }
 }
 
@@ -4083,19 +4355,37 @@ impl ImageViewer {
 
     fn new(
         path: PathBuf,
-        rx: Receiver<PathBuf>,
+        rx: Receiver<OpenRequest>,
         ctx_shared: Arc<Mutex<Option<egui::Context>>>,
         start_on_home_page: bool,
+        comparison_paths: Option<Vec<PathBuf>>,
     ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
         let open_target = path.clone();
-        let open_target_is_dir = start_on_home_page || path.is_dir();
+        let comparison_paths = comparison_paths.map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .take(6)
+                .collect::<Vec<_>>()
+        });
+        let comparison_mode = comparison_paths.as_ref().is_some_and(|paths| paths.len() >= 2);
+        let initial_images = if comparison_mode {
+            comparison_paths.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let open_target_is_dir = if comparison_mode {
+            false
+        } else {
+            start_on_home_page || path.is_dir()
+        };
 
-        let mut images = Vec::new();
-        let flat_loading = !start_on_home_page;
+        let mut images = initial_images;
+        let flat_loading = !start_on_home_page && !comparison_mode;
         let flat_images_shared = Arc::new(Mutex::new(None));
 
-        if !start_on_home_page {
+        if !start_on_home_page && !comparison_mode {
             if path.is_dir() {
                 let shared = flat_images_shared.clone();
                 let parent_absolute = path.clone();
@@ -4147,11 +4437,18 @@ impl ImageViewer {
 
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel::<(PathBuf, egui::ColorImage)>();
         let (video_duration_tx, video_duration_rx) =
-            std::sync::mpsc::channel::<(PathBuf, Option<f32>)>();
+            std::sync::mpsc::channel::<(PathBuf, Option<VideoMetadata>)>();
 
         let mut viewer = Self {
             images,
             current_index: 0,
+            comparison_paths,
+            comparison_view_states: HashMap::new(),
+            comparison_aligned_paths: HashMap::new(),
+            comparison_alignment_temp_dir: None,
+            comparison_alignment_status: String::new(),
+            comparison_path_dialog_open: false,
+            comparison_path_input: String::new(),
             zoom: 1.0,
             offset: egui::Vec2::ZERO,
             exif_data: String::new(),
@@ -4167,6 +4464,8 @@ impl ImageViewer {
             rx,
             show_grid: false,
             recursive_images: Vec::new(),
+            recursive_video_indices: Vec::new(),
+            gallery_thumbnail_scale: 1.0,
             grid_loading: false,
             recursive_rx: None,
             back_target_is_gallery: false,
@@ -4175,6 +4474,9 @@ impl ImageViewer {
             open_target,
             open_target_is_dir,
             flat_loading,
+            flat_refresh_in_flight: false,
+            flat_last_refresh_check: Instant::now(),
+            flat_directory_mtime: None,
             flat_images_shared,
             current_dimensions: String::new(),
             current_file_size: String::new(),
@@ -4185,8 +4487,8 @@ impl ImageViewer {
             thumbnail_rx,
             thumbnail_tx,
             thumbnail_active_threads: 0,
-            video_duration_cache: HashMap::new(),
-            video_duration_loading: HashSet::new(),
+            video_duration_cache: std::cell::RefCell::new(HashMap::new()),
+            video_duration_loading: std::cell::RefCell::new(HashSet::new()),
             video_duration_rx,
             video_duration_tx,
             
@@ -4199,6 +4501,9 @@ impl ImageViewer {
             db_rx: None,
             db_indices: None,
             semantic_query: String::new(),
+            search_history: Vec::new(),
+            search_forward_history: Vec::new(),
+            gallery_image_forward: None,
             applied_filename_query: String::new(),
             filename_search_results: None,
             semantic_folder: String::new(),
@@ -4218,6 +4523,8 @@ impl ImageViewer {
             expanded_duplicate_rows: HashSet::new(),
             sift_running: false,
             sift_rx: None,
+            sift_align_all_running: false,
+            sift_align_all_rx: None,
             selected_grid_files: Vec::new(),
             sift_repair_running: false,
             sift_repair_rx: None,
@@ -4230,7 +4537,21 @@ impl ImageViewer {
             show_home_page: start_on_home_page,
             home_current_dir: None,
             home_selected_dir: None,
+            viewer_rotation_quarter_turns: 0,
+            viewer_rotation_path: None,
         };
+
+        if viewer.is_comparison_mode() {
+            for path in &viewer.images {
+                viewer.comparison_view_states.insert(
+                    path.clone(),
+                    ImageViewState {
+                        zoom: 1.0,
+                        offset: egui::Vec2::ZERO,
+                    },
+                );
+            }
+        }
         
         if !start_on_home_page {
             viewer.update_current_file_info();
@@ -4616,6 +4937,14 @@ impl ImageViewer {
         path.to_path_buf()
     }
 
+    fn comparison_display_path(&self, path: &Path) -> PathBuf {
+        self.comparison_aligned_paths
+            .get(path)
+            .filter(|aligned| aligned.is_file())
+            .cloned()
+            .unwrap_or_else(|| self.get_thumbnail_path(path))
+    }
+
     fn video_source_path_for_tile(&self, path: &Path, db_filename: Option<&str>) -> PathBuf {
         if let Some(db_name) = db_filename {
             let roots = get_db_roots();
@@ -4626,17 +4955,17 @@ impl ImageViewer {
         self.resolve_actual_path(path)
     }
 
-    fn cached_video_duration(&mut self, path: &Path, ctx: &egui::Context) -> Option<f32> {
-        if let Some(duration) = self.video_duration_cache.get(path) {
-            return *duration;
+    fn cached_video_metadata(&self, path: &Path, ctx: &egui::Context) -> Option<VideoMetadata> {
+        if let Some(metadata) = self.video_duration_cache.borrow().get(path) {
+            return *metadata;
         }
-        if self.video_duration_loading.insert(path.to_path_buf()) {
+        if self.video_duration_loading.borrow_mut().insert(path.to_path_buf()) {
             let path_clone = path.to_path_buf();
             let tx = self.video_duration_tx.clone();
             let ctx_clone = ctx.clone();
             rayon::spawn(move || {
-                let duration = load_video_duration(&path_clone);
-                let _ = tx.send((path_clone, duration));
+                let metadata = load_video_metadata(&path_clone);
+                let _ = tx.send((path_clone, metadata));
                 ctx_clone.request_repaint();
             });
         }
@@ -4650,6 +4979,30 @@ impl ImageViewer {
         let result = file_resolution_and_size(path);
         self.resolution_size_cache.borrow_mut().insert(path.to_path_buf(), result.clone());
         result
+    }
+
+    fn get_duplicate_media_info(
+        &self,
+        path: &Path,
+        is_video: bool,
+        ctx: &egui::Context,
+    ) -> String {
+        if !is_video {
+            return self.get_file_resolution_and_size(path);
+        }
+        let size_modified = file_size_and_modified(path);
+        let metadata = self.cached_video_metadata(path, ctx);
+        let duration = metadata
+            .and_then(|metadata| metadata.duration_sec)
+            .map(format_video_duration)
+            .unwrap_or_else(|| "n/a".to_string());
+        let resolution = metadata
+            .and_then(|metadata| match (metadata.width, metadata.height) {
+                (Some(width), Some(height)) => Some(format!("{}x{}", width, height)),
+                _ => None,
+            })
+            .unwrap_or_else(|| "n/a".to_string());
+        format!("{} | {} | {}", duration, resolution, size_modified)
     }
 
 
@@ -4749,6 +5102,141 @@ impl ImageViewer {
         }
     }
 
+    fn current_search_snapshot(&self) -> SearchSnapshot {
+        SearchSnapshot {
+            semantic_query: self.semantic_query.clone(),
+            applied_filename_query: self.applied_filename_query.clone(),
+            filename_search_results: self.filename_search_results.clone(),
+            semantic_folder: self.semantic_folder.clone(),
+            semantic_limit: self.semantic_limit,
+            semantic_video_only: self.semantic_video_only,
+            semantic_mode: self.semantic_mode,
+            semantic_results: self.semantic_results.clone(),
+            semantic_results_mode: self.semantic_results_mode,
+            semantic_status: self.semantic_status.clone(),
+        }
+    }
+
+    fn same_search_snapshot(left: &SearchSnapshot, right: &SearchSnapshot) -> bool {
+        left.semantic_query == right.semantic_query
+            && left.applied_filename_query == right.applied_filename_query
+            && left.filename_search_results == right.filename_search_results
+            && left.semantic_folder == right.semantic_folder
+            && left.semantic_limit == right.semantic_limit
+            && left.semantic_video_only == right.semantic_video_only
+            && left.semantic_mode == right.semantic_mode
+            && left.semantic_results_mode == right.semantic_results_mode
+            && left.semantic_results.len() == right.semantic_results.len()
+            && left
+                .semantic_results
+                .iter()
+                .zip(&right.semantic_results)
+                .all(|(left, right)| {
+                    left.file_name == right.file_name
+                        && left.is_video == right.is_video
+                        && left.timestamp_sec.to_bits() == right.timestamp_sec.to_bits()
+                        && left.media_path == right.media_path
+                })
+    }
+
+    fn push_search_history(&mut self) {
+        let snapshot = self.current_search_snapshot();
+        self.search_forward_history.clear();
+        // A new search starts a new navigation branch, so an image from the old
+        // gallery branch must not be restored by a later forward click.
+        self.gallery_image_forward = None;
+        if self
+            .search_history
+            .last()
+            .is_some_and(|last| Self::same_search_snapshot(last, &snapshot))
+        {
+            return;
+        }
+
+        self.search_history.push(snapshot);
+        const MAX_SEARCH_HISTORY: usize = 20;
+        if self.search_history.len() > MAX_SEARCH_HISTORY {
+            self.search_history.remove(0);
+        }
+    }
+
+    fn remember_gallery_image(&mut self) {
+        if self.images.is_empty() || self.current_index >= self.images.len() {
+            self.gallery_image_forward = None;
+            return;
+        }
+
+        self.gallery_image_forward = Some(GalleryImageSnapshot {
+            images: self.images.clone(),
+            current_index: self.current_index,
+        });
+    }
+
+    fn restore_gallery_image(&mut self, ctx: &egui::Context) -> bool {
+        let Some(snapshot) = self.gallery_image_forward.clone() else {
+            return false;
+        };
+
+        self.images = snapshot.images;
+        self.current_index = snapshot
+            .current_index
+            .min(self.images.len().saturating_sub(1));
+        self.show_grid = false;
+        self.back_target_is_gallery = true;
+        self.zoom = 1.0;
+        self.offset = egui::Vec2::ZERO;
+        self.update_current_file_info();
+        self.update_side_panel_metadata_if_needed();
+        ctx.request_repaint();
+        true
+    }
+
+    fn apply_search_snapshot(&mut self, snapshot: SearchSnapshot, ctx: &egui::Context) {
+        self.semantic_query = snapshot.semantic_query;
+        self.applied_filename_query = snapshot.applied_filename_query;
+        self.filename_search_results = snapshot.filename_search_results;
+        self.semantic_folder = snapshot.semantic_folder;
+        self.semantic_limit = snapshot.semantic_limit;
+        self.semantic_video_only = snapshot.semantic_video_only;
+        self.semantic_mode = snapshot.semantic_mode;
+        self.semantic_results = snapshot.semantic_results;
+        self.semantic_results_mode = snapshot.semantic_results_mode;
+        self.semantic_status = snapshot.semantic_status;
+        self.pending_search_request = None;
+        self.pending_semantic_search_mode = None;
+        self.on_demand_embed_rx = None;
+        self.selected_grid_files.clear();
+        self.show_grid = true;
+        self.back_target_is_gallery = false;
+        ctx.request_repaint();
+    }
+
+    fn restore_previous_search(&mut self, ctx: &egui::Context) -> bool {
+        let Some(snapshot) = self.search_history.pop() else {
+            return false;
+        };
+
+        let current = self.current_search_snapshot();
+        if !Self::same_search_snapshot(&current, &snapshot) {
+            self.search_forward_history.push(current);
+        }
+        self.apply_search_snapshot(snapshot, ctx);
+        true
+    }
+
+    fn restore_next_search(&mut self, ctx: &egui::Context) -> bool {
+        let Some(snapshot) = self.search_forward_history.pop() else {
+            return false;
+        };
+
+        let current = self.current_search_snapshot();
+        if !Self::same_search_snapshot(&current, &snapshot) {
+            self.search_history.push(current);
+        }
+        self.apply_search_snapshot(snapshot, ctx);
+        true
+    }
+
     fn apply_filename_search(&mut self) {
         self.applied_filename_query = self.semantic_query.trim().to_string();
         if self.applied_filename_query.is_empty() {
@@ -4819,6 +5307,7 @@ impl ImageViewer {
     }
 
     fn submit_semantic_search(&mut self, ctx: &egui::Context) {
+        self.push_search_history();
         if self.semantic_mode == SearchMode::Filename {
             self.apply_filename_search();
             return;
@@ -5093,13 +5582,6 @@ impl ImageViewer {
             is_video: false,
             timestamp_sec: 0.0,
         };
-        self.semantic_query = "clipboard image".to_string();
-        self.semantic_results.clear();
-        self.semantic_results_mode = None;
-        self.semantic_status = format!(
-            "Computing CLIP embedding for pasted clipboard image {}...",
-            path.file_name().and_then(|name| name.to_str()).unwrap_or("clipboard image")
-        );
         self.request_search_action(request, ctx);
     }
 
@@ -5163,6 +5645,114 @@ impl ImageViewer {
             let _ = tx.send(result);
             ctx.request_repaint();
         });
+    }
+
+    fn start_sift_align_all(&mut self, ctx: &egui::Context) {
+        if !self.is_comparison_mode() || self.sift_align_all_running {
+            return;
+        }
+        if self.images.len() < 2 {
+            self.comparison_alignment_status =
+                "SIFT alignment needs at least two comparison images.".to_string();
+            return;
+        }
+        if self.images.iter().any(|path| is_video_path(path)) {
+            self.comparison_alignment_status =
+                "SIFT alignment currently supports still images only.".to_string();
+            return;
+        }
+
+        let reference = self.images[0].clone();
+        let candidates: Vec<PathBuf> = self
+            .images
+            .iter()
+            .skip(1)
+            .filter(|path| {
+                self.comparison_aligned_paths
+                    .get(*path)
+                    .map(|aligned| !aligned.is_file())
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            self.comparison_alignment_status = format!(
+                "SIFT alignment already complete for all {} comparison images.",
+                self.images.len()
+            );
+            return;
+        }
+
+        let output_dir = self.comparison_alignment_temp_dir.clone().unwrap_or_else(|| {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            std::env::temp_dir().join(format!(
+                "iris_sift_align_{}_{}",
+                std::process::id(),
+                stamp
+            ))
+        });
+        if let Err(err) = std::fs::create_dir_all(&output_dir) {
+            self.comparison_alignment_status =
+                format!("Could not create temporary SIFT alignment directory: {err}");
+            return;
+        }
+
+        self.comparison_alignment_temp_dir = Some(output_dir.clone());
+        self.comparison_alignment_status = format!(
+            "Aligning {} comparison images to the first image with SIFT...",
+            candidates.len()
+        );
+        self.sift_align_all_running = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sift_align_all_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = run_sift_alignment_batch(&reference, &candidates, &output_dir)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_sift_align_all(&mut self) {
+        let Some(rx) = self.sift_align_all_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.sift_align_all_running = false;
+                let current_reference = self
+                    .comparison_paths
+                    .as_ref()
+                    .and_then(|paths| paths.first())
+                    .cloned();
+                if current_reference.as_ref() == Some(&result.reference) {
+                    self.comparison_aligned_paths.extend(result.aligned_paths);
+                    self.comparison_alignment_status = result.summary;
+                    self.semantic_status = result.details.join(" | ");
+                } else {
+                    let _ = std::fs::remove_dir_all(&result.output_dir);
+                }
+            }
+            Ok(Err(err)) => {
+                self.sift_align_all_running = false;
+                if let Some(output_dir) = self.comparison_alignment_temp_dir.take() {
+                    let _ = std::fs::remove_dir_all(output_dir);
+                }
+                self.comparison_alignment_status = format!("SIFT alignment failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.sift_align_all_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.sift_align_all_running = false;
+                self.comparison_alignment_status =
+                    "SIFT alignment worker disconnected unexpectedly.".to_string();
+            }
+        }
     }
 
     fn poll_sift_alignment(&mut self) {
@@ -5323,14 +5913,15 @@ impl ImageViewer {
     fn start_recursive_scan(&mut self) {
         self.grid_loading = true;
         self.recursive_images.clear();
+        self.recursive_video_indices.clear();
         self.applied_filename_query.clear();
         self.filename_search_results = None;
         self.thumbnail_textures.clear();
         self.thumbnail_loading.clear();
         self.thumbnail_failed.clear();
         self.thumbnail_active_threads = 0;
-        self.video_duration_cache.clear();
-        self.video_duration_loading.clear();
+        self.video_duration_cache.borrow_mut().clear();
+        self.video_duration_loading.borrow_mut().clear();
 
         let start_dir = if self.open_target_is_dir {
             self.open_target.clone()
@@ -5348,15 +5939,228 @@ impl ImageViewer {
         });
     }
 
+    fn is_comparison_mode(&self) -> bool {
+        self.comparison_paths.as_ref().is_some_and(|paths| paths.len() >= 2)
+    }
+
+    fn clear_comparison_alignment(&mut self) {
+        self.comparison_aligned_paths.clear();
+        self.comparison_alignment_status.clear();
+        self.sift_align_all_rx = None;
+        self.sift_align_all_running = false;
+        if let Some(output_dir) = self.comparison_alignment_temp_dir.take() {
+            let _ = std::fs::remove_dir_all(output_dir);
+        }
+    }
+
+    fn clear_comparison_mode(&mut self) {
+        self.clear_comparison_alignment();
+        self.comparison_paths = None;
+        self.comparison_view_states.clear();
+    }
+
+    fn save_comparison_view_state(&mut self) {
+        if !self.is_comparison_mode() {
+            return;
+        }
+        let Some(path) = self.images.get(self.current_index).cloned() else {
+            return;
+        };
+        self.comparison_view_states.insert(
+            path,
+            ImageViewState {
+                zoom: self.zoom,
+                offset: self.offset,
+            },
+        );
+    }
+
+    fn switch_comparison_image(&mut self, index: usize) {
+        if !self.is_comparison_mode() || self.images.is_empty() {
+            return;
+        }
+        self.save_comparison_view_state();
+        self.current_index = index.min(self.images.len().saturating_sub(1));
+        let path = self.images[self.current_index].clone();
+        let state = self
+            .comparison_view_states
+            .get(&path)
+            .copied()
+            .unwrap_or(ImageViewState {
+                zoom: 1.0,
+                offset: egui::Vec2::ZERO,
+            });
+        self.zoom = state.zoom;
+        self.offset = state.offset;
+        self.update_current_file_info();
+        self.update_side_panel_metadata_if_needed();
+    }
+
+    fn open_comparison_paths(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let mut unique_paths = Vec::new();
+        for path in paths.into_iter().take(6) {
+            let path = path.canonicalize().unwrap_or(path);
+            if !path.is_file() || !is_supported_media_path(&path) || unique_paths.contains(&path) {
+                continue;
+            }
+            unique_paths.push(path);
+        }
+        if unique_paths.len() < 2 {
+            if let Some(path) = unique_paths.into_iter().next() {
+                self.open_image_path(path);
+            }
+            return;
+        }
+
+        self.image_editor = None;
+        self.clear_comparison_alignment();
+        self.compare_target = None;
+        self.sift_pair_overlay = None;
+        self.selected_grid_files.clear();
+        self.close_side_panel(ctx);
+        self.show_home_page = false;
+        self.show_grid = false;
+        self.back_target_is_gallery = false;
+        self.gallery_image_forward = None;
+        self.open_target = unique_paths[0].clone();
+        self.open_target_is_dir = false;
+        self.flat_loading = false;
+        self.flat_refresh_in_flight = false;
+        self.flat_directory_mtime = None;
+        if let Ok(mut lock) = self.flat_images_shared.lock() {
+            *lock = None;
+        }
+        self.images = unique_paths.clone();
+        self.current_index = 0;
+        self.comparison_paths = Some(unique_paths.clone());
+        self.comparison_view_states = unique_paths
+            .into_iter()
+            .map(|path| {
+                (
+                    path,
+                    ImageViewState {
+                        zoom: 1.0,
+                        offset: egui::Vec2::ZERO,
+                    },
+                )
+            })
+            .collect();
+        self.zoom = 1.0;
+        self.offset = egui::Vec2::ZERO;
+        self.viewer_rotation_path = None;
+        self.update_current_file_info();
+        self.update_side_panel_metadata_if_needed();
+        ctx.request_repaint();
+    }
+
     fn open_image_path(&mut self, path: PathBuf) {
+        self.gallery_image_forward = None;
         self.open_path(path, None);
     }
 
+    fn open_comparison_path_dialog(&mut self) {
+        self.comparison_path_input.clear();
+        self.comparison_path_dialog_open = true;
+    }
+
+    fn show_comparison_path_dialog(&mut self, ctx: &egui::Context) {
+        if !self.comparison_path_dialog_open {
+            return;
+        }
+
+        let mut dialog_open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Compare Paths")
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut dialog_open)
+            .show(ctx, |ui| {
+                ui.label("Enter one image or video path per line (2-6 paths):");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.comparison_path_input)
+                        .desired_width(620.0)
+                        .desired_rows(6)
+                        .hint_text("/path/to/first.jpg\n/path/to/second.jpg"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Compare").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            dialog_open = false;
+        }
+        self.comparison_path_dialog_open = dialog_open;
+        if !submit || !dialog_open {
+            return;
+        }
+
+        let paths: Vec<PathBuf> = self
+            .comparison_path_input
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !(2..=6).contains(&paths.len()) {
+            self.semantic_status = "Enter between two and six paths.".to_string();
+            return;
+        }
+        let valid_paths = paths
+            .iter()
+            .filter(|path| path.is_file() && is_supported_media_path(path))
+            .count();
+        if valid_paths < 2 {
+            self.semantic_status = "At least two valid image or video paths are required.".to_string();
+            return;
+        }
+
+        self.comparison_path_dialog_open = false;
+        self.open_comparison_paths(paths, ctx);
+    }
+
+    fn open_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open image or video")
+            .add_filter(
+                "Images and videos",
+                &[
+                    "jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "avif", "heif",
+                    "heic", "ico", "icns", "svg", "mp4", "mov", "avi", "mkv", "webm",
+                    "m4v", "wmv", "mpg", "mpeg",
+                ],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.image_editor = None;
+        self.compare_target = None;
+        self.sift_pair_overlay = None;
+        self.selected_grid_files.clear();
+        self.close_side_panel(ctx);
+        self.show_home_page = false;
+        self.show_grid = false;
+        self.back_target_is_gallery = false;
+        self.gallery_image_forward = None;
+        self.open_image_path(path);
+        ctx.request_repaint();
+    }
+
     fn open_folder_path(&mut self, path: PathBuf) {
+        self.gallery_image_forward = None;
         self.open_path(path, Some(true));
     }
 
     fn open_path(&mut self, path: PathBuf, known_is_dir: Option<bool>) {
+        self.clear_comparison_mode();
         let old_start_dir = if self.open_target_is_dir {
             self.open_target.clone()
         } else {
@@ -5379,7 +6183,9 @@ impl ImageViewer {
 
         if old_start_dir_norm != new_start_dir_norm {
             self.recursive_images.clear();
+            self.recursive_video_indices.clear();
             self.back_target_is_gallery = false;
+            self.flat_directory_mtime = None;
         }
 
         if path_is_dir {
@@ -5387,6 +6193,8 @@ impl ImageViewer {
             self.current_index = 0;
             self.update_current_file_info();
             self.flat_loading = false;
+            self.flat_refresh_in_flight = false;
+            self.flat_directory_mtime = None;
             if let Ok(mut lock) = self.flat_images_shared.lock() {
                 *lock = None;
             }
@@ -5395,6 +6203,8 @@ impl ImageViewer {
             self.current_index = 0;
             self.update_current_file_info();
             self.flat_loading = true;
+            self.flat_refresh_in_flight = false;
+            self.flat_directory_mtime = None;
             if let Ok(mut lock) = self.flat_images_shared.lock() {
                 *lock = None;
             }
@@ -5403,19 +6213,7 @@ impl ImageViewer {
             let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             std::thread::spawn(move || {
                 let parent_absolute = parent.canonicalize().unwrap_or(parent);
-                let mut collected = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let p = entry.path();
-                        if p.is_file() {
-                            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                            if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tiff" | "avif" | "heif" | "heic" | "ico" | "icns" | "svg") {
-                                collected.push(p);
-                            }
-                        }
-                    }
-                }
-                collected.sort();
+                let collected = collect_flat_images(&parent_absolute);
                 if let Ok(mut lock) = shared.lock() {
                     *lock = Some(collected);
                 }
@@ -5702,6 +6500,10 @@ impl ImageViewer {
                         match Self::save_editor_image(&editor, &destination, false) {
                             Ok(()) => {
                                 editor.status = format!("Saved {}", destination.display());
+                                let index = self.recursive_images.len();
+                                if is_video_path(&destination) {
+                                    self.recursive_video_indices.push(index);
+                                }
                                 self.recursive_images.push(destination);
                             }
                             Err(err) => editor.status = format!("Save failed: {err}"),
@@ -5989,23 +6791,95 @@ impl ImageViewer {
         self.side_panel_layout_path = Some(path);
     }
 
+    fn current_flat_directory(&self) -> Option<PathBuf> {
+        if self.open_target_is_dir {
+            return None;
+        }
+        let path = self.images.get(self.current_index).unwrap_or(&self.open_target);
+        path.parent().map(Path::to_path_buf)
+    }
+
+    fn current_flat_directory_mtime(&self) -> Option<SystemTime> {
+        self.current_flat_directory()
+            .and_then(|directory| std::fs::metadata(directory).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    }
+
+    fn start_flat_refresh_if_changed(&mut self) {
+        if self.is_comparison_mode()
+            || self.open_target_is_dir
+            || self.flat_loading
+            || self.flat_refresh_in_flight
+        {
+            return;
+        }
+        let Some(directory) = self.current_flat_directory() else {
+            return;
+        };
+        let current_mtime = std::fs::metadata(&directory)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        if current_mtime == self.flat_directory_mtime {
+            return;
+        }
+
+        self.flat_refresh_in_flight = true;
+        self.flat_loading = true;
+        if let Ok(mut lock) = self.flat_images_shared.lock() {
+            *lock = None;
+        }
+
+        let shared = self.flat_images_shared.clone();
+        std::thread::spawn(move || {
+            let directory = directory.canonicalize().unwrap_or(directory);
+            let collected = collect_flat_images(&directory);
+            if let Ok(mut lock) = shared.lock() {
+                *lock = Some(collected);
+            }
+        });
+    }
+
+    fn poll_flat_directory_refresh(&mut self, ctx: &egui::Context) {
+        if self.is_comparison_mode() || self.open_target_is_dir || self.images.is_empty() {
+            return;
+        }
+        if self.flat_last_refresh_check.elapsed() >= Duration::from_secs(1) {
+            self.flat_last_refresh_check = Instant::now();
+            self.start_flat_refresh_if_changed();
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
     fn next_image(&mut self) {
         if !self.images.is_empty() {
-            self.current_index = (self.current_index + 1) % self.images.len();
-            self.update_current_file_info();
-            self.update_side_panel_metadata_if_needed();
+            if self.is_comparison_mode() {
+                self.switch_comparison_image((self.current_index + 1) % self.images.len());
+            } else {
+                self.current_index = (self.current_index + 1) % self.images.len();
+                self.update_current_file_info();
+                self.update_side_panel_metadata_if_needed();
+            }
         }
     }
 
     fn prev_image(&mut self) {
         if !self.images.is_empty() {
-            if self.current_index == 0 {
-                self.current_index = self.images.len() - 1;
+            if self.is_comparison_mode() {
+                let index = if self.current_index == 0 {
+                    self.images.len() - 1
+                } else {
+                    self.current_index - 1
+                };
+                self.switch_comparison_image(index);
             } else {
-                self.current_index -= 1;
+                if self.current_index == 0 {
+                    self.current_index = self.images.len() - 1;
+                } else {
+                    self.current_index -= 1;
+                }
+                self.update_current_file_info();
+                self.update_side_panel_metadata_if_needed();
             }
-            self.update_current_file_info();
-            self.update_side_panel_metadata_if_needed();
         }
     }
 
@@ -6061,6 +6935,11 @@ impl ImageViewer {
                 
                 ui.add_space(12.0);
                 ui.checkbox(&mut self.semantic_video_only, "Videos only");
+                ui.weak(format!(
+                    "Thumbs {:.0}%",
+                    self.gallery_thumbnail_scale * 100.0
+                ))
+                .on_hover_text("Hold Ctrl and scroll over the gallery to resize thumbnails.");
 
                 ui.separator();
                 let selected_count = self.selected_grid_files.len();
@@ -6196,12 +7075,20 @@ impl ImageViewer {
             } else {
                 (0..self.recursive_images.len()).collect()
             };
-            let filtered_images: Vec<usize> = filename_candidates
-                .into_iter()
-                .filter(|&index| {
-                    !self.semantic_video_only || is_video_path(&self.recursive_images[index])
-                })
-                .collect();
+            let filtered_images: Vec<usize> = if self.semantic_video_only {
+                if self.filename_search_results.is_some() {
+                    filename_candidates
+                        .into_iter()
+                        .filter(|index| self.recursive_video_indices.binary_search(index).is_ok())
+                        .collect()
+                } else {
+                    // The scan builds this once, avoiding an extension check for every
+                    // indexed path on every UI frame while scrolling.
+                    self.recursive_video_indices.clone()
+                }
+            } else {
+                filename_candidates
+            };
 
             // Status message label
             ui.horizontal(|ui| {
@@ -6255,6 +7142,13 @@ impl ImageViewer {
                 if is_active_semantic_search {
                     let mut seen_semantic_paths: HashSet<PathBuf> = HashSet::new();
                     for item in &self.semantic_results {
+                        // Some semantic result producers deliberately search broadly (for
+                        // example, "show most similar" and person searches). Apply the
+                        // gallery toggle here as the final display filter so it works for
+                        // every semantic result source, not only text searches.
+                        if self.semantic_video_only && !item.is_video {
+                            continue;
+                        }
                         if let Some(path) = &item.media_path {
                             if !seen_semantic_paths.insert(path.clone()) {
                                 continue;
@@ -6305,23 +7199,62 @@ impl ImageViewer {
                         }
                     });
                 } else {
-                    let available_width = (ui.available_width() - 16.0).max(130.0);
-                    let col_width = 130.0 + 12.0;
+                    let gallery_rect = ui.available_rect_before_wrap();
+            let ctrl_zoom_delta = if ui.rect_contains_pointer(gallery_rect) {
+                ui.input(|input| {
+                    if input.modifiers.ctrl {
+                        input.zoom_delta()
+                    } else {
+                        1.0
+                    }
+                })
+            } else {
+                1.0
+            };
+            if ctrl_zoom_delta != 1.0 {
+                self.gallery_thumbnail_scale =
+                    (self.gallery_thumbnail_scale * ctrl_zoom_delta).clamp(0.5, 3.0);
+                ui.ctx().request_repaint();
+            }
+
+                    let tile_width = 130.0 * self.gallery_thumbnail_scale;
+                    let tile_height = 160.0 * self.gallery_thumbnail_scale;
+                    let available_width = (ui.available_width() - 16.0).max(tile_width);
+                    let col_width = tile_width + 12.0;
                     let cols = (available_width / col_width).floor().max(1.0) as usize;
                     let num_rows = (num_items + cols - 1) / cols;
-                    let row_height = 160.0 + 12.0;
+                    let row_height = tile_height + 12.0;
+                    let visible_rows = (gallery_rect.height() / row_height).max(1.0);
+                    let scroll_speed_multiplier = (10.0 / visible_rows).clamp(0.75, 4.0);
 
                     let mut double_clicked_item: Option<GalleryItem> = None;
                     let mut single_clicked_item: Option<GalleryItem> = None;
                     let mut clicked_similar: Option<PendingSearchRequest> = None;
                     let mut clicked_person: Option<PendingSearchRequest> = None;
+                    let navigation_button_down = ui.input(|input| {
+                        input.pointer.button_down(egui::PointerButton::Extra1)
+                            || input.pointer.button_down(egui::PointerButton::Extra2)
+                    });
+                    let gallery_scroll_source = if navigation_button_down {
+                        egui::scroll_area::ScrollSource::NONE
+                    } else {
+                        egui::scroll_area::ScrollSource::ALL
+                    };
 
-                    egui::ScrollArea::vertical().id_salt("gallery_scroll_area").show_rows(ui, row_height, num_rows, |ui, row_range| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("gallery_scroll_area")
+                        .scroll_source(gallery_scroll_source)
+                        .wheel_scroll_multiplier(egui::vec2(1.0, scroll_speed_multiplier))
+                        .show_rows(ui, row_height, num_rows, |ui, row_range| {
                         for row_idx in row_range {
                             let start_idx = row_idx * cols;
                             let end_idx = (start_idx + cols).min(num_items);
-                            let row_width = (cols as f32 * 130.0) + (cols.saturating_sub(1) as f32 * 12.0);
-                            let (row_rect, _) = ui.allocate_exact_size(egui::vec2(row_width, 160.0), egui::Sense::hover());
+                            let row_width = (cols as f32 * tile_width)
+                                + (cols.saturating_sub(1) as f32 * 12.0);
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(row_width, tile_height),
+                                egui::Sense::hover(),
+                            );
 
                             for (col_idx, item_idx) in (start_idx..end_idx).enumerate() {
                                     let temp_item;
@@ -6354,7 +7287,7 @@ impl ImageViewer {
                                     
                                     let rect = egui::Rect::from_min_size(
                                         egui::pos2(row_rect.min.x + col_idx as f32 * col_width, row_rect.min.y),
-                                        egui::vec2(130.0, 160.0),
+                                        egui::vec2(tile_width, tile_height),
                                     );
                                     let response = ui.interact(
                                         rect,
@@ -6459,13 +7392,13 @@ impl ImageViewer {
                                                 ui.centered_and_justified(|ui| {
                                                     ui.add(
                                                         egui::Image::from_texture(texture)
-                                                            .max_size(egui::vec2(130.0, 160.0))
+                                                            .max_size(egui::vec2(tile_width, tile_height))
                                                             .maintain_aspect_ratio(false)
                                                     );
                                                 });
                                             } else if self.thumbnail_failed.contains(&resolved_path) {
                                                 ui.vertical_centered(|ui| {
-                                                    ui.add_space(55.0);
+                                                    ui.add_space(55.0 * self.gallery_thumbnail_scale);
                                                     if is_video_path(path) {
                                                         ui.weak("📹 Video");
                                                     } else {
@@ -6474,8 +7407,8 @@ impl ImageViewer {
                                                 });
                                             } else {
                                                 ui.vertical_centered(|ui| {
-                                                    ui.add_space(60.0);
-                                                    ui.add(egui::Spinner::new().size(20.0));
+                                                    ui.add_space(60.0 * self.gallery_thumbnail_scale);
+                                                    ui.add(egui::Spinner::new().size(20.0 * self.gallery_thumbnail_scale));
                                                 });
                                                 
                                                 let max_threads = num_cpus::get().max(4);
@@ -6503,16 +7436,18 @@ impl ImageViewer {
                                             }
                                         });
 
-                                    // Overlay 1: Filename banner at the bottom (semi-transparent black with rounded bottom corners)
+                    // Overlay 1: Filename banner at the bottom (semi-transparent black with rounded bottom corners)
+                                    let overlay_scale = self.gallery_thumbnail_scale;
+                                    let banner_height = 24.0 * overlay_scale;
                                     let banner_rect = egui::Rect::from_min_max(
-                                        egui::pos2(rect.min.x, rect.max.y - 24.0),
+                                        egui::pos2(rect.min.x, rect.max.y - banner_height),
                                         rect.max
                                     );
                                     let banner_rounding = egui::CornerRadius {
                                         nw: 0,
                                         ne: 0,
-                                        sw: 6,
-                                        se: 6,
+                                        sw: (6.0 * overlay_scale).round().clamp(0.0, 255.0) as u8,
+                                        se: (6.0 * overlay_scale).round().clamp(0.0, 255.0) as u8,
                                     };
                                     ui.painter().rect_filled(banner_rect, banner_rounding, egui::Color32::from_black_alpha(180));
 
@@ -6545,27 +7480,37 @@ impl ImageViewer {
                                         banner_rect.center(),
                                         egui::Align2::CENTER_CENTER,
                                         filename_label,
-                                        egui::FontId::proportional(9.0),
+                                        egui::FontId::proportional(9.0 * overlay_scale),
                                         egui::Color32::WHITE,
                                     );
 
                                     // Overlay 2: Score / Match Badge pill overlay in the top-left
                                     if let Some(lbl) = &item.score_label {
                                         let badge_rect = egui::Rect::from_min_max(
-                                            egui::pos2(rect.min.x + 6.0, rect.min.y + 6.0),
-                                            egui::pos2(rect.min.x + 66.0, rect.min.y + 22.0)
+                                            egui::pos2(
+                                                rect.min.x + 6.0 * overlay_scale,
+                                                rect.min.y + 6.0 * overlay_scale,
+                                            ),
+                                            egui::pos2(
+                                                rect.min.x + 66.0 * overlay_scale,
+                                                rect.min.y + 22.0 * overlay_scale,
+                                            )
                                         );
                                         let badge_bg = if lbl.contains("Match") && !lbl.contains("OCR") {
                                             egui::Color32::from_rgb(16, 124, 65).gamma_multiply(0.85)
                                         } else {
                                             egui::Color32::from_rgb(0, 90, 158).gamma_multiply(0.85)
                                         };
-                                        ui.painter().rect_filled(badge_rect, 4.0, badge_bg);
+                                        ui.painter().rect_filled(
+                                            badge_rect,
+                                            4.0 * overlay_scale,
+                                            badge_bg,
+                                        );
                                         ui.painter().text(
                                             badge_rect.center(),
                                             egui::Align2::CENTER_CENTER,
                                             lbl,
-                                            egui::FontId::proportional(8.0),
+                                            egui::FontId::proportional(8.0 * overlay_scale),
                                             egui::Color32::WHITE,
                                         );
                                     }
@@ -6577,20 +7522,31 @@ impl ImageViewer {
                                             item.db_filename.as_deref(),
                                         );
                                         let badge_text = self
-                                            .cached_video_duration(&video_source_path, ctx)
+                                            .cached_video_metadata(&video_source_path, ctx)
+                                            .and_then(|metadata| metadata.duration_sec)
                                             .map(|duration| format!("📹 {}", format_video_duration(duration)))
                                             .unwrap_or_else(|| "📹 Video".to_string());
                                         
                                         let badge_rect = egui::Rect::from_min_max(
-                                            egui::pos2(rect.max.x - 78.0, rect.min.y + 6.0),
-                                            egui::pos2(rect.max.x - 6.0, rect.min.y + 22.0)
+                                            egui::pos2(
+                                                rect.max.x - 78.0 * overlay_scale,
+                                                rect.min.y + 6.0 * overlay_scale,
+                                            ),
+                                            egui::pos2(
+                                                rect.max.x - 6.0 * overlay_scale,
+                                                rect.min.y + 22.0 * overlay_scale,
+                                            )
                                         );
-                                        ui.painter().rect_filled(badge_rect, 4.0, egui::Color32::from_black_alpha(160));
+                                        ui.painter().rect_filled(
+                                            badge_rect,
+                                            4.0 * overlay_scale,
+                                            egui::Color32::from_black_alpha(160),
+                                        );
                                         ui.painter().text(
                                             badge_rect.center(),
                                             egui::Align2::CENTER_CENTER,
                                             badge_text,
-                                            egui::FontId::proportional(8.0),
+                                            egui::FontId::proportional(8.0 * overlay_scale),
                                             egui::Color32::WHITE,
                                         );
                                     }
@@ -6667,6 +7623,7 @@ impl ImageViewer {
                         };
                         self.images = active_paths;
                         self.current_index = self.images.iter().position(|p| p == &path).unwrap_or(0);
+                        self.remember_gallery_image();
                         self.show_grid = false;
                         self.back_target_is_gallery = true;
                         self.zoom = 1.0;
@@ -7025,6 +7982,11 @@ impl ImageViewer {
     }
 
     fn request_search_action(&mut self, request: PendingSearchRequest, ctx: &egui::Context) {
+        self.push_search_history();
+        // Related-image searches are gallery searches. Leave the current image
+        // viewer immediately so the pending and completed results are visible.
+        self.show_grid = true;
+        self.back_target_is_gallery = false;
         let label = Self::label_for_request(&request);
         self.semantic_mode = SearchMode::Clip;
         self.semantic_query = label.clone();
@@ -7069,6 +8031,7 @@ impl eframe::App for ImageViewer {
 
         self.poll_db_load();
         self.poll_sift_alignment();
+        self.poll_sift_align_all();
         self.poll_sift_repair(ctx);
         self.poll_on_demand_embeddings(ctx);
 
@@ -7101,14 +8064,17 @@ impl eframe::App for ImageViewer {
             ctx.request_repaint();
         }
 
-        while let Ok((path, duration)) = self.video_duration_rx.try_recv() {
-            self.video_duration_loading.remove(&path);
-            self.video_duration_cache.insert(path, duration);
+        while let Ok((path, metadata)) = self.video_duration_rx.try_recv() {
+            self.video_duration_loading.borrow_mut().remove(&path);
+            self.video_duration_cache.borrow_mut().insert(path, metadata);
             ctx.request_repaint();
         }
 
-        if let Ok(new_path) = self.rx.try_recv() {
-            self.open_image_path(new_path);
+        if let Ok(request) = self.rx.try_recv() {
+            match request {
+                OpenRequest::Single(path) => self.open_image_path(path),
+                OpenRequest::Comparison(paths) => self.open_comparison_paths(paths, ctx),
+            }
             self.show_home_page = false;
             ctx.request_repaint();
         }
@@ -7132,6 +8098,12 @@ impl eframe::App for ImageViewer {
             }
             if disconnected {
                 self.recursive_images.sort_by(|a, b| b.cmp(a));
+                self.recursive_video_indices = self
+                    .recursive_images
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, path)| is_video_path(path).then_some(index))
+                    .collect();
                 self.grid_loading = false;
                 self.recursive_rx = None;
                 ctx.request_repaint();
@@ -7146,30 +8118,88 @@ impl eframe::App for ImageViewer {
                 }
             }
             if let Some(imgs) = collected {
+                let current_path = self
+                    .images
+                    .get(self.current_index)
+                    .cloned()
+                    .or_else(|| (!self.open_target_is_dir).then(|| self.open_target.clone()));
                 self.images = imgs;
-                self.current_index = self.images.iter().position(|p| p == &self.open_target).unwrap_or(0);
+                self.current_index = current_path
+                    .as_ref()
+                    .and_then(|path| self.images.iter().position(|candidate| candidate == path))
+                    .or_else(|| {
+                        self.images
+                            .iter()
+                            .position(|path| path == &self.open_target)
+                    })
+                    .unwrap_or(0);
                 self.flat_loading = false;
+                self.flat_refresh_in_flight = false;
+                self.flat_directory_mtime = self.current_flat_directory_mtime();
                 self.update_current_file_info();
                 self.update_side_panel_metadata_if_needed();
                 ctx.request_repaint();
             }
         }
+        if !self.show_home_page && !self.show_grid && !self.open_target_is_dir {
+            self.poll_flat_directory_refresh(ctx);
+        }
         // Mouse Back click handling:
         // allow returning to gallery if explicitly marked, or if a gallery list is available.
         let can_back_to_gallery =
             self.back_target_is_gallery || (!self.show_home_page && !self.recursive_images.is_empty());
-        if !self.show_grid && can_back_to_gallery {
-            let back_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
-            if back_clicked {
+        let back_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
+        let forward_clicked =
+            ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra2));
+        let navigation_button_down = ctx.input(|i| {
+            i.pointer.button_down(egui::PointerButton::Extra1)
+                || i.pointer.button_down(egui::PointerButton::Extra2)
+        });
+
+        // Some window/input configurations report browser-button clicks alongside a
+        // scroll delta. Navigation buttons must never move the active scroll area.
+        if back_clicked || forward_clicked || navigation_button_down {
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+            });
+        }
+
+        if back_clicked {
+            if !self.show_grid && can_back_to_gallery {
                 self.show_grid = true;
                 self.back_target_is_gallery = true;
                 ctx.request_repaint();
+            } else if self.show_grid {
+                self.restore_previous_search(ctx);
+            }
+        }
+        if forward_clicked && self.show_grid {
+            if self.back_target_is_gallery {
+                self.restore_gallery_image(ctx);
+            } else if !self.restore_next_search(ctx) {
+                // A search-history forward step may lead back to the gallery
+                // state that preceded the viewed image. Restore that image only
+                // after the search-history stack has been exhausted.
+                self.restore_gallery_image(ctx);
             }
         }
 
         // Keyboard handling
         if !ctx.wants_keyboard_input() {
+            let mut open_file_requested = false;
+            let mut compare_paths_requested = false;
             ctx.input(|i| {
+                if (i.modifiers.matches_logically(egui::Modifiers::COMMAND)
+                    || i.modifiers.matches_logically(egui::Modifiers::CTRL))
+                    && i.key_pressed(egui::Key::O)
+                {
+                    if i.modifiers.shift {
+                        compare_paths_requested = true;
+                    } else {
+                        open_file_requested = true;
+                    }
+                }
                 if !self.show_home_page {
                     if !self.show_grid && self.image_editor.is_none() {
                         if i.key_pressed(egui::Key::ArrowRight) {
@@ -7188,6 +8218,9 @@ impl eframe::App for ImageViewer {
                         }
                     }
                     if i.key_pressed(egui::Key::G) {
+                        if !self.show_grid {
+                            self.clear_comparison_mode();
+                        }
                         self.show_grid = !self.show_grid;
                         if self.show_grid && self.recursive_images.is_empty() {
                             self.start_recursive_scan();
@@ -7219,7 +8252,14 @@ impl eframe::App for ImageViewer {
                     }
                 }
             });
+            if compare_paths_requested {
+                self.open_comparison_path_dialog();
+            } else if open_file_requested {
+                self.open_file_dialog(ctx);
+            }
         }
+
+        self.show_comparison_path_dialog(ctx);
 
         if self.show_home_page {
             self.show_home_page_view(ctx);
@@ -7234,7 +8274,50 @@ impl eframe::App for ImageViewer {
                 ui.separator();
                 
                 if ui.button("🏠 Filesystem").clicked() {
+                    self.clear_comparison_mode();
                     self.show_home_page = true;
+                }
+                if ui.button("Open File [Ctrl+O]").clicked() {
+                    self.open_file_dialog(ctx);
+                }
+                if ui.button("Compare Paths [Ctrl+Shift+O]").clicked() {
+                    self.open_comparison_path_dialog();
+                }
+
+                if self.is_comparison_mode() {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 190, 80),
+                        format!(
+                            "Compare {}/{} (←/→)",
+                            self.current_index + 1,
+                            self.images.len()
+                        ),
+                    );
+                    let can_align_all = !self.sift_align_all_running
+                        && self.images.iter().all(|path| !is_video_path(path));
+                    let align_label = if self.sift_align_all_running {
+                        "SIFT Aligning..."
+                    } else {
+                        "SIFT Align All"
+                    };
+                    if ui
+                        .add_enabled(can_align_all, egui::Button::new(align_label))
+                        .on_hover_text(
+                            "Use the first comparison image as the reference and align the rest with SIFT.",
+                        )
+                        .clicked()
+                    {
+                        self.start_sift_align_all(ctx);
+                    }
+                    if !self.comparison_alignment_status.is_empty() {
+                        ui.weak(&self.comparison_alignment_status);
+                    }
+                    if ui.button("Exit Compare").clicked() {
+                        if let Some(path) = self.images.get(self.current_index).cloned() {
+                            self.open_image_path(path);
+                        }
+                    }
                 }
                 
                 ui.separator();
@@ -7276,6 +8359,9 @@ impl eframe::App for ImageViewer {
                     
                     let gallery_text = if self.show_grid { "🖼 Hide Gallery [G]" } else { "🖼 Show Gallery [G]" };
                     if ui.button(gallery_text).clicked() {
+                        if !self.show_grid {
+                            self.clear_comparison_mode();
+                        }
                         self.show_grid = !self.show_grid;
                         if self.show_grid && self.recursive_images.is_empty() {
                             self.start_recursive_scan();
@@ -7507,6 +8593,7 @@ impl eframe::App for ImageViewer {
                                 let use_sift_seed_similarity = sift_members.len() > 1;
 
                                 let mut phash_similar_groups: Vec<(String, String, Vec<SimilarFile>)> = Vec::new();
+                                let mut video_hash_similar_groups: Vec<(String, String, Vec<SimilarFile>)> = Vec::new();
                                 for (seed_index, seed) in phash_group_seeds.iter().enumerate() {
                                     if let Some(items) = indices.similar_by_master.get(seed.as_str()) {
                                         let mut group_items = items.clone();
@@ -7543,13 +8630,38 @@ impl eframe::App for ImageViewer {
                                                 .unwrap_or(Ordering::Equal)
                                                 .then_with(|| a.file_name.cmp(&b.file_name))
                                         });
-                                        if !group_items.is_empty() {
-                                            let section_label = if use_sift_seed_similarity {
-                                                format!("SIFT master {} pHash/VideoHash similars", seed_index + 1)
+                                        let mut phash_items = Vec::new();
+                                        let mut video_hash_items = Vec::new();
+                                        for item in group_items {
+                                            let item_is_video = item.is_video
+                                                || is_video_path(Path::new(&item.file_name));
+                                            if current_is_video && item_is_video {
+                                                video_hash_items.push(item);
                                             } else {
-                                                "Active image pHash/VideoHash similars".to_string()
+                                                phash_items.push(item);
+                                            }
+                                        }
+                                        if !phash_items.is_empty() {
+                                            let section_label = if use_sift_seed_similarity {
+                                                format!("SIFT master {} pHash similars", seed_index + 1)
+                                            } else if current_is_video {
+                                                "Active video pHash similars".to_string()
+                                            } else {
+                                                "Active image pHash similars".to_string()
                                             };
-                                            phash_similar_groups.push((seed.clone(), section_label, group_items));
+                                            phash_similar_groups.push((seed.clone(), section_label, phash_items));
+                                        }
+                                        if !video_hash_items.is_empty() {
+                                            let section_label = if use_sift_seed_similarity {
+                                                format!("SIFT master {} VideoHash similars", seed_index + 1)
+                                            } else {
+                                                "Active video VideoHash similars".to_string()
+                                            };
+                                            video_hash_similar_groups.push((
+                                                seed.clone(),
+                                                section_label,
+                                                video_hash_items,
+                                            ));
                                         }
                                     }
                                 }
@@ -7563,6 +8675,16 @@ impl eframe::App for ImageViewer {
                                     }
                                 }
                                 let phash_unique_count = phash_unique_files.len();
+                                let mut video_hash_unique_files = HashSet::new();
+                                for (seed, _, items) in &video_hash_similar_groups {
+                                    if seed != &filename {
+                                        video_hash_unique_files.insert(seed.clone());
+                                    }
+                                    for item in items {
+                                        video_hash_unique_files.insert(item.file_name.clone());
+                                    }
+                                }
+                                let video_hash_unique_count = video_hash_unique_files.len();
                                 
                                 // Precompute SIFT members metadata
                                 // source_path = original file (video/image), preview_path = video still or image
@@ -7574,7 +8696,7 @@ impl eframe::App for ImageViewer {
                                     let member_is_video = is_video_path(Path::new(member))
                                         || source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
                                     let res_size_str = source_path_opt.as_ref()
-                                        .map(|p| self.get_file_resolution_and_size(p))
+                                        .map(|p| self.get_duplicate_media_info(p, member_is_video, ctx))
                                         .unwrap_or_else(|| "n/a".to_string());
                                     let sift_str = if sift_members.len() <= 1 && member == &filename {
                                         "SIFT: no grouped match".to_string()
@@ -7604,21 +8726,23 @@ impl eframe::App for ImageViewer {
                                         ),
                                     );
                                 }
-                                for (group_seed, _, group_items) in &phash_similar_groups {
-                                    for item in group_items {
-                                        if !self.expanded_duplicate_rows.contains(&item.file_name) {
-                                            continue;
+                                for similar_groups in [&phash_similar_groups, &video_hash_similar_groups] {
+                                    for (group_seed, _, group_items) in similar_groups {
+                                        for item in group_items {
+                                            if !self.expanded_duplicate_rows.contains(&item.file_name) {
+                                                continue;
+                                            }
+                                            database_details.insert(
+                                                (group_seed.clone(), item.file_name.clone()),
+                                                duplicate_database_detail_lines(
+                                                    &item.file_name,
+                                                    group_seed,
+                                                    item.is_video,
+                                                    &indices.phash_by_file,
+                                                    &indices.video_frame_phashes_by_file,
+                                                ),
+                                            );
                                         }
-                                        database_details.insert(
-                                            (group_seed.clone(), item.file_name.clone()),
-                                            duplicate_database_detail_lines(
-                                                &item.file_name,
-                                                group_seed,
-                                                item.is_video,
-                                                &indices.phash_by_file,
-                                                &indices.video_frame_phashes_by_file,
-                                            ),
-                                        );
                                     }
                                 }
 
@@ -7627,10 +8751,17 @@ impl eframe::App for ImageViewer {
                                 ui.weak(format!("Current: {}", filename));
                                 ui.add_space(2.0);
                                 ui.weak(format!(
-                                    "pHash/VideoHash similar count: {} across {} group(s)",
+                                    "pHash similar count: {} across {} group(s)",
                                     phash_unique_count,
                                     phash_similar_groups.len()
                                 ));
+                                if current_is_video {
+                                    ui.weak(format!(
+                                        "VideoHash similar count: {} across {} group(s)",
+                                        video_hash_unique_count,
+                                        video_hash_similar_groups.len()
+                                    ));
+                                }
                                 ui.add_space(8.0);
                                 
                                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -7701,6 +8832,7 @@ impl eframe::App for ImageViewer {
                                                                         self.db_filename_by_path.insert(s_path.clone(), member.clone());
                                                                         self.current_index += 1;
                                                                     }
+                                                                    self.remember_gallery_image();
                                                                     self.show_grid = false;
                                                                     self.back_target_is_gallery = true;
                                                                     self.update_current_file_info();
@@ -7730,15 +8862,26 @@ impl eframe::App for ImageViewer {
                                         ui.add_space(8.0);
                                     }
                                     
-                                    // 2. pHash/VideoHash similars grouped by SIFT master/member seed
-                                    if !phash_similar_groups.is_empty() {
+                                    // 2. pHash and VideoHash similars grouped by SIFT master/member seed
+                                    let mut rendered_similar_section = false;
+                                    for (section_title, similar_groups, unique_count) in [
+                                        ("pHash similars", &phash_similar_groups, phash_unique_count),
+                                        ("VideoHash similars", &video_hash_similar_groups, video_hash_unique_count),
+                                    ] {
+                                        if similar_groups.is_empty() {
+                                            continue;
+                                        }
+                                        rendered_similar_section = true;
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "🔗 Similar Files (pHash/VideoHash)");
-                                            ui.weak(format!("({} unique files)", phash_unique_count));
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(100, 180, 255),
+                                                format!("🔗 Similar Files ({section_title})"),
+                                            );
+                                            ui.weak(format!("({unique_count} unique files)"));
                                         });
                                         ui.add_space(6.0);
                                         
-                                        for (group_seed, section_label, group_items) in &phash_similar_groups {
+                                        for (group_seed, section_label, group_items) in similar_groups {
                                             egui::Frame::NONE
                                                 .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.35))
                                                 .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.35)))
@@ -7763,7 +8906,7 @@ impl eframe::App for ImageViewer {
                                                             || is_video_path(Path::new(&item.file_name))
                                                             || source_path_opt.as_ref().is_some_and(|p| is_video_path(p));
                                                         let res_size_str = source_path_opt.as_ref()
-                                                            .map(|p| self.get_file_resolution_and_size(p))
+                                                            .map(|p| self.get_duplicate_media_info(p, item_is_video, ctx))
                                                             .unwrap_or_else(|| "n/a".to_string());
                                                         let item_has_clip = clip_embedded_files.contains(&item.file_name);
                                                         let item_has_ocr = ocr_embedded_files.contains(&item.file_name);
@@ -7845,6 +8988,7 @@ impl eframe::App for ImageViewer {
                                                                                         self.db_filename_by_path.insert(s_path.clone(), item.file_name.clone());
                                                                                         self.current_index += 1;
                                                                                     }
+                                                                                    self.remember_gallery_image();
                                                                                     self.show_grid = false;
                                                                                     self.back_target_is_gallery = true;
                                                                                     self.update_current_file_info();
@@ -7872,7 +9016,8 @@ impl eframe::App for ImageViewer {
                                                 });
                                             ui.add_space(8.0);
                                         }
-                                    } else if phash_similar_groups.is_empty() {
+                                    }
+                                    if !rendered_similar_section {
                                         ui.weak("No duplicates or similar files found in database.");
                                     }
                                 });
@@ -7898,7 +9043,15 @@ impl eframe::App for ImageViewer {
                 self.show_grid_view(ui, ctx);
             } else {
                 if let Some(path) = self.images.get(self.current_index).cloned() {
-                let resolved_path = self.get_thumbnail_path(&path);
+                if self.viewer_rotation_path.as_ref() != Some(&path) {
+                    self.viewer_rotation_path = Some(path.clone());
+                    self.viewer_rotation_quarter_turns = 0;
+                }
+                let resolved_path = if self.is_comparison_mode() {
+                    self.comparison_display_path(&path)
+                } else {
+                    self.get_thumbnail_path(&path)
+                };
                 let uri = format!("file://{}", resolved_path.to_string_lossy());
                 
                 // Click and Drag to pan (allocated first to allow zoom-to-mouse math using rect)
@@ -7952,6 +9105,15 @@ impl eframe::App for ImageViewer {
                     }
                     if !is_video_item && ui.button("✏ Edit image").clicked() {
                         self.start_image_editor(&path, ui.ctx());
+                        ui.close();
+                    }
+                    if !is_video_item && ui.button("🔄 Rotate image").clicked() {
+                        self.viewer_rotation_quarter_turns =
+                            (self.viewer_rotation_quarter_turns + 1) % 4;
+                        self.viewer_rotation_path = Some(path.clone());
+                        self.zoom = 1.0;
+                        self.offset = egui::Vec2::ZERO;
+                        ui.ctx().request_repaint();
                         ui.close();
                     }
                     if ui.button("🔍 Fit Image / Recenter").clicked() {
@@ -8074,8 +9236,16 @@ impl eframe::App for ImageViewer {
                     let draw_pos = rect.center() + self.offset - draw_size / 2.0;
                     let draw_rect = egui::Rect::from_min_size(draw_pos, draw_size);
                     
-                    // Use ui.put to place the image widget
-                    ui.put(draw_rect, egui::Image::new(uri).maintain_aspect_ratio(true).show_loading_spinner(false));
+                    // Rotate only the viewer mesh; the source file remains unchanged.
+                    let image = egui::Image::new(uri)
+                        .maintain_aspect_ratio(true)
+                        .show_loading_spinner(false)
+                        .rotate(
+                            self.viewer_rotation_quarter_turns as f32
+                                * std::f32::consts::FRAC_PI_2,
+                            egui::Vec2::splat(0.5),
+                        );
+                    ui.put(draw_rect, image);
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -8085,7 +9255,7 @@ impl eframe::App for ImageViewer {
             }
         });
 
-        if self.flat_loading || self.grid_loading {
+        if self.flat_loading || self.grid_loading || self.sift_align_all_running {
             ctx.request_repaint();
         }
     }
@@ -8161,6 +9331,7 @@ impl ImageViewer {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut opened_folder = false;
+            let mut opened_file = false;
             ui.add_space(8.0);
             
             // Dolphin-like location toolbar at the top
@@ -8219,9 +9390,18 @@ impl ImageViewer {
                         opened_folder = true;
                     }
                 }
+
+                if ui.button("Open File").clicked() {
+                    self.open_file_dialog(ctx);
+                    opened_file = true;
+                }
+                if ui.button("Compare Paths").clicked() {
+                    self.open_comparison_path_dialog();
+                    opened_file = true;
+                }
             });
 
-            if opened_folder {
+            if opened_folder || opened_file {
                 ctx.request_repaint();
                 return;
             }

@@ -44,6 +44,7 @@ The Rust desktop application. It provides:
 - Filename, CLIP, and OCR search modes from one search UI.
 - Optional folder-scoped CLIP/OCR search across indexed collections.
 - Image viewing, video handoff to `mpv`, and folder opening.
+- Comparison mode for two to six selected files, with independent zoom and pan state for each file, plus on-demand SIFT alignment to the first image.
 - EXIF/raw metadata via `exiftool` and video stream/format metadata via `ffprobe`.
 - Duplicate sidebar for SIFT groups, pHash/VideoHash similar files, and image-video cross-media matches.
 - Right-click actions for showing visually similar files and more of the same person.
@@ -125,6 +126,14 @@ Open a file or folder:
 ```bash
 cargo run --release -- --no-daemon /path/to/file-or-folder
 ```
+
+Open two to six files in comparison mode. Use the left and right arrow keys to switch between them; Iris restores each file's zoom and pan position independently:
+
+```bash
+cargo run --release -- --no-daemon /path/to/first.jpg /path/to/second.jpg /path/to/third.jpg
+```
+
+The normal `Ctrl+O` picker opens one file. To enter paths inside Iris, use `Compare Paths` or `Ctrl+Shift+O` and enter one path per line. Select one file with `Ctrl+O` for normal single-file viewing. In comparison mode, `SIFT Align All` uses the first image as the reference, computes missing pairwise SIFT homographies in a background worker, and displays aligned temporary copies without changing the source files. It is intended for still images; files that cannot produce a reliable homography remain unwarped and are reported in the status.
 
 Reuse an existing window:
 
