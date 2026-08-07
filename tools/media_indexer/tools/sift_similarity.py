@@ -8,6 +8,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+ALIGNMENT_MIN_INLIERS = 8
+ALIGNMENT_MAX_CONDITION = 1.0e10
+ALIGNMENT_MIN_AREA_RATIO = 0.01
+ALIGNMENT_MAX_AREA_RATIO = 100.0
+
 
 def out(payload: dict, code: int = 0) -> None:
     print(json.dumps(payload, ensure_ascii=True))
@@ -48,7 +53,7 @@ def match_sift_images(
 
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-    sift = cv2.SIFT_create(nfeatures=4000)
+    sift = cv2.SIFT_create(nfeatures=8000)
     kp_a, des_a = sift.detectAndCompute(gray_a, None)
     kp_b, des_b = sift.detectAndCompute(gray_b, None)
 
@@ -68,7 +73,9 @@ def match_sift_images(
         )
 
     matcher = cv2.BFMatcher(cv2.NORM_L2)
-    knn = matcher.knnMatch(des_a, des_b, k=2)
+    # Match candidate B into reference A directly. Lowe's ratio test is
+    # directional; B -> A is also the matrix direction needed for warping.
+    knn = matcher.knnMatch(des_b, des_a, k=2)
     good = []
     for pair in knn:
         if len(pair) < 2:
@@ -80,18 +87,20 @@ def match_sift_images(
     inlier_matches = 0
     homography = None
     if len(good) >= 4:
-        # The normal SIFT report maps A -> B. For display alignment we also
-        # return the inverse-direction matrix that maps B onto A.
-        src = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        homography_a_to_b, mask = cv2.findHomography(src, dst, cv2.RANSAC, 4.0)
+        src = np.float32([kp_b[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([kp_a[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        homography_b_to_a, mask = cv2.findHomography(
+            src,
+            dst,
+            cv2.RANSAC,
+            4.0,
+            maxIters=5000,
+            confidence=0.999,
+        )
         if mask is not None:
             inlier_matches = int(mask.ravel().sum())
-        if return_homography and homography_a_to_b is not None:
-            try:
-                homography = np.linalg.inv(homography_a_to_b)
-            except np.linalg.LinAlgError:
-                homography = None
+        if return_homography and homography_b_to_a is not None:
+            homography = homography_b_to_a
 
     good_matches = int(len(good))
     inlier_ratio = float(inlier_matches / good_matches) if good_matches > 0 else 0.0
@@ -113,6 +122,61 @@ def match_sift_images(
         },
         homography,
     )
+
+
+def validate_alignment_homography(
+    homography: np.ndarray,
+    candidate_shape: tuple[int, ...],
+    reference_shape: tuple[int, ...],
+) -> str | None:
+    if homography.shape != (3, 3) or not np.isfinite(homography).all():
+        return "SIFT produced a non-finite homography"
+
+    condition = float(np.linalg.cond(homography))
+    if not math.isfinite(condition) or condition > ALIGNMENT_MAX_CONDITION:
+        return f"SIFT homography is numerically unstable (condition {condition:.2e})"
+
+    candidate_height, candidate_width = candidate_shape[:2]
+    reference_height, reference_width = reference_shape[:2]
+    sample_points = np.float64(
+        [
+            [0.0, 0.0],
+            [candidate_width - 1.0, 0.0],
+            [candidate_width - 1.0, candidate_height - 1.0],
+            [0.0, candidate_height - 1.0],
+            [(candidate_width - 1.0) / 2.0, (candidate_height - 1.0) / 2.0],
+        ]
+    )
+    denominators = (
+        homography[2, 0] * sample_points[:, 0]
+        + homography[2, 1] * sample_points[:, 1]
+        + homography[2, 2]
+    )
+    if (
+        not np.isfinite(denominators).all()
+        or np.any(np.abs(denominators) < 1.0e-6)
+        or np.any(np.signbit(denominators) != np.signbit(denominators[0]))
+    ):
+        return "SIFT homography crosses the projective horizon"
+
+    corners = sample_points[:4].astype(np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+    if not np.isfinite(projected).all():
+        return "SIFT projected non-finite image corners"
+    projected_contour = projected.astype(np.float32)
+    if not cv2.isContourConvex(projected_contour):
+        return "SIFT projected a folded or self-intersecting image"
+
+    projected_area = abs(float(cv2.contourArea(projected_contour)))
+    reference_area = float(reference_width * reference_height)
+    area_ratio = projected_area / max(reference_area, 1.0)
+    if not ALIGNMENT_MIN_AREA_RATIO <= area_ratio <= ALIGNMENT_MAX_AREA_RATIO:
+        return f"SIFT projected an implausible image area ({area_ratio:.4f}x reference)"
+
+    coordinate_limit = 20.0 * max(reference_width, reference_height)
+    if float(np.abs(projected).max()) > coordinate_limit:
+        return "SIFT projected image corners implausibly far outside the reference"
+    return None
 
 
 def run_sift(path_a: Path, path_b: Path) -> dict:
@@ -196,8 +260,17 @@ def align_images(reference: Path, candidates: list[Path], output_dir: Path) -> d
             results.append(item)
             continue
 
-        if homography is None or metrics["inlier_matches"] < 4:
+        if homography is None or metrics["inlier_matches"] < ALIGNMENT_MIN_INLIERS:
             item["error"] = "not enough geometrically consistent SIFT matches"
+            results.append(item)
+            continue
+        validation_error = validate_alignment_homography(
+            homography,
+            candidate_img.shape,
+            reference_img.shape,
+        )
+        if validation_error is not None:
+            item["error"] = validation_error
             results.append(item)
             continue
 

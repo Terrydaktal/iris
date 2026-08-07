@@ -15,7 +15,34 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 ├── icon.png
 ├── make_transparent.py
 ├── src
-│   ├── main.rs
+│   ├── main.rs                 # Binary entry point
+│   ├── app
+│   │   ├── mod.rs              # Application module wiring and internal facade
+│   │   ├── model.rs            # Shared application state and database/search value types
+│   │   ├── bootstrap.rs        # CLI parsing, daemon socket, and window startup
+│   │   ├── viewer_assets.rs    # Viewer texture sizing and conversion
+│   │   ├── metadata.rs         # exiftool and ffprobe integration
+│   │   ├── binary.rs           # Image binary/chunk inspection parsers
+│   │   ├── media_scan.rs       # Folder media discovery
+│   │   ├── search.rs           # LanceDB row loading and in-memory search
+│   │   ├── paths.rs            # Database paths, collection roots, and path matching
+│   │   ├── platform.rs         # Desktop/platform path helpers
+│   │   ├── clipboard.rs        # Wayland and desktop clipboard integration
+│   │   ├── formatting.rs       # File metadata labels and wrapped path rendering
+│   │   ├── hashing.rs          # SIFT, on-demand embeddings, and worker orchestration
+│   │   ├── runtime.rs          # eframe event loop and background-result polling
+│   │   └── ui
+│   │       ├── mod.rs          # UI feature module wiring
+│   │       ├── core.rs         # Window, sidebar, and shared layout behavior
+│   │       ├── face.rs         # Face resemblance and photo-to-video frame matching
+│   │       ├── lifecycle.rs    # ImageViewer construction and background database lifecycle
+│   │       ├── media_assets.rs # Database path resolution, metadata, and thumbnail loading
+│   │       ├── search.rs       # Search controls and related-media actions
+│   │       ├── sift.rs         # SIFT compare, align, and repair actions
+│   │       ├── navigation.rs   # Folder scans, comparison paths, and navigation
+│   │       ├── viewer.rs       # Viewer, metadata panel, editor, and texture cache
+│   │       ├── gallery.rs      # Gallery grid and duplicate actions
+│   │       └── home.rs         # File-browser home page
 │   └── bin
 │       └── make_transparent.rs
 └── tools
@@ -36,9 +63,9 @@ Generated local data is ignored by Git, including `target/`, `lancedb/`, Python 
 
 ## Main Components
 
-### Iris Viewer: `src/main.rs`
+### Iris Viewer: `src/app/`
 
-The Rust desktop application. It provides:
+`src/main.rs` is only the Cargo binary entry point. The Rust desktop application is organized under `src/app/` by responsibility, while keeping the existing `ImageViewer` state shared across the UI feature modules. It provides:
 
 - Folder and file gallery browsing for images and videos.
 - Filename, CLIP, and OCR search modes from one search UI.
@@ -48,7 +75,7 @@ The Rust desktop application. It provides:
 - EXIF/raw metadata via `exiftool` and video stream/format metadata via `ffprobe`.
 - Duplicate sidebar for SIFT groups, pHash/VideoHash similar files, and image-video cross-media matches.
 - Right-click actions for showing visually similar files and more of the same person.
-- Ctrl-click multi-selection for SIFT compare/repair tooling.
+- Ctrl-click gallery selection for SIFT tooling and face comparison. Two photos can be compared by their closest detected faces; selecting one photo and one indexed video finds the closest indexed face frame and marks the face with a red box.
 - Embedded crop/rotate editor for image edits.
 - On-demand CLIP/face embedding for files that have not already been indexed.
 
@@ -133,7 +160,7 @@ Open two to six files in comparison mode. Use the left and right arrow keys to s
 cargo run --release -- --no-daemon /path/to/first.jpg /path/to/second.jpg /path/to/third.jpg
 ```
 
-The normal `Ctrl+O` picker opens one file. To enter paths inside Iris, use `Compare Paths` or `Ctrl+Shift+O` and enter one path per line. Select one file with `Ctrl+O` for normal single-file viewing. In comparison mode, `SIFT Align All` uses the first image as the reference, computes missing pairwise SIFT homographies in a background worker, and displays aligned temporary copies without changing the source files. It is intended for still images; files that cannot produce a reliable homography remain unwarped and are reported in the status.
+The normal `Ctrl+O` picker opens one file. To enter paths inside Iris, use `Compare Paths` or `Ctrl+Shift+O` and enter one path per line. Select one file with `Ctrl+O` for normal single-file viewing. In comparison mode, `Sync View` shares the current zoom and pan position across every image; when it is off, each image keeps its own view state. `SIFT Align All` uses the first image as the reference, computes pairwise SIFT homographies in a background worker, and displays aligned temporary copies without changing the source files. Run `SIFT Re-align All` to discard the temporary results and recompute every alignment. It is intended for still images; files that cannot produce a reliable homography remain unwarped and are reported in the status.
 
 Reuse an existing window:
 
