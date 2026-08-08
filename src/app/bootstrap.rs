@@ -128,8 +128,10 @@ pub(crate) fn run() -> eframe::Result {
                 for stream in listener.incoming() {
                     if let Ok(mut stream) = stream {
                         use std::io::Read;
-                        let mut buf = Vec::new();
-                        if let Ok(_) = stream.read_to_end(&mut buf) {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = Vec::with_capacity(4096);
+                        let _ = stream.by_ref().take(64 * 1024 + 1).read_to_end(&mut buf);
+                        if buf.len() <= 64 * 1024 {
                             if !buf.is_empty() {
                                 if let Ok(path_str) = String::from_utf8(buf) {
                                     let request = serde_json::from_str::<Vec<String>>(&path_str)

@@ -165,6 +165,210 @@ pub(crate) async fn load_clip_database_index(db_dir: &Path, table_name: &str) ->
     })
 }
 
+/// Query the media indexer's dedicated CLIP ANN table. The base table remains
+/// the source of truth, while this narrow table avoids loading every embedding
+/// into the UI process just to answer an interactive search.
+pub(crate) async fn search_clip_ann(
+    db_dir: &Path,
+    table_name: &str,
+    query: &[f32],
+    limit: usize,
+    video_only: bool,
+    folder_filter: &str,
+) -> Result<Vec<SearchResult>> {
+    if video_only || !folder_filter.trim().is_empty() {
+        bail!("CLIP ANN cannot apply the requested media or folder filter");
+    }
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let ann_table_name = format!("{table_name}_clip_ann");
+    let table_names = db.table_names().execute().await?;
+    if !table_names.iter().any(|name| name == &ann_table_name) {
+        bail!("ANN table {ann_table_name} is not available");
+    }
+    let table = db.open_table(&ann_table_name).execute().await?;
+    let candidate_limit = limit.saturating_mul(8).max(limit).max(32);
+    let mut stream = table
+        .query()
+        .select(Select::columns(&[
+            "file_name",
+            "timestamp_sec",
+            "_distance",
+        ]))
+        .nearest_to(query.to_vec())?
+        .distance_type(lancedb::DistanceType::Cosine)
+        .limit(candidate_limit)
+        .execute()
+        .await?;
+    let db_roots = get_db_roots();
+    let mut best_by_file: HashMap<String, (f32, bool, f32)> = HashMap::new();
+    while let Some(batch) = stream.try_next().await? {
+        let file_names = batch
+            .column_by_name("file_name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow!("CLIP ANN result has no file_name column"))?;
+        let timestamps = batch
+            .column_by_name("timestamp_sec")
+            .and_then(|column| column.as_any().downcast_ref::<Float32Array>());
+        let distances = batch
+            .column_by_name("_distance")
+            .and_then(|column| column.as_any().downcast_ref::<Float32Array>());
+        for row in 0..batch.num_rows() {
+            if file_names.is_null(row) {
+                continue;
+            }
+            let file_name = file_names.value(row).to_string();
+            let is_video = is_video_path(Path::new(&file_name));
+            if video_only && !is_video {
+                continue;
+            }
+            if !folder_filter.is_empty()
+                && !file_matches_folder(&file_name, folder_filter, &db_roots)
+            {
+                continue;
+            }
+            let distance = distances
+                .filter(|array| !array.is_null(row))
+                .map(|array| array.value(row))
+                .unwrap_or(1.0);
+            let score = 1.0 - distance;
+            let timestamp_sec = timestamps
+                .filter(|array| !array.is_null(row))
+                .map(|array| array.value(row))
+                .unwrap_or(0.0);
+            best_by_file
+                .entry(file_name)
+                .and_modify(|best| {
+                    if score > best.0 {
+                        *best = (score, is_video, timestamp_sec);
+                    }
+                })
+                .or_insert((score, is_video, timestamp_sec));
+        }
+    }
+    let mut rows: Vec<_> = best_by_file
+        .into_iter()
+        .map(
+            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+                rank: 0,
+                score,
+                file_name,
+                is_video,
+                timestamp_sec,
+                media_path: None,
+                ocr_term_hits: 0,
+                ocr_query_terms: 0,
+                ocr_phrase_query: false,
+            },
+        )
+        .collect();
+    rows.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    rows.truncate(limit);
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    Ok(rows)
+}
+
+pub(crate) async fn search_face_ann(
+    db_dir: &Path,
+    table_name: &str,
+    query_vectors: &[Vec<f32>],
+    limit: usize,
+    min_score: f32,
+) -> Result<Vec<SearchResult>> {
+    if query_vectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db = lancedb::connect(db_dir.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+    let ann_table_name = format!("{table_name}_face_ann");
+    let table_names = db.table_names().execute().await?;
+    if !table_names.iter().any(|name| name == &ann_table_name) {
+        bail!("ANN table {ann_table_name} is not available");
+    }
+    let table = db.open_table(&ann_table_name).execute().await?;
+    let candidate_limit = limit.saturating_mul(4).max(limit).max(32);
+    let mut best_by_file: HashMap<String, (f32, bool, f32)> = HashMap::new();
+    for query_vector in query_vectors {
+        let mut stream = table
+            .query()
+            .select(Select::columns(&[
+                "file_name",
+                "timestamp_sec",
+                "_distance",
+            ]))
+            .nearest_to(query_vector.clone())?
+            .distance_type(lancedb::DistanceType::Cosine)
+            .limit(candidate_limit)
+            .execute()
+            .await?;
+        while let Some(batch) = stream.try_next().await? {
+            let file_names = batch
+                .column_by_name("file_name")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow!("face ANN result has no file_name column"))?;
+            let timestamps = batch
+                .column_by_name("timestamp_sec")
+                .and_then(|column| column.as_any().downcast_ref::<Float32Array>());
+            let distances = batch
+                .column_by_name("_distance")
+                .and_then(|column| column.as_any().downcast_ref::<Float32Array>());
+            for row in 0..batch.num_rows() {
+                if file_names.is_null(row) {
+                    continue;
+                }
+                let file_name = file_names.value(row).to_string();
+                let distance = distances
+                    .filter(|array| !array.is_null(row))
+                    .map(|array| array.value(row))
+                    .unwrap_or(1.0);
+                let score = 1.0 - distance;
+                if score < min_score {
+                    continue;
+                }
+                let timestamp_sec = timestamps
+                    .filter(|array| !array.is_null(row))
+                    .map(|array| array.value(row))
+                    .unwrap_or(0.0);
+                let is_video = is_video_path(Path::new(&file_name));
+                best_by_file
+                    .entry(file_name)
+                    .and_modify(|best| {
+                        if score > best.0 {
+                            *best = (score, is_video, timestamp_sec);
+                        }
+                    })
+                    .or_insert((score, is_video, timestamp_sec));
+            }
+        }
+    }
+    let mut rows: Vec<_> = best_by_file
+        .into_iter()
+        .map(
+            |(file_name, (score, is_video, timestamp_sec))| SearchResult {
+                rank: 0,
+                score,
+                file_name,
+                is_video,
+                timestamp_sec,
+                media_path: None,
+                ocr_term_hits: 0,
+                ocr_query_terms: 0,
+                ocr_phrase_query: false,
+            },
+        )
+        .collect();
+    rows.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    rows.truncate(limit);
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+    Ok(rows)
+}
+
 pub(crate) async fn load_supplemental_database_indices(
     db_dir: &Path,
     table_name: &str,
@@ -900,11 +1104,11 @@ pub(crate) fn search_index(
     video_only: bool,
     folder_filter: &str,
 ) -> Vec<SearchResult> {
+    let db_roots = get_db_roots();
     let merged = index
         .entries
         .par_chunks(4096)
         .map(|chunk| {
-            let db_roots = get_db_roots();
             let mut local: HashMap<String, (f32, bool, f32)> = HashMap::new();
             for entry in chunk {
                 if video_only && !entry.is_video {
@@ -997,12 +1201,12 @@ pub(crate) fn search_ocr_index(
     }
     let query_term_count = terms.len();
     let require_phrase_match = query_is_quoted;
+    let db_roots = get_db_roots();
 
     let merged = index
         .entries
         .par_chunks(4096)
         .map(|chunk| {
-            let db_roots = get_db_roots();
             let mut local: HashMap<String, (f32, bool, f32, usize, usize, bool)> = HashMap::new();
             for entry in chunk {
                 if video_only && !entry.is_video {

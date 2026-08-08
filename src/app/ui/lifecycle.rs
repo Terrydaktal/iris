@@ -38,118 +38,49 @@ impl ImageViewer {
 
         let mut images = initial_images;
         let flat_loading = !start_on_home_page && !comparison_mode;
-        let flat_images_shared = Arc::new(Mutex::new(None));
+        let flat_images_shared: Arc<Mutex<Option<FlatRefreshResult>>> = Arc::new(Mutex::new(None));
 
         if !start_on_home_page && !comparison_mode {
-            if path.is_dir() {
-                let shared = flat_images_shared.clone();
-                let parent_absolute = path.clone();
-                std::thread::spawn(move || {
-                    let mut collected = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
-                        for entry in entries.filter_map(|e| e.ok()) {
-                            let p = entry.path();
-                            if p.is_file() {
-                                let ext = p
-                                    .extension()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("")
-                                    .to_lowercase();
-                                if matches!(
-                                    ext.as_str(),
-                                    "jpg"
-                                        | "jpeg"
-                                        | "png"
-                                        | "bmp"
-                                        | "gif"
-                                        | "webp"
-                                        | "tiff"
-                                        | "avif"
-                                        | "heif"
-                                        | "heic"
-                                        | "ico"
-                                        | "icns"
-                                        | "svg"
-                                        | "mp4"
-                                        | "mov"
-                                        | "avi"
-                                        | "mkv"
-                                        | "webm"
-                                        | "m4v"
-                                        | "wmv"
-                                        | "mpg"
-                                        | "mpeg"
-                                ) {
-                                    collected.push(p);
-                                }
-                            }
-                        }
-                    }
-                    collected.sort();
-                    if let Ok(mut lock) = shared.lock() {
-                        *lock = Some(collected);
-                    }
-                });
-            } else {
+            if !path.is_dir() {
                 images.push(path.clone());
-                let shared = flat_images_shared.clone();
-                let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                let parent_absolute = parent.canonicalize().unwrap_or(parent);
-                std::thread::spawn(move || {
-                    let mut collected = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(&parent_absolute) {
-                        for entry in entries.filter_map(|e| e.ok()) {
-                            let p = entry.path();
-                            if p.is_file() {
-                                let ext = p
-                                    .extension()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("")
-                                    .to_lowercase();
-                                if matches!(
-                                    ext.as_str(),
-                                    "jpg"
-                                        | "jpeg"
-                                        | "png"
-                                        | "bmp"
-                                        | "gif"
-                                        | "webp"
-                                        | "tiff"
-                                        | "avif"
-                                        | "heif"
-                                        | "heic"
-                                        | "ico"
-                                        | "icns"
-                                        | "svg"
-                                        | "mp4"
-                                        | "mov"
-                                        | "avi"
-                                        | "mkv"
-                                        | "webm"
-                                        | "m4v"
-                                        | "wmv"
-                                        | "mpg"
-                                        | "mpeg"
-                                ) {
-                                    collected.push(p);
-                                }
-                            }
-                        }
-                    }
-                    collected.sort();
-                    if let Ok(mut lock) = shared.lock() {
-                        *lock = Some(collected);
-                    }
-                });
             }
+            let shared = flat_images_shared.clone();
+            let parent = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            std::thread::spawn(move || {
+                let parent_absolute = parent.canonicalize().unwrap_or(parent);
+                let collected = collect_flat_images(&parent_absolute);
+                if let Ok(mut lock) = shared.lock() {
+                    if lock
+                        .as_ref()
+                        .is_none_or(|existing| existing.generation <= 1)
+                    {
+                        *lock = Some(FlatRefreshResult {
+                            generation: 1,
+                            directory: parent_absolute,
+                            images: collected,
+                        });
+                    }
+                }
+            });
         }
 
         let (thumbnail_tx, thumbnail_rx) =
-            std::sync::mpsc::channel::<(PathBuf, egui::ColorImage)>();
+            std::sync::mpsc::channel::<(u64, PathBuf, egui::ColorImage)>();
         let (viewer_texture_tx, viewer_texture_rx) =
             std::sync::mpsc::channel::<(PathBuf, u64, Result<egui::ColorImage, String>)>();
         let (video_duration_tx, video_duration_rx) =
             std::sync::mpsc::channel::<(PathBuf, Option<VideoMetadata>)>();
+        let (metadata_tx, metadata_rx) = std::sync::mpsc::channel::<MetadataLoadResult>();
+        let metadata_worker_queue = Arc::new(MetadataJobQueue::default());
+        let worker_queue = Arc::clone(&metadata_worker_queue);
+        let worker_ctx_shared = Arc::clone(&ctx_shared);
+        std::thread::spawn(move || {
+            run_metadata_worker(worker_queue, metadata_tx, worker_ctx_shared)
+        });
 
         let mut viewer = Self {
             images,
@@ -177,11 +108,17 @@ impl ImageViewer {
             pending_initial_window_size,
             rx,
             show_grid: false,
-            recursive_images: Vec::new(),
+            recursive_images: Arc::from([]),
+            recursive_scan_paths: Vec::new(),
+            recursive_images_snapshot: Arc::from([]),
             recursive_video_indices: Vec::new(),
             gallery_thumbnail_scale: 1.0,
             grid_loading: false,
             recursive_rx: None,
+            recursive_scan_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            recursive_scan_generation: 0,
+            gallery_thumbnail_generation: 0,
+            gallery_visible_thumbnail_paths: HashSet::new(),
             back_target_is_gallery: false,
             side_panel_mode: SidePanelMode::Layout,
             exif_search: String::new(),
@@ -189,6 +126,7 @@ impl ImageViewer {
             open_target_is_dir,
             flat_loading,
             flat_refresh_in_flight: false,
+            flat_refresh_generation: 1,
             flat_last_refresh_check: Instant::now(),
             flat_directory_mtime: None,
             flat_images_shared,
@@ -198,12 +136,14 @@ impl ImageViewer {
             thumbnail_textures: std::collections::HashMap::new(),
             thumbnail_loading: std::collections::HashSet::new(),
             thumbnail_failed: std::collections::HashSet::new(),
+            thumbnail_retry_at: HashMap::new(),
             thumbnail_rx,
             thumbnail_tx,
             thumbnail_active_threads: 0,
             viewer_textures: HashMap::new(),
             viewer_texture_loading: HashSet::new(),
             viewer_texture_failed: HashSet::new(),
+            viewer_texture_retry_at: HashMap::new(),
             viewer_texture_revisions: HashMap::new(),
             viewer_texture_rx,
             viewer_texture_tx,
@@ -224,6 +164,11 @@ impl ImageViewer {
             search_history: Vec::new(),
             search_forward_history: Vec::new(),
             gallery_image_forward: None,
+            gallery_scan_generation: 0,
+            gallery_filter_cache_key: None,
+            gallery_filtered_indices: Arc::from([]),
+            gallery_navigation_indices: None,
+            gallery_navigation_position: 0,
             applied_filename_query: String::new(),
             filename_search_results: None,
             semantic_folder: String::new(),
@@ -257,6 +202,19 @@ impl ImageViewer {
             video_still_cache: std::cell::RefCell::new(HashMap::new()),
             resolution_size_cache: std::cell::RefCell::new(HashMap::new()),
             db_filename_cache: std::cell::RefCell::new(HashMap::new()),
+            metadata_rx,
+            metadata_worker_queue,
+            metadata_loading: false,
+            metadata_loading_path: None,
+            metadata_loading_exif: false,
+            metadata_loading_layout: false,
+            metadata_generation: 0,
+            semantic_search_rx: None,
+            semantic_search_generation: 0,
+            filename_search_rx: None,
+            filename_search_generation: 0,
+            pending_similarity_source: None,
+            pending_similarity_label: None,
             show_home_page: start_on_home_page,
             home_current_dir: None,
             home_selected_dir: None,
@@ -360,9 +318,13 @@ impl ImageViewer {
                 let mut basename_to_db_filename = HashMap::new();
                 for entry in &clip_index.entries {
                     if let Some(fname) = Path::new(entry.file_name.as_ref()).file_name() {
-                        basename_to_db_filename
+                        let names = basename_to_db_filename
                             .entry(fname.to_string_lossy().to_lowercase())
-                            .or_insert_with(|| entry.file_name.to_string());
+                            .or_insert_with(Vec::new);
+                        let name = entry.file_name.to_string();
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
                     }
                 }
                 self.db_indices = Some(DatabaseIndices {
@@ -385,7 +347,7 @@ impl ImageViewer {
                     sift_root_by_file: HashMap::new(),
                     sift_members_by_root: HashMap::new(),
                     skipped_processing_files: Arc::new(HashSet::new()),
-                    basename_to_db_filename,
+                    basename_to_db_filename: Arc::new(basename_to_db_filename),
                     encoder,
                 });
                 self.db_loaded = true;
@@ -414,6 +376,7 @@ impl ImageViewer {
                     indices.sift_root_by_file = data.sift_root_by_file;
                     indices.sift_members_by_root = data.sift_members_by_root;
                     indices.skipped_processing_files = Arc::new(data.skipped_processing_files);
+                    let mut basename_to_db_filename = (*indices.basename_to_db_filename).clone();
                     for key in indices
                         .phash_master_by_file
                         .keys()
@@ -421,12 +384,15 @@ impl ImageViewer {
                         .chain(indices.sift_info_by_file.keys())
                     {
                         if let Some(fname) = Path::new(key).file_name() {
-                            indices
-                                .basename_to_db_filename
+                            let names = basename_to_db_filename
                                 .entry(fname.to_string_lossy().to_lowercase())
-                                .or_insert_with(|| key.clone());
+                                .or_insert_with(Vec::new);
+                            if !names.contains(key) {
+                                names.push(key.clone());
+                            }
                         }
                     }
+                    indices.basename_to_db_filename = Arc::new(basename_to_db_filename);
                 }
                 self.db_supplemental_loaded = true;
                 self.db_supplemental_loading = false;
@@ -540,6 +506,16 @@ impl ImageViewer {
                 self.semantic_status =
                     "On-demand embedding worker disconnected unexpectedly.".to_string();
             }
+        }
+    }
+}
+
+impl Drop for ImageViewer {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.metadata_worker_queue.state.lock() {
+            state.pending = None;
+            state.shutdown = true;
+            self.metadata_worker_queue.wake.notify_one();
         }
     }
 }

@@ -1,6 +1,100 @@
+use super::binary::{FileChunk, parse_bmp, parse_generic, parse_jpeg, parse_png, parse_webp};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub(crate) fn run_metadata_worker(
+    queue: Arc<crate::app::MetadataJobQueue>,
+    tx: std::sync::mpsc::Sender<crate::app::MetadataLoadResult>,
+    ctx_shared: Arc<Mutex<Option<eframe::egui::Context>>>,
+) {
+    loop {
+        let request = {
+            let mut state = match queue.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            while state.pending.is_none() && !state.shutdown {
+                state = match queue.wake.wait(state) {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+            }
+            if state.shutdown {
+                return;
+            }
+            state.pending.take()
+        };
+
+        let Some(request) = request else {
+            continue;
+        };
+        let result = load_file_metadata(
+            request.logical_path,
+            request.inspect_path,
+            request.generation,
+            request.load_exif,
+            request.load_layout,
+        );
+        if tx.send(result).is_err() {
+            return;
+        }
+        if let Ok(lock) = ctx_shared.lock() {
+            if let Some(ctx) = lock.as_ref() {
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> std::io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("metadata command stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("metadata command stderr was not captured"))?;
+    const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            let status = child.wait()?;
+            return Ok(Output {
+                status,
+                stdout: stdout_reader.join().unwrap_or_default(),
+                stderr: stderr_reader.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "metadata command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 pub(crate) fn extract_system_block(exif_data: &str) -> String {
     let mut lines = Vec::new();
@@ -109,7 +203,8 @@ pub(crate) fn resolve_ffprobe_path() -> Option<PathBuf> {
 
 pub(crate) fn load_ffprobe_metadata(path: &Path) -> String {
     if let Some(ffprobe_path) = resolve_ffprobe_path() {
-        match Command::new(&ffprobe_path)
+        let mut command = Command::new(&ffprobe_path);
+        command
             .args([
                 "-v",
                 "error",
@@ -122,9 +217,8 @@ pub(crate) fn load_ffprobe_metadata(path: &Path) -> String {
                 "-print_format",
                 "json",
             ])
-            .arg(path)
-            .output()
-        {
+            .arg(path);
+        match command_output_with_timeout(command, Duration::from_secs(30)) {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 if !stdout.trim().is_empty() {
@@ -155,7 +249,8 @@ pub(crate) struct VideoMetadata {
 
 pub(crate) fn load_video_metadata(path: &Path) -> Option<VideoMetadata> {
     let ffprobe_path = resolve_ffprobe_path()?;
-    let out = Command::new(ffprobe_path)
+    let mut command = Command::new(ffprobe_path);
+    command
         .args([
             "-v",
             "error",
@@ -164,9 +259,8 @@ pub(crate) fn load_video_metadata(path: &Path) -> Option<VideoMetadata> {
             "-of",
             "json",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let out = command_output_with_timeout(command, Duration::from_secs(15)).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -202,6 +296,113 @@ pub(crate) fn load_video_metadata(path: &Path) -> Option<VideoMetadata> {
         width,
         height,
     })
+}
+
+pub(crate) fn load_file_metadata(
+    logical_path: PathBuf,
+    inspect_path: PathBuf,
+    generation: u64,
+    load_exif: bool,
+    load_layout: bool,
+) -> crate::app::MetadataLoadResult {
+    let exif_data = if load_exif {
+        let exiftool_data = if !inspect_path.exists() {
+            format!("Resolved file does not exist: {}", inspect_path.display())
+        } else if let Some(exiftool_path) = resolve_exiftool_path() {
+            let mut command = Command::new(&exiftool_path);
+            command.args(["-a", "-u", "-g1", "-H"]).arg(&inspect_path);
+            match command_output_with_timeout(command, Duration::from_secs(30)) {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    if !stdout.trim().is_empty() {
+                        stdout
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        if stderr.is_empty() {
+                            format!("exiftool produced no output for {}", inspect_path.display())
+                        } else {
+                            format!("exiftool error: {stderr}")
+                        }
+                    }
+                }
+                Err(error) => format!("Error running exiftool: {error}"),
+            }
+        } else {
+            "Error running exiftool: executable not found. Set IRIS_EXIFTOOL or install exiftool."
+                .to_string()
+        };
+        if inspect_path.exists() && super::is_video_path(&inspect_path) {
+            format!(
+                "{}\n\n---- FFprobe JSON ----\n{}",
+                exiftool_data.trim_end(),
+                load_ffprobe_metadata(&inspect_path)
+            )
+        } else {
+            exiftool_data
+        }
+    } else {
+        String::new()
+    };
+
+    let chunks = if !load_layout || !inspect_path.exists() {
+        Vec::new()
+    } else if super::is_video_path(&inspect_path) {
+        vec![FileChunk {
+            name: "Video File".to_string(),
+            offset: 0,
+            length: std::fs::metadata(&inspect_path)
+                .map(|metadata| metadata.len().min(usize::MAX as u64) as usize)
+                .unwrap_or(0),
+            description: "Video files do not use the image binary layout parser.".to_string(),
+            color: eframe::egui::Color32::from_rgb(140, 150, 170),
+            parsed_data: "Use Raw EXIF to view exiftool and ffprobe metadata for this video."
+                .to_string(),
+        }]
+    } else {
+        let mut bytes = Vec::new();
+        match std::fs::File::open(&inspect_path)
+            .and_then(|mut file| file.by_ref().take(64 * 1024 * 1024).read_to_end(&mut bytes))
+        {
+            Ok(_) => {
+                let mut chunks = if let Some(chunks) = parse_png(&bytes) {
+                    chunks
+                } else if let Some(chunks) = parse_jpeg(&bytes) {
+                    chunks
+                } else if let Some(chunks) = parse_webp(&bytes) {
+                    chunks
+                } else if let Some(chunks) = parse_bmp(&bytes) {
+                    chunks
+                } else {
+                    parse_generic(&bytes)
+                };
+                if load_exif {
+                    chunks.insert(
+                        0,
+                        FileChunk {
+                            name: "System Metadata".to_string(),
+                            offset: 0,
+                            length: 0,
+                            description: "Operating system-level file attributes, timestamps, and permissions."
+                                .to_string(),
+                            color: eframe::egui::Color32::from_rgb(140, 150, 170),
+                            parsed_data: extract_system_block(&exif_data),
+                        },
+                    );
+                }
+                chunks
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    crate::app::MetadataLoadResult {
+        generation,
+        path: logical_path,
+        exif_data,
+        chunks,
+        load_exif,
+        load_layout,
+    }
 }
 
 pub(crate) fn format_video_duration(duration_sec: f32) -> String {

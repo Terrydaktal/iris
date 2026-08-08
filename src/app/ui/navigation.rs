@@ -2,15 +2,31 @@ use super::*;
 
 impl ImageViewer {
     pub(crate) fn start_recursive_scan(&mut self) {
+        self.invalidate_background_searches();
+        self.recursive_scan_generation = self.recursive_scan_generation.wrapping_add(1);
+        self.recursive_scan_token.store(
+            self.recursive_scan_generation,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let scan_generation = self.recursive_scan_generation;
+        let scan_token = self.recursive_scan_token.clone();
+        self.gallery_scan_generation = self.gallery_scan_generation.wrapping_add(1);
+        self.gallery_thumbnail_generation = self.gallery_thumbnail_generation.wrapping_add(1);
+        self.gallery_filter_cache_key = None;
+        self.gallery_navigation_indices = None;
+        self.gallery_navigation_position = 0;
         self.grid_loading = true;
-        self.recursive_images.clear();
+        self.recursive_images = Arc::from([]);
+        self.recursive_scan_paths.clear();
+        self.recursive_images_snapshot = Arc::from([]);
         self.recursive_video_indices.clear();
         self.applied_filename_query.clear();
         self.filename_search_results = None;
         self.thumbnail_textures.clear();
         self.thumbnail_loading.clear();
         self.thumbnail_failed.clear();
-        self.thumbnail_active_threads = 0;
+        self.thumbnail_retry_at.clear();
+        self.gallery_visible_thumbnail_paths.clear();
         self.video_duration_cache.borrow_mut().clear();
         self.video_duration_loading.borrow_mut().clear();
 
@@ -29,7 +45,13 @@ impl ImageViewer {
         std::thread::spawn(move || {
             let start_dir_canon = start_dir.canonicalize().unwrap_or(start_dir);
             let mut visited = std::collections::HashSet::new();
-            collect_images_recursive(&start_dir_canon, &tx, &mut visited);
+            collect_images_recursive_cancelable(
+                &start_dir_canon,
+                &tx,
+                &mut visited,
+                &scan_token,
+                scan_generation,
+            );
         });
     }
 
@@ -51,6 +73,8 @@ impl ImageViewer {
 
     pub(crate) fn clear_comparison_mode(&mut self) {
         self.clear_comparison_alignment();
+        self.gallery_navigation_indices = None;
+        self.gallery_navigation_position = 0;
         self.comparison_paths = None;
         self.comparison_view_states.clear();
         self.comparison_sync_view = false;
@@ -116,6 +140,7 @@ impl ImageViewer {
     }
 
     pub(crate) fn open_comparison_paths(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        self.invalidate_background_searches();
         let mut unique_paths = Vec::new();
         for path in paths.into_iter().take(6) {
             let path = path.canonicalize().unwrap_or(path);
@@ -133,6 +158,8 @@ impl ImageViewer {
 
         self.image_editor = None;
         self.clear_comparison_alignment();
+        self.gallery_navigation_indices = None;
+        self.gallery_navigation_position = 0;
         self.compare_target = None;
         self.sift_pair_overlay = None;
         self.selected_grid_items.clear();
@@ -281,6 +308,8 @@ impl ImageViewer {
     }
 
     pub(crate) fn open_path(&mut self, path: PathBuf, known_is_dir: Option<bool>) {
+        self.invalidate_background_searches();
+        self.flat_refresh_generation = self.flat_refresh_generation.wrapping_add(1);
         self.clear_comparison_mode();
         self.face_overlay_boxes.clear();
         let old_start_dir = if self.open_target_is_dir {
@@ -310,7 +339,9 @@ impl ImageViewer {
         let new_start_dir_norm = normalized_path_for_match(&new_start_dir);
 
         if old_start_dir_norm != new_start_dir_norm {
-            self.recursive_images.clear();
+            self.recursive_images = Arc::from([]);
+            self.recursive_scan_paths.clear();
+            self.recursive_images_snapshot = Arc::from([]);
             self.recursive_video_indices.clear();
             self.back_target_is_gallery = false;
             self.flat_directory_mtime = None;
@@ -339,11 +370,21 @@ impl ImageViewer {
 
             let shared = self.flat_images_shared.clone();
             let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let generation = self.flat_refresh_generation;
             std::thread::spawn(move || {
                 let parent_absolute = parent.canonicalize().unwrap_or(parent);
                 let collected = collect_flat_images(&parent_absolute);
                 if let Ok(mut lock) = shared.lock() {
-                    *lock = Some(collected);
+                    let replace = lock
+                        .as_ref()
+                        .is_none_or(|existing| existing.generation <= generation);
+                    if replace {
+                        *lock = Some(FlatRefreshResult {
+                            generation,
+                            directory: parent_absolute,
+                            images: collected,
+                        });
+                    }
                 }
             });
         }

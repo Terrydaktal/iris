@@ -1,7 +1,46 @@
 use super::*;
 
 impl ImageViewer {
+    fn cached_gallery_indices(&mut self, semantic_active: bool) -> Arc<[usize]> {
+        let key = GalleryFilterKey {
+            scan_generation: self.gallery_scan_generation,
+            grid_loading: self.grid_loading,
+            applied_filename_query: self.applied_filename_query.clone(),
+            has_filename_results: self.filename_search_results.is_some(),
+            semantic_mode: self.semantic_mode,
+            semantic_results_mode: self.semantic_results_mode,
+            video_only: self.semantic_video_only,
+        };
+        if self.gallery_filter_cache_key.as_ref() != Some(&key) {
+            let candidates = if !semantic_active && self.grid_loading {
+                Vec::new()
+            } else if self.semantic_mode == SearchMode::Filename {
+                self.filename_search_results
+                    .clone()
+                    .unwrap_or_else(|| (0..self.recursive_images.len()).collect())
+            } else {
+                (0..self.recursive_images.len()).collect()
+            };
+            let filtered = if self.semantic_video_only {
+                if self.filename_search_results.is_some() {
+                    candidates
+                        .into_iter()
+                        .filter(|index| self.recursive_video_indices.binary_search(index).is_ok())
+                        .collect()
+                } else {
+                    self.recursive_video_indices.clone()
+                }
+            } else {
+                candidates
+            };
+            self.gallery_filtered_indices = Arc::from(filtered);
+            self.gallery_filter_cache_key = Some(key);
+        }
+        self.gallery_filtered_indices.clone()
+    }
+
     pub(crate) fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.gallery_visible_thumbnail_paths.clear();
         #[derive(Clone)]
         struct GalleryItem {
             path: PathBuf,
@@ -196,31 +235,9 @@ impl ImageViewer {
                 }
             };
 
-            // Keep the folder grid empty until the recursive scan has completed so the
-            // user does not see a transient partial ordering before the final sorted set.
-            let filename_candidates: Vec<usize> = if !is_active_semantic_search && self.grid_loading {
-                Vec::new()
-            } else if self.semantic_mode == SearchMode::Filename {
-                self.filename_search_results
-                    .clone()
-                    .unwrap_or_else(|| (0..self.recursive_images.len()).collect())
-            } else {
-                (0..self.recursive_images.len()).collect()
-            };
-            let filtered_images: Vec<usize> = if self.semantic_video_only {
-                if self.filename_search_results.is_some() {
-                    filename_candidates
-                        .into_iter()
-                        .filter(|index| self.recursive_video_indices.binary_search(index).is_ok())
-                        .collect()
-                } else {
-                    // The scan builds this once, avoiding an extension check for every
-                    // indexed path on every UI frame while scrolling.
-                    self.recursive_video_indices.clone()
-                }
-            } else {
-                filename_candidates
-            };
+            // Keep the folder grid empty until the recursive scan has completed and cache
+            // the resulting index set so scrolling does not allocate O(N) every frame.
+            let filtered_images = self.cached_gallery_indices(is_active_semantic_search);
 
             // Status message label
             ui.horizontal(|ui| {
@@ -519,6 +536,17 @@ impl ImageViewer {
                                         .corner_radius(6.0)
                                         .show(&mut child_ui, |ui| {
                                             let resolved_path = self.get_thumbnail_path(path);
+                                            self.gallery_visible_thumbnail_paths
+                                                .insert(resolved_path.clone());
+                                            if self.thumbnail_failed.contains(&resolved_path)
+                                                && self
+                                                    .thumbnail_retry_at
+                                                    .get(&resolved_path)
+                                                    .is_none_or(|retry_at| Instant::now() >= *retry_at)
+                                            {
+                                                self.thumbnail_failed.remove(&resolved_path);
+                                                self.thumbnail_retry_at.remove(&resolved_path);
+                                            }
                                             if let Some(texture) = self.thumbnail_textures.get(&resolved_path) {
                                                 ui.centered_and_justified(|ui| {
                                                     ui.add(
@@ -547,6 +575,8 @@ impl ImageViewer {
                                                     self.thumbnail_loading.insert(resolved_path.clone());
                                                     self.thumbnail_active_threads += 1;
                                                     let path_clone = resolved_path.clone();
+                                                    let thumbnail_generation =
+                                                        self.gallery_thumbnail_generation;
                                                     let tx_clone = self.thumbnail_tx.clone();
                                                     let ctx_clone = ui.ctx().clone();
                                                     rayon::spawn(move || {
@@ -555,11 +585,19 @@ impl ImageViewer {
                                                             let size = [thumb.width() as usize, thumb.height() as usize];
                                                             let pixels = thumb.to_rgba8().into_raw();
                                                             let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                                            let _ = tx_clone.send((path_clone, color_img));
+                                                            let _ = tx_clone.send((
+                                                                thumbnail_generation,
+                                                                path_clone,
+                                                                color_img,
+                                                            ));
                                                             ctx_clone.request_repaint();
                                                         } else {
                                                             let empty_img = egui::ColorImage::new([0, 0], Vec::new());
-                                                            let _ = tx_clone.send((path_clone, empty_img));
+                                                            let _ = tx_clone.send((
+                                                                thumbnail_generation,
+                                                                path_clone,
+                                                                empty_img,
+                                                            ));
                                                             ctx_clone.request_repaint();
                                                         }
                                                     });
@@ -744,21 +782,30 @@ impl ImageViewer {
                                 .arg(playback_path)
                                 .spawn();
                         } else {
-                        let active_paths: Vec<PathBuf> = if is_active_semantic_search {
-                            for item in &gallery_items {
-                                if let Some(db_name) = &item.db_filename {
-                                    self.db_filename_by_path.insert(item.path.clone(), db_name.clone());
+                            if is_active_semantic_search {
+                                for item in &gallery_items {
+                                    if let Some(db_name) = &item.db_filename {
+                                        self.db_filename_by_path
+                                            .insert(item.path.clone(), db_name.clone());
+                                    }
                                 }
+                                self.images =
+                                    gallery_items.iter().map(|item| item.path.clone()).collect();
+                                self.current_index =
+                                    self.images.iter().position(|p| p == &path).unwrap_or(0);
+                                self.gallery_navigation_indices = None;
+                            } else if let Some(position) = filtered_images
+                                .iter()
+                                .position(|&index| self.recursive_images[index] == path)
+                            {
+                                if let Some(db_name) = self.resolve_db_filename(&path) {
+                                    self.db_filename_by_path.insert(path.clone(), db_name);
+                                }
+                                self.images = vec![path.clone()];
+                                self.current_index = 0;
+                                self.gallery_navigation_indices = Some(filtered_images.clone());
+                                self.gallery_navigation_position = position;
                             }
-                            gallery_items.iter().map(|item| item.path.clone()).collect()
-                        } else {
-                            if let Some(db_name) = self.resolve_db_filename(&path) {
-                                self.db_filename_by_path.insert(path.clone(), db_name);
-                            }
-                            filtered_images.iter().map(|&idx| self.recursive_images[idx].clone()).collect()
-                        };
-                        self.images = active_paths;
-                        self.current_index = self.images.iter().position(|p| p == &path).unwrap_or(0);
                         self.remember_gallery_image();
                         self.show_grid = false;
                         self.back_target_is_gallery = true;
@@ -772,22 +819,38 @@ impl ImageViewer {
 
                     if let Some(item) = single_clicked_item {
                         let path = item.path.clone();
-                        let active_paths: Vec<PathBuf> = if is_active_semantic_search {
+                        if is_active_semantic_search {
                             for item in &gallery_items {
                                 if let Some(db_name) = &item.db_filename {
-                                    self.db_filename_by_path.insert(item.path.clone(), db_name.clone());
+                                    self.db_filename_by_path
+                                        .insert(item.path.clone(), db_name.clone());
                                 }
                             }
-                            gallery_items.iter().map(|item| item.path.clone()).collect()
-                        } else {
+                            let active_paths: Vec<PathBuf> =
+                                gallery_items.iter().map(|item| item.path.clone()).collect();
+                            if let Some(pos) = active_paths.iter().position(|p| p == &path) {
+                                self.images = active_paths;
+                                self.current_index = pos;
+                                self.gallery_navigation_indices = None;
+                                self.update_current_file_info();
+                                if self.show_exif || self.side_panel_open_pending {
+                                    self.update_side_panel_metadata_if_needed();
+                                } else {
+                                    self.open_side_panel(ui.ctx(), SidePanelMode::Duplicates);
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        } else if let Some(pos) = filtered_images
+                            .iter()
+                            .position(|&index| self.recursive_images[index] == path)
+                        {
                             if let Some(db_name) = self.resolve_db_filename(&path) {
                                 self.db_filename_by_path.insert(path.clone(), db_name);
                             }
-                            filtered_images.iter().map(|&idx| self.recursive_images[idx].clone()).collect()
-                        };
-                        if let Some(pos) = active_paths.iter().position(|p| p == &path) {
-                            self.images = active_paths;
-                            self.current_index = pos;
+                            self.images = vec![path.clone()];
+                            self.current_index = 0;
+                            self.gallery_navigation_indices = Some(filtered_images.clone());
+                            self.gallery_navigation_position = pos;
                             self.update_current_file_info();
                             if self.show_exif || self.side_panel_open_pending {
                                 self.update_side_panel_metadata_if_needed();

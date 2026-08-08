@@ -1,11 +1,59 @@
 use super::*;
 
+fn db_filename_for_search(
+    path: &Path,
+    roots: &HashMap<String, PathBuf>,
+    basename_map: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let path_norm = path.to_string_lossy().replace('\\', "/");
+    let trimmed = path_norm.trim_start_matches("./").trim_start_matches('/');
+    if let Some((collection, rel)) = trimmed.split_once('/') {
+        if !rel.is_empty() && roots.contains_key(collection) {
+            return Some(format!("{collection}/{}", rel.trim_start_matches('/')));
+        }
+    }
+    for (collection, root) in roots {
+        if let Ok(rel) = path.strip_prefix(root) {
+            return Some(format!(
+                "{collection}/{}",
+                rel.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+            ));
+        }
+        let root_norm = root.to_string_lossy().replace('\\', "/");
+        if path_norm == root_norm || path_norm.starts_with(&format!("{root_norm}/")) {
+            return Some(format!(
+                "{collection}/{}",
+                path_norm[root_norm.len()..].trim_start_matches('/')
+            ));
+        }
+    }
+    if !path.exists() {
+        let basename = path.file_name()?.to_string_lossy().to_lowercase();
+        let matches = basename_map.get(&basename)?;
+        if matches.len() == 1 {
+            return matches.first().cloned();
+        }
+    }
+    None
+}
+
 impl ImageViewer {
+    pub(crate) fn invalidate_background_searches(&mut self) {
+        self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
+        self.semantic_search_rx = None;
+        self.filename_search_generation = self.filename_search_generation.wrapping_add(1);
+        self.filename_search_rx = None;
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
+    }
+
     pub(crate) fn run_semantic_search_mode(&mut self, mode: SearchMode, ctx: &egui::Context) {
         match mode {
             SearchMode::Filename => {}
             SearchMode::Clip => self.search_clip_now(ctx),
-            SearchMode::Ocr => self.search_ocr_now(),
+            SearchMode::Ocr => self.search_ocr_now(ctx),
         }
     }
 
@@ -76,6 +124,8 @@ impl ImageViewer {
         self.gallery_image_forward = Some(GalleryImageSnapshot {
             images: self.images.clone(),
             current_index: self.current_index,
+            navigation_indices: self.gallery_navigation_indices.clone(),
+            navigation_position: self.gallery_navigation_position,
         });
     }
 
@@ -88,6 +138,8 @@ impl ImageViewer {
         self.current_index = snapshot
             .current_index
             .min(self.images.len().saturating_sub(1));
+        self.gallery_navigation_indices = snapshot.navigation_indices;
+        self.gallery_navigation_position = snapshot.navigation_position;
         self.show_grid = false;
         self.back_target_is_gallery = true;
         self.zoom = 1.0;
@@ -147,72 +199,90 @@ impl ImageViewer {
     pub(crate) fn apply_filename_search(&mut self) {
         self.applied_filename_query = self.semantic_query.trim().to_string();
         if self.applied_filename_query.is_empty() {
+            self.filename_search_generation = self.filename_search_generation.wrapping_add(1);
+            self.filename_search_rx = None;
             self.filename_search_results = None;
             self.semantic_status = "Filename filter cleared.".to_string();
             return;
         }
 
+        let roots = get_db_roots();
+        let basename_map = self
+            .db_indices
+            .as_ref()
+            .map(|indices| Arc::clone(&indices.basename_to_db_filename))
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+        let paths = Arc::clone(&self.recursive_images_snapshot);
         let query = self
             .applied_filename_query
             .to_lowercase()
             .replace('\\', "/");
-        let query_is_path = query.contains('/');
-        let query_basename = query.rsplit('/').next().filter(|name| name.contains('.'));
-        let roots = get_db_roots();
-        let mut matches = Vec::new();
-        for (index, path) in self.recursive_images.iter().enumerate() {
-            let matched = if query_is_path {
-                if query_basename.is_some_and(|query_name| {
-                    !path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.eq_ignore_ascii_case(query_name))
-                }) {
-                    false
-                } else {
-                    let physical_path = path.to_string_lossy().replace('\\', "/").to_lowercase();
-                    if partial_path_matches(&query, &physical_path) {
-                        true
-                    } else if let Some(db_name) = self.resolve_db_filename(path) {
-                        let db_name = db_name.to_lowercase();
-                        let relative_name = db_name
-                            .split_once('/')
-                            .map(|(_, rel)| rel)
-                            .unwrap_or(&db_name);
-                        partial_path_matches(&query, &db_name)
-                            || partial_path_matches(&query, relative_name)
-                            || db_name.split_once('/').is_some_and(|(collection, rel)| {
-                                roots.get(collection).is_some_and(|root| {
-                                    let full_path = root
-                                        .join(rel)
-                                        .to_string_lossy()
-                                        .replace('\\', "/")
-                                        .to_lowercase();
-                                    partial_path_matches(&query, &full_path)
-                                })
-                            })
-                    } else {
+        let query_for_status = self.applied_filename_query.clone();
+        let generation = self.filename_search_generation.wrapping_add(1);
+        let gallery_generation = self.gallery_scan_generation;
+        self.filename_search_generation = generation;
+        self.filename_search_results = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.filename_search_rx = Some(rx);
+        self.semantic_status = format!("Searching filenames for {query_for_status}...");
+        std::thread::spawn(move || {
+            let query_is_path = query.contains('/');
+            let query_basename = query.rsplit('/').next().filter(|name| name.contains('.'));
+            let mut matches = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                let matched = if query_is_path {
+                    if query_basename.is_some_and(|query_name| {
+                        !path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.eq_ignore_ascii_case(query_name))
+                    }) {
                         false
+                    } else {
+                        let physical_path =
+                            path.to_string_lossy().replace('\\', "/").to_lowercase();
+                        if partial_path_matches(&query, &physical_path) {
+                            true
+                        } else if let Some(db_name) =
+                            db_filename_for_search(path, &roots, &basename_map)
+                        {
+                            let db_name = db_name.to_lowercase();
+                            let relative_name = db_name
+                                .split_once('/')
+                                .map(|(_, rel)| rel)
+                                .unwrap_or(&db_name);
+                            partial_path_matches(&query, &db_name)
+                                || partial_path_matches(&query, relative_name)
+                                || db_name.split_once('/').is_some_and(|(collection, rel)| {
+                                    roots.get(collection).is_some_and(|root| {
+                                        let full_path = root
+                                            .join(rel)
+                                            .to_string_lossy()
+                                            .replace('\\', "/")
+                                            .to_lowercase();
+                                        partial_path_matches(&query, &full_path)
+                                    })
+                                })
+                        } else {
+                            false
+                        }
                     }
+                } else {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+                };
+                if matched {
+                    matches.push(index);
                 }
-            } else {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.to_lowercase().contains(&query))
-            };
-            if matched {
-                matches.push(index);
             }
-        }
-
-        matches.reverse();
-
-        self.semantic_status = format!(
-            "Filename search found {} item(s) for {}.",
-            matches.len(),
-            self.applied_filename_query
-        );
-        self.filename_search_results = Some(matches);
+            matches.reverse();
+            let _ = tx.send(FilenameSearchWorkerResult {
+                generation,
+                gallery_generation,
+                matches,
+            });
+        });
     }
 
     pub(crate) fn submit_semantic_search(&mut self, ctx: &egui::Context) {
@@ -388,8 +458,10 @@ impl ImageViewer {
         if let Some(indices) = &self.db_indices {
             if let Some(base) = query_path.file_name() {
                 let base = base.to_string_lossy().to_lowercase();
-                if let Some(db_name) = indices.basename_to_db_filename.get(&base) {
-                    return Some(request_from_db_name(db_name.clone()));
+                if let Some(db_names) = indices.basename_to_db_filename.get(&base) {
+                    if db_names.len() == 1 {
+                        return Some(request_from_db_name(db_names[0].clone()));
+                    }
                 }
             }
         }
@@ -398,17 +470,11 @@ impl ImageViewer {
     }
 
     pub(crate) fn search_clip_now(&mut self, ctx: &egui::Context) {
+        self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
         let q = self.semantic_query.trim().to_string();
         let folder_scope = self.effective_semantic_folder();
-        if !self.db_supplemental_loaded {
-            self.pending_semantic_search_mode = Some(SearchMode::Ocr);
-            self.semantic_status = if self.db_supplemental_loading {
-                "Loading OCR index in the background...".to_string()
-            } else {
-                "OCR index is unavailable because supplemental database loading failed.".to_string()
-            };
-            return;
-        }
         if q.is_empty() {
             self.semantic_status = "Please enter a search phrase first.".to_string();
             self.semantic_results.clear();
@@ -427,7 +493,6 @@ impl ImageViewer {
             return;
         };
 
-        let started = Instant::now();
         let query_vector = match indices.encoder.embed(&q) {
             Ok(vec) => vec,
             Err(err) => {
@@ -446,45 +511,62 @@ impl ImageViewer {
         }
 
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_index(
-            &indices.clip_index,
-            &query_vector,
-            pre_limit,
-            self.semantic_video_only,
-            &folder_scope,
-        );
-        if !self.semantic_video_only {
-            results = collapse_sift_grouped_results(
-                results,
-                &indices.sift_root_by_file,
-                self.semantic_limit,
-            );
-        } else {
-            results.truncate(self.semantic_limit);
-        }
-
-        let db_roots = get_db_roots();
-        let db_dir_buf = get_db_dir();
-        let db_dir = db_dir_buf.as_path();
-        for row in &mut results {
-            row.media_path =
-                resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
-            if let Some(path) = &row.media_path {
-                self.db_filename_by_path
-                    .insert(path.clone(), row.file_name.clone());
-            }
-        }
-
-        let took = started.elapsed().as_millis();
-        self.semantic_status = format!(
-            "✓ Found {} CLIP results in {} ms across {} index vectors within {}",
-            results.len(),
-            took,
-            indices.clip_index.entries.len(),
-            folder_scope
-        );
-        self.semantic_results = results;
-        self.semantic_results_mode = Some(SearchMode::Clip);
+        let result_limit = self.semantic_limit;
+        let video_only = self.semantic_video_only;
+        let indexed_items = indices.clip_index.entries.len();
+        let clip_index = Arc::clone(&indices.clip_index);
+        let db_dir = get_db_dir();
+        let folder_scope = folder_scope.to_string();
+        let generation = self.semantic_search_generation.wrapping_add(1);
+        self.semantic_search_generation = generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.semantic_search_rx = Some(rx);
+        self.semantic_results.clear();
+        self.semantic_results_mode = None;
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
+        self.semantic_status = "Searching CLIP index...".to_string();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let ann_result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(search_clip_ann(
+                            &db_dir,
+                            MEDIA_INDEX_TABLE,
+                            &query_vector,
+                            pre_limit,
+                            video_only,
+                            &folder_scope,
+                        ))
+                        .ok()
+                });
+            let rows = ann_result.unwrap_or_else(|| {
+                search_index(
+                    &clip_index,
+                    &query_vector,
+                    pre_limit,
+                    video_only,
+                    &folder_scope,
+                )
+            });
+            let _ = tx.send(Ok(SemanticSearchWorkerResult {
+                generation,
+                mode: SearchMode::Clip,
+                rows,
+                took_ms: started.elapsed().as_millis(),
+                indexed_items,
+                folder_scope,
+                display_label: "CLIP".to_string(),
+                limit: result_limit,
+                video_only,
+            }));
+            ctx_clone.request_repaint();
+        });
     }
 
     pub(crate) fn search_clip_from_clipboard_image(
@@ -517,7 +599,10 @@ impl ImageViewer {
         self.request_search_action(request, ctx);
     }
 
-    pub(crate) fn search_ocr_now(&mut self) {
+    pub(crate) fn search_ocr_now(&mut self, ctx: &egui::Context) {
+        self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
         let q = self.semantic_query.trim().to_string();
         let folder_scope = self.effective_semantic_folder();
         if q.is_empty() {
@@ -531,47 +616,38 @@ impl ImageViewer {
             return;
         };
 
-        let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let mut results = search_ocr_index(
-            &indices.ocr_index,
-            &q,
-            pre_limit,
-            self.semantic_video_only,
-            &folder_scope,
-        );
-        if !self.semantic_video_only {
-            results = collapse_sift_grouped_results(
-                results,
-                &indices.sift_root_by_file,
-                self.semantic_limit,
-            );
-        } else {
-            results.truncate(self.semantic_limit);
-        }
-
-        let db_roots = get_db_roots();
-        let db_dir_buf = get_db_dir();
-        let db_dir = db_dir_buf.as_path();
-        for row in &mut results {
-            row.media_path =
-                resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
-            if let Some(path) = &row.media_path {
-                self.db_filename_by_path
-                    .insert(path.clone(), row.file_name.clone());
-            }
-        }
-
-        let took = started.elapsed().as_millis();
-        self.semantic_status = format!(
-            "✓ Found {} OCR results in {} ms across {} index entries within {}",
-            results.len(),
-            took,
-            indices.ocr_index.entries.len(),
-            folder_scope
-        );
-        self.semantic_results = results;
-        self.semantic_results_mode = Some(SearchMode::Ocr);
+        let result_limit = self.semantic_limit;
+        let video_only = self.semantic_video_only;
+        let indexed_items = indices.ocr_index.entries.len();
+        let ocr_index = Arc::clone(&indices.ocr_index);
+        let folder_scope = folder_scope.to_string();
+        let generation = self.semantic_search_generation.wrapping_add(1);
+        self.semantic_search_generation = generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.semantic_search_rx = Some(rx);
+        self.semantic_results.clear();
+        self.semantic_results_mode = None;
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
+        self.semantic_status = "Searching OCR index...".to_string();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let rows = search_ocr_index(&ocr_index, &q, pre_limit, video_only, &folder_scope);
+            let _ = tx.send(Ok(SemanticSearchWorkerResult {
+                generation,
+                mode: SearchMode::Ocr,
+                rows,
+                took_ms: started.elapsed().as_millis(),
+                indexed_items,
+                folder_scope,
+                display_label: "OCR".to_string(),
+                limit: result_limit,
+                video_only,
+            }));
+            ctx_clone.request_repaint();
+        });
     }
 }
 
@@ -611,58 +687,61 @@ impl ImageViewer {
             );
             return;
         }
-        let started = Instant::now();
         let pre_limit = (self.semantic_limit.saturating_mul(12)).max(self.semantic_limit + 32);
-        let mut results = search_index(&indices.clip_index, &query_vector, pre_limit, false, "");
-        if let Some(source) = &source {
-            results.retain(|candidate| candidate.file_name != source.file_name);
-        }
-        results =
-            collapse_sift_grouped_results(results, &indices.sift_root_by_file, self.semantic_limit);
-
-        let db_roots = get_db_roots();
-        let db_dir_buf = get_db_dir();
-        let db_dir = db_dir_buf.as_path();
-        for candidate in &mut results {
-            candidate.media_path = resolve_media_path(
-                &db_roots,
-                db_dir,
-                &candidate.file_name,
-                candidate.timestamp_sec,
-            )
-            .ok();
-            if let Some(path) = &candidate.media_path {
-                self.db_filename_by_path
-                    .insert(path.clone(), candidate.file_name.clone());
+        let result_limit = self.semantic_limit;
+        let clip_index = Arc::clone(&indices.clip_index);
+        let indexed_items = clip_index.entries.len();
+        let db_dir = get_db_dir();
+        let label = label.to_string();
+        let generation = self.semantic_search_generation.wrapping_add(1);
+        self.semantic_search_generation = generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.semantic_search_rx = Some(rx);
+        self.pending_similarity_source = source;
+        self.pending_similarity_label = Some(label.clone());
+        self.semantic_results.clear();
+        self.semantic_results_mode = None;
+        self.semantic_status = format!("Searching CLIP similars for {label}...");
+        let ctx = self
+            .ctx_shared
+            .lock()
+            .ok()
+            .and_then(|lock| lock.as_ref().cloned());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let ann_result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(search_clip_ann(
+                            &db_dir,
+                            MEDIA_INDEX_TABLE,
+                            &query_vector,
+                            pre_limit,
+                            false,
+                            "",
+                        ))
+                        .ok()
+                });
+            let rows = ann_result
+                .unwrap_or_else(|| search_index(&clip_index, &query_vector, pre_limit, false, ""));
+            let _ = tx.send(Ok(SemanticSearchWorkerResult {
+                generation,
+                mode: SearchMode::Clip,
+                rows,
+                took_ms: started.elapsed().as_millis(),
+                indexed_items,
+                folder_scope: label.to_string(),
+                display_label: "CLIP-similar".to_string(),
+                limit: result_limit,
+                video_only: false,
+            }));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
             }
-        }
-        if let Some(mut source) = source {
-            if source.media_path.is_none() {
-                source.media_path =
-                    resolve_media_path(&db_roots, db_dir, &source.file_name, source.timestamp_sec)
-                        .ok();
-            }
-            if let Some(source_path) = &source.media_path {
-                self.db_filename_by_path
-                    .insert(source_path.clone(), source.file_name.clone());
-                results.retain(|candidate| candidate.media_path.as_ref() != Some(source_path));
-            }
-            source.score = 1.0;
-            results.insert(0, source);
-            results.truncate(self.semantic_limit);
-        }
-        for (idx, row) in results.iter_mut().enumerate() {
-            row.rank = idx + 1;
-        }
-        let took = started.elapsed().as_millis();
-        self.semantic_status = format!(
-            "✓ Found {} CLIP-similar results in {} ms for {}",
-            results.len(),
-            took,
-            label
-        );
-        self.semantic_results = results;
-        self.semantic_results_mode = Some(SearchMode::Clip);
+        });
     }
 
     pub(crate) fn show_most_similar_clip(&mut self, row: &SearchResult) {
@@ -752,32 +831,62 @@ impl ImageViewer {
             self.semantic_results_mode = Some(SearchMode::Clip);
             return;
         }
-        let started = Instant::now();
-        let mut results =
-            search_face_index(&indices.face_index, &query_faces, 500, FACE_MATCH_MIN_SCORE);
-        results = collapse_sift_grouped_results(results, &indices.sift_root_by_file, 500);
-
-        let db_roots = get_db_roots();
-        let db_dir_buf = get_db_dir();
-        let db_dir = db_dir_buf.as_path();
-        for row in &mut results {
-            row.media_path =
-                resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec).ok();
-            if let Some(path) = &row.media_path {
-                self.db_filename_by_path
-                    .insert(path.clone(), row.file_name.clone());
+        let face_index = Arc::clone(&indices.face_index);
+        let indexed_items = face_index.entries.len();
+        let query_count = query_faces.len();
+        let result_limit = self.semantic_limit;
+        let label = label.to_string();
+        let db_dir = get_db_dir();
+        let generation = self.semantic_search_generation.wrapping_add(1);
+        self.semantic_search_generation = generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.semantic_search_rx = Some(rx);
+        self.semantic_results.clear();
+        self.semantic_results_mode = None;
+        self.pending_similarity_source = None;
+        self.pending_similarity_label = None;
+        self.semantic_status =
+            format!("Searching face index using {query_count} query face vector(s) for {label}...");
+        let ctx = self
+            .ctx_shared
+            .lock()
+            .ok()
+            .and_then(|lock| lock.as_ref().cloned());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let ann_result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(search_face_ann(
+                            &db_dir,
+                            MEDIA_INDEX_TABLE,
+                            &query_faces,
+                            500,
+                            FACE_MATCH_MIN_SCORE,
+                        ))
+                        .ok()
+                });
+            let rows = ann_result.unwrap_or_else(|| {
+                search_face_index(&face_index, &query_faces, 500, FACE_MATCH_MIN_SCORE)
+            });
+            let _ = tx.send(Ok(SemanticSearchWorkerResult {
+                generation,
+                mode: SearchMode::Clip,
+                rows,
+                took_ms: started.elapsed().as_millis(),
+                indexed_items,
+                folder_scope: label.clone(),
+                display_label: format!("person ({label})"),
+                limit: result_limit,
+                video_only: false,
+            }));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
             }
-        }
-        let took = started.elapsed().as_millis();
-        self.semantic_status = format!(
-            "✓ Found {} person results in {} ms using {} query face vector(s) for {}",
-            results.len(),
-            took,
-            query_faces.len(),
-            label
-        );
-        self.semantic_results = results;
-        self.semantic_results_mode = Some(SearchMode::Clip);
+        });
     }
 
     pub(crate) fn label_for_request(request: &PendingSearchRequest) -> String {

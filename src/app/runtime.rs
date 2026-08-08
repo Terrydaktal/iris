@@ -26,6 +26,8 @@ impl eframe::App for ImageViewer {
         self.poll_sift_repair(ctx);
         self.poll_on_demand_embeddings(ctx);
         self.poll_face_compare(ctx);
+        self.poll_semantic_search(ctx);
+        self.poll_filename_search(ctx);
 
         if !self.db_loaded && !self.db_loading {
             let is_ai = if let Some(p) = self.images.get(self.current_index) {
@@ -40,10 +42,18 @@ impl eframe::App for ImageViewer {
             }
         }
 
-        while let Ok((path, color_image)) = self.thumbnail_rx.try_recv() {
+        while let Ok((thumbnail_generation, path, color_image)) = self.thumbnail_rx.try_recv() {
+            self.thumbnail_active_threads = self.thumbnail_active_threads.saturating_sub(1);
+            if thumbnail_generation != self.gallery_thumbnail_generation {
+                continue;
+            }
             if color_image.size[0] == 0 {
                 self.thumbnail_failed.insert(path.clone());
+                self.thumbnail_retry_at
+                    .insert(path.clone(), Instant::now() + Duration::from_secs(2));
             } else {
+                self.thumbnail_failed.remove(&path);
+                self.thumbnail_retry_at.remove(&path);
                 let texture = ctx.load_texture(
                     path.to_string_lossy(),
                     color_image,
@@ -52,9 +62,9 @@ impl eframe::App for ImageViewer {
                 self.thumbnail_textures.insert(path.clone(), texture);
             }
             self.thumbnail_loading.remove(&path);
-            self.thumbnail_active_threads = self.thumbnail_active_threads.saturating_sub(1);
             ctx.request_repaint();
         }
+        self.trim_thumbnail_texture_cache();
 
         while let Ok((path, revision, result)) = self.viewer_texture_rx.try_recv() {
             let current_revision = self
@@ -68,6 +78,8 @@ impl eframe::App for ImageViewer {
             self.viewer_texture_loading.remove(&path);
             match result {
                 Ok(color_image) => {
+                    self.viewer_texture_failed.remove(&path);
+                    self.viewer_texture_retry_at.remove(&path);
                     let texture = ctx.load_texture(
                         format!("viewer_image: {}", path.display()),
                         color_image,
@@ -76,7 +88,9 @@ impl eframe::App for ImageViewer {
                     self.viewer_textures.insert(path, texture);
                 }
                 Err(_) => {
-                    self.viewer_texture_failed.insert(path);
+                    self.viewer_texture_failed.insert(path.clone());
+                    self.viewer_texture_retry_at
+                        .insert(path.clone(), Instant::now() + Duration::from_secs(2));
                 }
             }
             ctx.request_repaint();
@@ -88,6 +102,30 @@ impl eframe::App for ImageViewer {
             self.video_duration_cache
                 .borrow_mut()
                 .insert(path, metadata);
+            ctx.request_repaint();
+        }
+
+        while let Ok(result) = self.metadata_rx.try_recv() {
+            if result.generation != self.metadata_generation
+                || self.images.get(self.current_index) != Some(&result.path)
+            {
+                continue;
+            }
+            self.metadata_loading = false;
+            if result.load_exif {
+                self.exif_data = result.exif_data;
+                self.side_panel_metadata_path = Some(result.path.clone());
+                self.metadata_loading_exif = false;
+            }
+            if result.load_layout {
+                self.chunks = result.chunks;
+                self.side_panel_layout_path = Some(result.path);
+                self.metadata_loading_layout = false;
+            }
+            self.metadata_loading = self.metadata_loading_exif || self.metadata_loading_layout;
+            if !self.metadata_loading {
+                self.metadata_loading_path = None;
+            }
             ctx.request_repaint();
         }
 
@@ -114,17 +152,19 @@ impl eframe::App for ImageViewer {
                 }
             }
             if !new_images.is_empty() {
-                self.recursive_images.extend(new_images);
+                self.recursive_scan_paths.extend(new_images);
                 ctx.request_repaint();
             }
             if disconnected {
-                self.recursive_images.sort_by(|a, b| b.cmp(a));
+                self.recursive_scan_paths.sort_by(|a, b| b.cmp(a));
                 self.recursive_video_indices = self
-                    .recursive_images
+                    .recursive_scan_paths
                     .iter()
                     .enumerate()
                     .filter_map(|(index, path)| is_video_path(path).then_some(index))
                     .collect();
+                self.recursive_images = Arc::from(std::mem::take(&mut self.recursive_scan_paths));
+                self.recursive_images_snapshot = Arc::clone(&self.recursive_images);
                 self.grid_loading = false;
                 self.recursive_rx = None;
                 ctx.request_repaint();
@@ -138,28 +178,37 @@ impl eframe::App for ImageViewer {
                     collected = Some(imgs);
                 }
             }
-            if let Some(imgs) = collected {
-                let current_path = self
-                    .images
-                    .get(self.current_index)
-                    .cloned()
-                    .or_else(|| (!self.open_target_is_dir).then(|| self.open_target.clone()));
-                self.images = imgs;
-                self.current_index = current_path
-                    .as_ref()
-                    .and_then(|path| self.images.iter().position(|candidate| candidate == path))
-                    .or_else(|| {
-                        self.images
-                            .iter()
-                            .position(|path| path == &self.open_target)
-                    })
-                    .unwrap_or(0);
-                self.flat_loading = false;
-                self.flat_refresh_in_flight = false;
-                self.flat_directory_mtime = self.current_flat_directory_mtime();
-                self.update_current_file_info();
-                self.update_side_panel_metadata_if_needed();
-                ctx.request_repaint();
+            if let Some(result) = collected {
+                let current_directory = self
+                    .current_flat_directory()
+                    .map(|directory| normalized_path_for_match(&directory));
+                let result_directory = normalized_path_for_match(&result.directory);
+                if result.generation == self.flat_refresh_generation
+                    && current_directory.as_deref() == Some(result_directory.as_str())
+                {
+                    let current_path =
+                        self.images.get(self.current_index).cloned().or_else(|| {
+                            (!self.open_target_is_dir).then(|| self.open_target.clone())
+                        });
+                    self.images = result.images;
+                    self.gallery_navigation_indices = None;
+                    self.gallery_navigation_position = 0;
+                    self.current_index = current_path
+                        .as_ref()
+                        .and_then(|path| self.images.iter().position(|candidate| candidate == path))
+                        .or_else(|| {
+                            self.images
+                                .iter()
+                                .position(|path| path == &self.open_target)
+                        })
+                        .unwrap_or(0);
+                    self.flat_loading = false;
+                    self.flat_refresh_in_flight = false;
+                    self.flat_directory_mtime = self.current_flat_directory_mtime();
+                    self.update_current_file_info();
+                    self.update_side_panel_metadata_if_needed();
+                    ctx.request_repaint();
+                }
             }
         }
         if !self.show_home_page && !self.show_grid && !self.open_target_is_dir {
@@ -369,7 +418,16 @@ impl eframe::App for ImageViewer {
                                 .unwrap_or("")
                                 .to_string()
                         });
-                    ui.label(format!("{} ({}/{}) - {} - {}", filename, self.current_index + 1, self.images.len(), self.current_dimensions, self.current_file_size));
+                    let gallery_position = self
+                        .gallery_navigation_indices
+                        .as_ref()
+                        .map(|_| self.gallery_navigation_position + 1)
+                        .unwrap_or(self.current_index + 1);
+                    let gallery_count = self
+                        .gallery_navigation_indices
+                        .as_ref()
+                        .map_or(self.images.len(), |indices| indices.len());
+                    ui.label(format!("{} ({}/{}) - {} - {}", filename, gallery_position, gallery_count, self.current_dimensions, self.current_file_size));
                 } else {
                     ui.label("No image loaded");
                 }
@@ -1437,6 +1495,146 @@ impl eframe::App for ImageViewer {
 
         if self.flat_loading || self.grid_loading || self.sift_align_all_running {
             ctx.request_repaint();
+        }
+    }
+}
+
+impl ImageViewer {
+    fn trim_thumbnail_texture_cache(&mut self) {
+        const MAX_THUMBNAIL_TEXTURES: usize = 512;
+        let mut retained_paths = HashSet::new();
+        if let Some(path) = self.images.get(self.current_index) {
+            retained_paths.insert(path.clone());
+            if let Some(still) = self.video_still_cache.borrow().get(path) {
+                retained_paths.insert(still.clone());
+            }
+        }
+        retained_paths.extend(self.gallery_visible_thumbnail_paths.iter().cloned());
+        while self.thumbnail_textures.len() > MAX_THUMBNAIL_TEXTURES {
+            let candidate = self
+                .thumbnail_textures
+                .keys()
+                .find(|path| !retained_paths.contains(*path))
+                .cloned()
+                .or_else(|| self.thumbnail_textures.keys().next().cloned());
+            let Some(path) = candidate else {
+                break;
+            };
+            self.thumbnail_textures.remove(&path);
+        }
+    }
+
+    fn poll_filename_search(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.filename_search_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                if result.generation != self.filename_search_generation
+                    || result.gallery_generation != self.gallery_scan_generation
+                {
+                    return;
+                }
+                let count = result.matches.len();
+                self.filename_search_results = Some(result.matches);
+                self.semantic_status = format!(
+                    "Filename search found {count} item(s) for {}.",
+                    self.applied_filename_query
+                );
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.filename_search_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.semantic_status = "Filename search worker disconnected.".to_string();
+            }
+        }
+    }
+
+    fn poll_semantic_search(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.semantic_search_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(payload)) => {
+                if payload.generation != self.semantic_search_generation {
+                    return;
+                }
+                let Some(indices) = &self.db_indices else {
+                    return;
+                };
+                let mut rows = payload.rows;
+                let mut source = self.pending_similarity_source.take();
+                let source_label = self.pending_similarity_label.take();
+                if let Some(source) = &source {
+                    rows.retain(|candidate| candidate.file_name != source.file_name);
+                }
+                if !payload.video_only {
+                    rows = collapse_sift_grouped_results(
+                        rows,
+                        &indices.sift_root_by_file,
+                        payload.limit,
+                    );
+                } else {
+                    rows.truncate(payload.limit);
+                }
+                let db_roots = get_db_roots();
+                let db_dir_buf = get_db_dir();
+                let db_dir = db_dir_buf.as_path();
+                for row in &mut rows {
+                    row.media_path =
+                        resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec)
+                            .ok();
+                    if let Some(path) = &row.media_path {
+                        self.db_filename_by_path
+                            .insert(path.clone(), row.file_name.clone());
+                    }
+                }
+                if let Some(mut source) = source.take() {
+                    if source.media_path.is_none() {
+                        source.media_path = resolve_media_path(
+                            &db_roots,
+                            db_dir,
+                            &source.file_name,
+                            source.timestamp_sec,
+                        )
+                        .ok();
+                    }
+                    if let Some(source_path) = &source.media_path {
+                        self.db_filename_by_path
+                            .insert(source_path.clone(), source.file_name.clone());
+                        rows.retain(|candidate| candidate.media_path.as_ref() != Some(source_path));
+                    }
+                    source.score = 1.0;
+                    rows.insert(0, source);
+                    rows.truncate(payload.limit);
+                }
+                for (idx, row) in rows.iter_mut().enumerate() {
+                    row.rank = idx + 1;
+                }
+                self.semantic_status = format!(
+                    "Found {} {} results in {} ms across {} index entries within {}",
+                    rows.len(),
+                    source_label.as_deref().unwrap_or(&payload.display_label),
+                    payload.took_ms,
+                    payload.indexed_items,
+                    payload.folder_scope
+                );
+                self.semantic_results = rows;
+                self.semantic_results_mode = Some(payload.mode);
+                ctx.request_repaint();
+            }
+            Ok(Err(error)) => {
+                self.semantic_status = format!("Search failed: {error}");
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.semantic_search_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.semantic_status = "Search worker disconnected.".to_string();
+            }
         }
     }
 }

@@ -20,6 +20,19 @@ pub(crate) fn downsample_for_viewer(image: DynamicImage) -> DynamicImage {
 
 pub(crate) fn viewer_color_image(image: DynamicImage) -> egui::ColorImage {
     let image = downsample_for_viewer(image);
+    viewer_color_image_ref(&image)
+}
+
+pub(crate) fn viewer_color_image_ref(image: &DynamicImage) -> egui::ColorImage {
+    let image = if image.width().max(image.height()) > MAX_VIEWER_TEXTURE_DIMENSION {
+        image.resize(
+            MAX_VIEWER_TEXTURE_DIMENSION,
+            MAX_VIEWER_TEXTURE_DIMENSION,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image.clone()
+    };
     let rgba = image.to_rgba8();
     egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],

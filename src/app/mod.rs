@@ -41,7 +41,6 @@ mod viewer_assets;
 
 // This is the small internal facade used by the feature modules. Keep the
 // exports explicit so a module's cross-cutting dependencies remain visible.
-pub(crate) use binary::{FileChunk, parse_bmp, parse_generic, parse_jpeg, parse_png, parse_webp};
 pub(crate) use bootstrap::{initial_window_size, run};
 pub(crate) use clipboard::{
     clipboard_paste_signal, copy_image_file_to_clipboard, image_path_from_pasted_text,
@@ -55,19 +54,19 @@ pub(crate) use hashing::{
     run_sift_alignment_batch, run_sift_repair_for_files,
 };
 pub(crate) use media_scan::{
-    collect_flat_images, collect_images_recursive, is_supported_media_path,
+    collect_flat_images, collect_images_recursive_cancelable, is_supported_media_path,
 };
 pub(crate) use metadata::{
-    VideoMetadata, extract_system_block, format_video_duration, load_ffprobe_metadata,
-    load_video_metadata, resolve_exiftool_path,
+    VideoMetadata, format_video_duration, load_video_metadata, run_metadata_worker,
 };
 pub(crate) use model::{
     ClipEntry, ClipIndex, ClipTextEncoder, CropDragMode, DatabaseIndices, DatabaseLoadMessage,
-    FaceComparisonResult, FaceDetail, FaceEntry, FaceIndex, GalleryImageSnapshot, GallerySelection,
-    ImageEditor, ImageViewState, ImageViewer, OcrEntry, OcrIndex, OnDemandEmbedResult, OpenRequest,
-    PendingSearchRequest, SearchMode, SearchResult, SearchSnapshot, SidePanelMode,
-    SiftAlignAllResult, SiftInfo, SiftRepairResult, SimilarFile, SupplementalDbData,
-    VideoFramePhash,
+    FaceComparisonResult, FaceDetail, FaceEntry, FaceIndex, FilenameSearchWorkerResult,
+    FlatRefreshResult, GalleryFilterKey, GalleryImageSnapshot, GallerySelection, ImageEditor,
+    ImageViewState, ImageViewer, MetadataJobQueue, MetadataLoadRequest, MetadataLoadResult,
+    OcrEntry, OcrIndex, OnDemandEmbedResult, OpenRequest, PendingSearchRequest, SearchMode,
+    SearchResult, SearchSnapshot, SemanticSearchWorkerResult, SidePanelMode, SiftAlignAllResult,
+    SiftInfo, SiftRepairResult, SimilarFile, SupplementalDbData, VideoFramePhash,
 };
 pub(crate) use paths::{
     MEDIA_INDEX_TABLE, db_filename_from_video_still_path, file_matches_folder, get_db_dir,
@@ -80,6 +79,8 @@ pub(crate) use platform::{
     get_system_disks, is_path_ai_backed, is_path_ai_backed_with_roots, normalized_path_for_match,
     path_matches_db_root,
 };
+pub(crate) use search::search_clip_ann;
+pub(crate) use search::search_face_ann;
 pub(crate) use search::{
     FACE_MATCH_MIN_SCORE, collapse_sift_grouped_results, dot, draw_embedding_markers,
     duplicate_database_detail_lines, load_clip_database_index, load_supplemental_database_indices,
@@ -87,4 +88,5 @@ pub(crate) use search::{
 };
 pub(crate) use viewer_assets::{
     IMAGE_VIEWER_TOP_BAR_HEIGHT, INITIAL_IMAGE_DISPLAY_HEIGHT, viewer_color_image,
+    viewer_color_image_ref,
 };

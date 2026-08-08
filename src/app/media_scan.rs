@@ -1,6 +1,6 @@
-use super::paths::is_video_path;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 pub(crate) fn is_supported_media_path(path: &Path) -> bool {
@@ -36,11 +36,16 @@ pub(crate) fn is_supported_media_path(path: &Path) -> bool {
     )
 }
 
-pub(crate) fn collect_images_recursive(
+pub(crate) fn collect_images_recursive_cancelable(
     dir: &Path,
     tx: &Sender<PathBuf>,
     visited: &mut HashSet<PathBuf>,
+    token: &AtomicU64,
+    generation: u64,
 ) {
+    if token.load(Ordering::Relaxed) != generation {
+        return;
+    }
     let canon_dir = match dir.canonicalize() {
         Ok(c) => c,
         Err(_) => dir.to_path_buf(),
@@ -50,10 +55,19 @@ pub(crate) fn collect_images_recursive(
     }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
+            if token.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
-                collect_images_recursive(&path, tx, visited);
-            } else if path.is_file() {
+            if file_type.is_dir() {
+                collect_images_recursive_cancelable(&path, tx, visited, token, generation);
+            } else if file_type.is_file() {
                 if is_supported_media_path(&path) {
                     if let Ok(canon) = path.canonicalize() {
                         let _ = tx.send(canon);
@@ -70,8 +84,11 @@ pub(crate) fn collect_flat_images(dir: &Path) -> Vec<PathBuf> {
     let mut collected = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(|entry| entry.ok()) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_file() && is_supported_media_path(&path) && !is_video_path(&path) {
+            if file_type.is_file() && is_supported_media_path(&path) {
                 collected.push(path);
             }
         }

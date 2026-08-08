@@ -1,115 +1,69 @@
 use super::*;
 
 impl ImageViewer {
-    pub(crate) fn update_exif(&mut self) {
-        self.update_current_file_info();
-        if let Some(path) = self.images.get(self.current_index).cloned() {
-            let resolved_path = self.resolve_actual_path(&path);
-            let inspect_path: &Path = if resolved_path.exists() {
-                resolved_path.as_path()
-            } else {
-                path.as_path()
-            };
-
-            let exiftool_data = if !inspect_path.exists() {
-                format!("Resolved file does not exist: {}", inspect_path.display())
-            } else if let Some(exiftool_path) = resolve_exiftool_path() {
-                match Command::new(&exiftool_path)
-                    .args(["-a", "-u", "-g1", "-H"])
-                    .arg(inspect_path)
-                    .output()
-                {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                        if !stdout.trim().is_empty() {
-                            stdout
-                        } else {
-                            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                            if stderr.is_empty() {
-                                format!(
-                                    "exiftool produced no output for {}",
-                                    inspect_path.display()
-                                )
-                            } else {
-                                format!("exiftool error: {}", stderr)
-                            }
-                        }
-                    }
-                    Err(e) => format!(
-                        "Error running exiftool at {}: {}",
-                        exiftool_path.display(),
-                        e
-                    ),
-                }
-            } else {
-                "Error running exiftool: executable not found. Set IRIS_EXIFTOOL or install exiftool.".to_string()
-            };
-            self.exif_data = if inspect_path.exists() && is_video_path(inspect_path) {
-                format!(
-                    "{}\n\n---- FFprobe JSON ----\n{}",
-                    exiftool_data.trim_end(),
-                    load_ffprobe_metadata(inspect_path)
-                )
-            } else {
-                exiftool_data
-            };
-
-            if is_video_path(inspect_path) {
-                self.chunks = vec![FileChunk {
-                    name: "Video File".to_string(),
-                    offset: 0,
-                    length: std::fs::metadata(inspect_path)
-                        .map(|m| m.len().min(usize::MAX as u64) as usize)
-                        .unwrap_or(0),
-                    description: "Video files do not use the image binary layout parser."
-                        .to_string(),
-                    color: egui::Color32::from_rgb(140, 150, 170),
-                    parsed_data:
-                        "Use Raw EXIF to view exiftool and ffprobe metadata for this video."
-                            .to_string(),
-                }];
-            } else if let Ok(bytes) = std::fs::read(inspect_path) {
-                let mut chunks = if let Some(chunks) = parse_png(&bytes) {
-                    chunks
-                } else if let Some(chunks) = parse_jpeg(&bytes) {
-                    chunks
-                } else if let Some(chunks) = parse_webp(&bytes) {
-                    chunks
-                } else if let Some(chunks) = parse_bmp(&bytes) {
-                    chunks
-                } else {
-                    parse_generic(&bytes)
-                };
-
-                let system_block = extract_system_block(&self.exif_data);
-                chunks.insert(
-                    0,
-                    FileChunk {
-                        name: "System Metadata".to_string(),
-                        offset: 0,
-                        length: 0,
-                        description:
-                            "Operating system-level file attributes, timestamps, and permissions."
-                                .to_string(),
-                        color: egui::Color32::from_rgb(140, 150, 170), // Slate gray
-                        parsed_data: system_block,
-                    },
-                );
-
-                self.chunks = chunks;
-            } else {
-                self.chunks = Vec::new();
-            }
-            self.side_panel_layout_path = Some(path.clone());
-            self.side_panel_metadata_path = Some(path);
-        } else {
-            self.exif_data = String::new();
-            self.chunks = Vec::new();
-            self.current_dimensions = String::new();
-            self.current_file_size = String::new();
+    fn request_metadata_load(&mut self, load_exif: bool, load_layout: bool) {
+        let Some(path) = self.images.get(self.current_index).cloned() else {
+            self.metadata_generation = self.metadata_generation.wrapping_add(1);
+            self.exif_data.clear();
+            self.chunks.clear();
             self.side_panel_metadata_path = None;
             self.side_panel_layout_path = None;
+            self.metadata_loading = false;
+            self.metadata_loading_path = None;
+            self.metadata_loading_exif = false;
+            self.metadata_loading_layout = false;
+            return;
+        };
+        let same_path = self.metadata_loading_path.as_ref() == Some(&path);
+        let request_exif = load_exif || (same_path && self.metadata_loading_exif);
+        let request_layout = load_layout || (same_path && self.metadata_loading_layout);
+        if same_path
+            && (!load_exif || self.metadata_loading_exif)
+            && (!load_layout || self.metadata_loading_layout)
+        {
+            return;
         }
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
+        let generation = self.metadata_generation;
+        self.metadata_loading = true;
+        self.metadata_loading_path = Some(path.clone());
+        self.metadata_loading_exif = request_exif;
+        self.metadata_loading_layout = request_layout;
+        if request_exif {
+            self.exif_data = "Loading metadata...".to_string();
+            self.side_panel_metadata_path = None;
+        }
+        if request_layout {
+            self.chunks.clear();
+            self.side_panel_layout_path = None;
+        }
+        let resolved_path = self.resolve_actual_path(&path);
+        let inspect_path = if resolved_path.exists() {
+            resolved_path
+        } else {
+            path.clone()
+        };
+        let mut state = match self.metadata_worker_queue.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.shutdown {
+            self.metadata_loading = false;
+            return;
+        }
+        state.pending = Some(MetadataLoadRequest {
+            logical_path: path,
+            inspect_path,
+            generation,
+            load_exif: request_exif,
+            load_layout: request_layout,
+        });
+        self.metadata_worker_queue.wake.notify_one();
+    }
+
+    pub(crate) fn update_exif(&mut self) {
+        self.update_current_file_info();
+        self.request_metadata_load(true, false);
     }
 
     pub(crate) fn update_current_file_info(&mut self) {
@@ -154,7 +108,7 @@ impl ImageViewer {
     ) -> egui::TextureHandle {
         ctx.load_texture(
             "image_editor_preview",
-            viewer_color_image(image.clone()),
+            viewer_color_image_ref(image),
             egui::TextureOptions::LINEAR,
         )
     }
@@ -191,6 +145,8 @@ impl ImageViewer {
             .retain(|path| keep_paths.contains(path));
         self.viewer_texture_revisions
             .retain(|path, _| keep_paths.contains(path));
+        self.viewer_texture_retry_at
+            .retain(|path, _| keep_paths.contains(path));
     }
 
     pub(crate) fn request_viewer_texture(
@@ -202,7 +158,15 @@ impl ImageViewer {
             return Some(texture.clone());
         }
         if self.viewer_texture_failed.contains(path) {
-            return None;
+            let retry_ready = self
+                .viewer_texture_retry_at
+                .get(path)
+                .is_none_or(|retry_at| Instant::now() >= *retry_at);
+            if !retry_ready {
+                return None;
+            }
+            self.viewer_texture_failed.remove(path);
+            self.viewer_texture_retry_at.remove(path);
         }
         if self.viewer_texture_loading.contains(path) {
             return None;
@@ -353,11 +317,17 @@ impl ImageViewer {
                 .and_then(|part| part.to_str())
                 .unwrap_or("png");
             let temp_path = destination.with_file_name(format!(
-                ".{}.iris-edit-tmp.{extension}",
+                ".{}.iris-edit-tmp-{}-{}.{}",
                 destination
                     .file_stem()
                     .and_then(|part| part.to_str())
-                    .unwrap_or("image")
+                    .unwrap_or("image"),
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default(),
+                extension,
             ));
             cropped.save_with_format(&temp_path, format)?;
             std::fs::rename(&temp_path, destination)?;
@@ -384,9 +354,11 @@ impl ImageViewer {
         for cache_path in &cache_paths {
             self.thumbnail_textures.remove(cache_path.as_path());
             self.thumbnail_failed.remove(cache_path.as_path());
+            self.thumbnail_retry_at.remove(cache_path.as_path());
             self.thumbnail_loading.remove(cache_path.as_path());
             self.viewer_textures.remove(cache_path.as_path());
             self.viewer_texture_failed.remove(cache_path.as_path());
+            self.viewer_texture_retry_at.remove(cache_path.as_path());
             self.viewer_texture_loading.remove(cache_path.as_path());
             let revision = self
                 .viewer_texture_revisions
@@ -409,6 +381,9 @@ impl ImageViewer {
         }
         self.viewer_rotation_quarter_turns = 0;
         self.viewer_rotation_path = self.images.get(self.current_index).cloned();
+        self.gallery_filter_cache_key = None;
+        self.side_panel_metadata_path = None;
+        self.side_panel_layout_path = None;
         self.update_current_file_info();
         self.update_side_panel_metadata_if_needed();
         ctx.request_repaint();
@@ -472,7 +447,10 @@ impl ImageViewer {
                                 if is_video_path(&destination) {
                                     self.recursive_video_indices.push(index);
                                 }
-                                self.recursive_images.push(destination);
+                                let mut recursive_images = self.recursive_images.to_vec();
+                                recursive_images.push(destination);
+                                self.recursive_images = Arc::from(recursive_images);
+                                self.recursive_images_snapshot = Arc::clone(&self.recursive_images);
                             }
                             Err(err) => editor_for_ui.status = format!("Save failed: {err}"),
                         }
@@ -718,46 +696,7 @@ impl ImageViewer {
         }
 
         self.update_current_file_info();
-        let resolved_path = self.resolve_actual_path(&path);
-        let inspect_path: &Path = if resolved_path.exists() {
-            resolved_path.as_path()
-        } else {
-            path.as_path()
-        };
-
-        if is_video_path(inspect_path) {
-            self.chunks = vec![FileChunk {
-                name: "Video File".to_string(),
-                offset: 0,
-                length: std::fs::metadata(inspect_path)
-                    .map(|m| m.len().min(usize::MAX as u64) as usize)
-                    .unwrap_or(0),
-                description: "Video files do not use the image binary layout parser.".to_string(),
-                color: egui::Color32::from_rgb(140, 150, 170),
-                parsed_data: "Use Raw EXIF to load exiftool and ffprobe metadata for this video."
-                    .to_string(),
-            }];
-            self.side_panel_layout_path = Some(path);
-            return;
-        }
-
-        if let Ok(bytes) = std::fs::read(inspect_path) {
-            let chunks = if let Some(chunks) = parse_png(&bytes) {
-                chunks
-            } else if let Some(chunks) = parse_jpeg(&bytes) {
-                chunks
-            } else if let Some(chunks) = parse_webp(&bytes) {
-                chunks
-            } else if let Some(chunks) = parse_bmp(&bytes) {
-                chunks
-            } else {
-                parse_generic(&bytes)
-            };
-            self.chunks = chunks;
-        } else {
-            self.chunks = Vec::new();
-        }
-        self.side_panel_layout_path = Some(path);
+        self.request_metadata_load(false, true);
     }
 
     pub(crate) fn current_flat_directory(&self) -> Option<PathBuf> {
@@ -797,6 +736,8 @@ impl ImageViewer {
 
         self.flat_refresh_in_flight = true;
         self.flat_loading = true;
+        self.flat_refresh_generation = self.flat_refresh_generation.wrapping_add(1);
+        let generation = self.flat_refresh_generation;
         if let Ok(mut lock) = self.flat_images_shared.lock() {
             *lock = None;
         }
@@ -806,7 +747,16 @@ impl ImageViewer {
             let directory = directory.canonicalize().unwrap_or(directory);
             let collected = collect_flat_images(&directory);
             if let Ok(mut lock) = shared.lock() {
-                *lock = Some(collected);
+                let replace = lock
+                    .as_ref()
+                    .is_none_or(|existing| existing.generation <= generation);
+                if replace {
+                    *lock = Some(FlatRefreshResult {
+                        generation,
+                        directory,
+                        images: collected,
+                    });
+                }
             }
         });
     }
@@ -823,6 +773,18 @@ impl ImageViewer {
     }
 
     pub(crate) fn next_image(&mut self) {
+        if let Some(indices) = self.gallery_navigation_indices.clone() {
+            if !indices.is_empty() {
+                self.gallery_navigation_position =
+                    (self.gallery_navigation_position + 1) % indices.len();
+                let path = self.recursive_images[indices[self.gallery_navigation_position]].clone();
+                self.images = vec![path];
+                self.current_index = 0;
+                self.update_current_file_info();
+                self.update_side_panel_metadata_if_needed();
+            }
+            return;
+        }
         if !self.images.is_empty() {
             if self.is_comparison_mode() {
                 self.switch_comparison_image((self.current_index + 1) % self.images.len());
@@ -835,6 +797,21 @@ impl ImageViewer {
     }
 
     pub(crate) fn prev_image(&mut self) {
+        if let Some(indices) = self.gallery_navigation_indices.clone() {
+            if !indices.is_empty() {
+                self.gallery_navigation_position = if self.gallery_navigation_position == 0 {
+                    indices.len() - 1
+                } else {
+                    self.gallery_navigation_position - 1
+                };
+                let path = self.recursive_images[indices[self.gallery_navigation_position]].clone();
+                self.images = vec![path];
+                self.current_index = 0;
+                self.update_current_file_info();
+                self.update_side_panel_metadata_if_needed();
+            }
+            return;
+        }
         if !self.images.is_empty() {
             if self.is_comparison_mode() {
                 let index = if self.current_index == 0 {

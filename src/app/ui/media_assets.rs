@@ -15,22 +15,8 @@ impl ImageViewer {
             }
         }
 
-        // Fast path 1: folder component substring match (extremely robust against mount path/canonicalize differences like /media vs /run/media)
-        for (col_id, root_path) in &roots {
-            let folder_name = root_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(col_id.as_str());
-
-            let path_lower = path_norm.to_lowercase();
-            let match_str_lower = format!("/{}/", folder_name.to_lowercase());
-            if let Some(pos) = path_lower.find(&match_str_lower) {
-                let rel = &path_norm[pos + match_str_lower.len()..];
-                return Some(format!("{}/{}", col_id, rel));
-            }
-        }
-
-        // Fast path 2: prefix-strip against known roots without touching the disk.
+        // Match only an actual collection-root prefix. A shared leaf folder name is
+        // not enough to identify a collection and can silently map the wrong file.
         for (col_id, root_path) in &roots {
             if let Ok(rel) = path.strip_prefix(root_path) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -38,11 +24,11 @@ impl ImageViewer {
             }
         }
 
-        // Secondary: substring matching (handles trailing-slash edge cases)
+        // Handle equivalent textual prefixes with different separator styles.
         let path_str = path.to_string_lossy().replace('\\', "/");
         for (col_id, root_path) in &roots {
             let root_str = root_path.to_string_lossy().replace('\\', "/");
-            if path_str.starts_with(&root_str) {
+            if path_str == root_str || path_str.starts_with(&format!("{root_str}/")) {
                 let rel = &path_str[root_str.len()..];
                 return Some(format!("{}/{}", col_id, rel.trim_start_matches('/')));
             }
@@ -56,7 +42,9 @@ impl ImageViewer {
                 if let Some(fname) = path.file_name() {
                     let base = fname.to_string_lossy().to_lowercase();
                     if let Some(resolved) = indices.basename_to_db_filename.get(&base) {
-                        return Some(resolved.clone());
+                        if resolved.len() == 1 {
+                            return resolved.first().cloned();
+                        }
                     }
                 }
             }
@@ -77,14 +65,16 @@ impl ImageViewer {
         }
         // Fast path 2: Check the cache to avoid synchronous disk canonicalization and linear scans
         if let Some(cached) = self.db_filename_cache.borrow().get(path) {
-            return cached.clone();
+            return Some(cached.clone());
         }
         // Fallback: derive from filesystem path vs collection roots
         let resolved = self.get_db_filename_from_path(path);
-        // Cache the result (even if None) to avoid repeating this heavy calculation
-        self.db_filename_cache
-            .borrow_mut()
-            .insert(path.to_path_buf(), resolved.clone());
+        // Do not cache misses: collection roots can be discovered asynchronously.
+        if let Some(name) = &resolved {
+            self.db_filename_cache
+                .borrow_mut()
+                .insert(path.to_path_buf(), name.clone());
+        }
         resolved
     }
 
@@ -252,6 +242,7 @@ impl ImageViewer {
                 self.thumbnail_loading.insert(resolved_path.to_path_buf());
                 self.thumbnail_active_threads += 1;
                 let path_clone = resolved_path.to_path_buf();
+                let thumbnail_generation = self.gallery_thumbnail_generation;
                 let tx_clone = self.thumbnail_tx.clone();
                 let ctx_clone = ui.ctx().clone();
                 rayon::spawn(move || {
@@ -260,11 +251,11 @@ impl ImageViewer {
                         let size = [thumb.width() as usize, thumb.height() as usize];
                         let pixels = thumb.to_rgba8().into_raw();
                         let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                        let _ = tx_clone.send((path_clone, color_img));
+                        let _ = tx_clone.send((thumbnail_generation, path_clone, color_img));
                         ctx_clone.request_repaint();
                     } else {
                         let empty_img = egui::ColorImage::new([0, 0], Vec::new());
-                        let _ = tx_clone.send((path_clone, empty_img));
+                        let _ = tx_clone.send((thumbnail_generation, path_clone, empty_img));
                         ctx_clone.request_repaint();
                     }
                 });

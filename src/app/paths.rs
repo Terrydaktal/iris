@@ -494,26 +494,19 @@ pub(crate) fn file_matches_folder(
         return false;
     }
 
-    if normalized_file.contains(&normalized_folder) {
+    let folder_prefix = normalized_folder.trim_end_matches('/');
+    if normalized_file == folder_prefix
+        || normalized_file.starts_with(&format!("{folder_prefix}/"))
+        || normalized_file.contains(&format!("/{folder_prefix}/"))
+    {
         return true;
     }
-    if let Ok(canon_folder) = folder_path.canonicalize() {
-        if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
-            if let Ok(canon_source) = source_path.canonicalize() {
-                if canon_source.starts_with(&canon_folder) {
-                    return true;
-                }
-            }
-            if source_path.starts_with(folder_path) {
-                return true;
-            }
-        }
-    } else if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
+    if let Ok(source_path) = resolve_source_path(db_roots, file_name) {
         let source_str = source_path
             .to_string_lossy()
             .replace('\\', "/")
             .to_lowercase();
-        if source_str.contains(&normalized_folder) {
+        if source_str == folder_prefix || source_str.starts_with(&format!("{folder_prefix}/")) {
             return true;
         }
     }
