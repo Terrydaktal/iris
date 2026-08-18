@@ -184,12 +184,15 @@ impl ImageViewer {
             self.viewer_texture_loading.insert(path.clone());
             let tx = self.viewer_texture_tx.clone();
             let ctx = ctx.clone();
+            let diagnostics = self.diagnostics.clone();
             rayon::spawn(move || {
+                let task = diagnostics.task_guard("viewer_texture_decode");
                 let result = image::open(&path)
                     .map(viewer_color_image)
                     .map_err(|err| format!("{}: {err}", path.display()));
                 let _ = tx.send((path, revision, result));
                 ctx.request_repaint();
+                task.complete();
             });
         }
         None
@@ -743,7 +746,9 @@ impl ImageViewer {
         }
 
         let shared = self.flat_images_shared.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("viewer_flat_refresh");
             let directory = directory.canonicalize().unwrap_or(directory);
             let collected = collect_flat_images(&directory);
             if let Ok(mut lock) = shared.lock() {
@@ -758,6 +763,7 @@ impl ImageViewer {
                     });
                 }
             }
+            task.complete();
         });
     }
 

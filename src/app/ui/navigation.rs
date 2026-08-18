@@ -41,8 +41,10 @@ impl ImageViewer {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.recursive_rx = Some(rx);
+        let diagnostics = self.diagnostics.clone();
 
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("gallery_recursive_scan");
             let start_dir_canon = start_dir.canonicalize().unwrap_or(start_dir);
             let mut visited = std::collections::HashSet::new();
             collect_images_recursive_cancelable(
@@ -52,6 +54,7 @@ impl ImageViewer {
                 &scan_token,
                 scan_generation,
             );
+            task.complete();
         });
     }
 
@@ -371,7 +374,9 @@ impl ImageViewer {
             let shared = self.flat_images_shared.clone();
             let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             let generation = self.flat_refresh_generation;
+            let diagnostics = self.diagnostics.clone();
             std::thread::spawn(move || {
+                let task = diagnostics.task_guard("gallery_flat_refresh");
                 let parent_absolute = parent.canonicalize().unwrap_or(parent);
                 let collected = collect_flat_images(&parent_absolute);
                 if let Ok(mut lock) = shared.lock() {
@@ -386,6 +391,7 @@ impl ImageViewer {
                         });
                     }
                 }
+                task.complete();
             });
         }
     }

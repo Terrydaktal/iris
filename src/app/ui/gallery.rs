@@ -579,7 +579,9 @@ impl ImageViewer {
                                                         self.gallery_thumbnail_generation;
                                                     let tx_clone = self.thumbnail_tx.clone();
                                                     let ctx_clone = ui.ctx().clone();
+                                                    let diagnostics = self.diagnostics.clone();
                                                     rayon::spawn(move || {
+                                                        let task = diagnostics.task_guard("gallery_thumbnail_decode");
                                                         if let Ok(img) = image::open(&path_clone) {
                                                             let thumb = img.resize_to_fill(260, 320, image::imageops::FilterType::Triangle);
                                                             let size = [thumb.width() as usize, thumb.height() as usize];
@@ -600,6 +602,7 @@ impl ImageViewer {
                                                             ));
                                                             ctx_clone.request_repaint();
                                                         }
+                                                        task.complete();
                                                     });
                                                 }
                                             }

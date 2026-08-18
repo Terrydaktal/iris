@@ -1,4 +1,4 @@
-use super::{binary::FileChunk, metadata::VideoMetadata};
+use super::{DiagnosticState, binary::FileChunk, metadata::VideoMetadata};
 use anyhow::Result;
 use eframe::egui;
 use ort::session::Session;
@@ -349,6 +349,7 @@ pub(crate) struct ImageEditor {
 }
 
 pub(crate) struct ImageViewer {
+    pub(crate) diagnostics: DiagnosticState,
     pub(crate) images: Vec<PathBuf>,
     pub(crate) current_index: usize,
     pub(crate) comparison_paths: Option<Vec<PathBuf>>,

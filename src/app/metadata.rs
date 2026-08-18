@@ -10,20 +10,38 @@ pub(crate) fn run_metadata_worker(
     queue: Arc<crate::app::MetadataJobQueue>,
     tx: std::sync::mpsc::Sender<crate::app::MetadataLoadResult>,
     ctx_shared: Arc<Mutex<Option<eframe::egui::Context>>>,
+    diagnostics: crate::app::DiagnosticState,
 ) {
+    let operation_id = diagnostics.next_operation_id();
+    diagnostics.task_started("metadata_worker", operation_id);
     loop {
         let request = {
+            #[cfg(feature = "diagnostics")]
+            let lock_started = Instant::now();
             let mut state = match queue.state.lock() {
                 Ok(state) => state,
-                Err(_) => return,
+                Err(_) => {
+                    diagnostics.task_failed("metadata_worker", operation_id, "queue_lock_poisoned");
+                    return;
+                }
             };
             while state.pending.is_none() && !state.shutdown {
                 state = match queue.wake.wait(state) {
                     Ok(state) => state,
-                    Err(_) => return,
+                    Err(_) => {
+                        diagnostics.task_failed(
+                            "metadata_worker",
+                            operation_id,
+                            "queue_wait_failed",
+                        );
+                        return;
+                    }
                 };
             }
+            #[cfg(feature = "diagnostics")]
+            diagnostics.record_lock_wait("metadata_queue", lock_started.elapsed());
             if state.shutdown {
+                diagnostics.task_completed("metadata_worker", operation_id);
                 return;
             }
             state.pending.take()
@@ -40,12 +58,25 @@ pub(crate) fn run_metadata_worker(
             request.load_layout,
         );
         if tx.send(result).is_err() {
+            diagnostics.task_completed("metadata_worker", operation_id);
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let ctx_lock_started = Instant::now();
         if let Ok(lock) = ctx_shared.lock() {
+            #[cfg(feature = "diagnostics")]
+            diagnostics.record_lock_wait("metadata_context", ctx_lock_started.elapsed());
             if let Some(ctx) = lock.as_ref() {
                 ctx.request_repaint();
             }
+        } else {
+            diagnostics.task_failed_with_code(
+                "metadata_worker",
+                operation_id,
+                "context_lock_poisoned",
+                "metadata repaint context lock was poisoned",
+            );
+            return;
         }
     }
 }

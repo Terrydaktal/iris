@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import argparse
 import contextlib
 import hashlib
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -135,6 +137,14 @@ PROGRESS_BAR_FORMAT = (
     "[elapsed {elapsed}, left {remaining}, {rate_fmt}]"
 )
 PROGRESS_DELAY_SECONDS = 2.0
+STATUS_SCHEMA_VERSION = 2
+try:
+    STATUS_WRITE_INTERVAL_SECONDS = max(
+        0.05,
+        float(os.environ.get("EMBEDIMAGES_STATUS_INTERVAL_SECONDS", "0.5")),
+    )
+except ValueError:
+    STATUS_WRITE_INTERVAL_SECONDS = 0.5
 CLIP_PREPROCESS_MAX_SIDE = 2048
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -145,6 +155,10 @@ ANSI_YELLOW = "\033[33m"
 ANSI_ORANGE = "\033[38;5;208m"
 T = TypeVar("T")
 SIFT_THREAD_LOCAL = threading.local()
+STATUS_RUN_ID = uuid.uuid4().hex
+STATUS_WRITE_LOCK = threading.Lock()
+STATUS_PENDING: dict[Path, dict[str, Any]] = {}
+STATUS_LAST_WRITE: dict[Path, float] = {}
 
 FACE_GROUP_STRUCT = pa.struct(
     [
@@ -440,28 +454,138 @@ def shorten_for_status(value: str, max_len: int = 90) -> str:
     return "..." + value[-(max_len - 3) :]
 
 
-def write_status(cfg: AppConfig, **data: Any) -> None:
-    cfg.db_dir.mkdir(parents=True, exist_ok=True)
-    status = {
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "updated_at_unix": time.time(),
-        **data,
-    }
-    status_path = cfg.db_dir / "embedimages-status.json"
-    temp_path = status_path.with_suffix(".tmp")
+def _persist_status(status_path: Path, status: dict[str, Any]) -> None:
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = status_path.with_name(
+        f".{status_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     temp_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
     temp_path.replace(status_path)
 
 
+def _status_collection_slug(collection_id: str) -> str:
+    slug = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in collection_id
+    ).strip("._")
+    return slug or "collection"
+
+
+def status_path(cfg: AppConfig) -> Path:
+    return (
+        cfg.db_dir
+        / "embedimages-status"
+        / f"{_status_collection_slug(cfg.collection_id)}-{STATUS_RUN_ID}.json"
+    )
+
+
+def status_configuration(cfg: AppConfig) -> dict[str, Any]:
+    """Return bounded, non-path configuration provenance for live diagnosis."""
+    return {
+        "clip_model": cfg.clip_model,
+        "clip_batch_size": cfg.clip_batch_size,
+        "easyocr_languages": list(cfg.easyocr_langs),
+        "easyocr_max_side": cfg.easyocr_max_side,
+        "easyocr_canvas_size": cfg.easyocr_canvas_size,
+        "easyocr_batch_size": cfg.easyocr_batch_size,
+        "easyocr_gpu": cfg.easyocr_gpu,
+        "ocr_text_model": cfg.ocr_text_model,
+        "ocr_text_device": cfg.ocr_text_device,
+        "paddle_device": cfg.paddle_device,
+        "paddle_det_model": cfg.paddle_det_model,
+        "paddle_ocr_max_side": cfg.paddle_ocr_max_side,
+        "skip_paddle_ocr": cfg.skip_paddle_ocr,
+        "hash_workers": cfg.hash_workers,
+        "face_timeout_seconds": cfg.face_timeout_seconds,
+        "face_det_size": cfg.face_det_size,
+        "face_fallback_det_size": cfg.face_fallback_det_size,
+        "face_det_threshold": cfg.face_det_threshold,
+        "phash_skip_similarity_pct": cfg.phash_skip_similarity_pct,
+        "cross_media_similarity_pct": cfg.cross_media_similarity_pct,
+        "video_hash_skip_similarity_pct": cfg.video_hash_skip_similarity_pct,
+        "sift_candidate_topk": cfg.sift_candidate_topk,
+        "sift_min_inliers": cfg.sift_min_inliers,
+        "sift_min_inlier_ratio": cfg.sift_min_inlier_ratio,
+        "run_sift_master_match": cfg.run_sift_master_match,
+        "rerun_sift_master_match": cfg.rerun_sift_master_match,
+        "repair_image_masters": cfg.repair_image_masters,
+        "repair_only": cfg.repair_only,
+        "rerun_stages": sorted(cfg.rerun_stages),
+    }
+
+
+def flush_status(cfg: AppConfig) -> None:
+    current_path = status_path(cfg)
+    with STATUS_WRITE_LOCK:
+        status = STATUS_PENDING.pop(current_path, None)
+        if status is not None:
+            STATUS_LAST_WRITE[current_path] = time.monotonic()
+    if status is not None:
+        _persist_status(current_path, status)
+
+
+def flush_all_status() -> None:
+    with STATUS_WRITE_LOCK:
+        pending = list(STATUS_PENDING.items())
+        STATUS_PENDING.clear()
+        now = time.monotonic()
+        for status_path, _ in pending:
+            STATUS_LAST_WRITE[status_path] = now
+    for status_path, status in pending:
+        _persist_status(status_path, status)
+
+
+def write_status(cfg: AppConfig, **data: Any) -> None:
+    current_path = status_path(cfg)
+    status = {
+        "status_schema": STATUS_SCHEMA_VERSION,
+        "run_id": STATUS_RUN_ID,
+        "pid": os.getpid(),
+        "collection_id": cfg.collection_id,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "updated_at_unix": time.time(),
+        "status_write_interval_seconds": STATUS_WRITE_INTERVAL_SECONDS,
+        "effective_configuration": status_configuration(cfg),
+        **data,
+    }
+    force = data.get("state") in {
+        "complete",
+        "failed",
+        "failed_file",
+        "fatal_gpu_error",
+        "flushing_db_batch",
+    }
+    now = time.monotonic()
+    with STATUS_WRITE_LOCK:
+        STATUS_PENDING[current_path] = status
+        last_write = STATUS_LAST_WRITE.get(current_path, 0.0)
+        if not force and now - last_write < STATUS_WRITE_INTERVAL_SECONDS:
+            return
+        status = STATUS_PENDING.pop(current_path)
+        STATUS_LAST_WRITE[current_path] = now
+    _persist_status(current_path, status)
+
+
+atexit.register(flush_all_status)
+
+
 def read_status(cfg: AppConfig) -> dict[str, Any] | None:
-    status_path = cfg.db_dir / "embedimages-status.json"
-    if not status_path.exists():
+    status_dir = cfg.db_dir / "embedimages-status"
+    if not status_dir.is_dir():
         return None
-    try:
-        data = json.loads(status_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+    prefix = f"{_status_collection_slug(cfg.collection_id)}-"
+    newest: tuple[float, dict[str, Any]] | None = None
+    for candidate in status_dir.glob(f"{prefix}*.json"):
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or data.get("collection_id") != cfg.collection_id:
+            continue
+        updated_at = float(data.get("updated_at_unix", 0.0))
+        if newest is None or updated_at > newest[0]:
+            newest = (updated_at, data)
+    return newest[1] if newest is not None else None
 
 
 def cross_media_state_path(cfg: AppConfig) -> Path:
@@ -1658,7 +1782,15 @@ def hash_error_stage(is_video_items: bool) -> str:
 
 
 def compact_error_message(exc: Exception, limit: int = 500) -> str:
-    message = str(exc).strip() or exc.__class__.__name__
+    parts: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(parts) < 8:
+        seen.add(id(current))
+        part = str(current).strip() or current.__class__.__name__
+        parts.append(part)
+        current = current.__cause__ or current.__context__
+    message = " <- caused by: ".join(parts)
     if len(message) <= limit:
         return message
     return message[: limit - 3] + "..."
@@ -5583,6 +5715,7 @@ def main() -> None:
             video_paths,
         )
         db = lancedb.connect(str(cfg.db_dir))
+        all_file_names = set(records.keys())
         missing_tables = missing_ann_tables(db, cfg.table_name, records)
         face_table_name = ann_table_name(cfg.table_name, "face")
         clip_table_name = ann_table_name(cfg.table_name, "clip")
@@ -5600,7 +5733,6 @@ def main() -> None:
             print("No new media required processing. Missing ANN side tables were rebuilt from existing records.")
         else:
             print("No new or incomplete media items require processing.")
-        all_file_names = set(records.keys())
         if force_clip_sync and clip_table_name not in missing_tables:
             sync_clip_ann_table(db, cfg.table_name, records, all_file_names)
         if force_face_sync and face_table_name not in missing_tables:

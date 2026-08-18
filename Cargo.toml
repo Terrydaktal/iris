@@ -2,6 +2,11 @@
 name = "iris"
 version = "0.2.2"
 edition = "2024"
+build = "build.rs"
+
+[features]
+default = []
+diagnostics = []
 
 [dependencies]
 eframe = "0.33.3"
@@ -29,3 +34,5 @@ debug = 1
 
 [profile.release]
 opt-level = 3
+# Keep line tables for post-mortem backtraces without changing optimized code.
+debug = "line-tables-only"

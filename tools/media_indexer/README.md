@@ -84,6 +84,22 @@ Results are stored in LanceDB with one record per file:
 UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media --db-dir ./lancedb
 ```
 
+## Progress Status
+
+Each run publishes one atomic status file per collection and run under the
+`embedimages-status/` directory in the database directory. The unique run ID
+prevents concurrent runs from overwriting each other. It is a best-effort
+operational record with schema `2`, process id, run id, stage, file/frame
+coordinates, and the latest known error. Per-file updates are
+coalesced and written at most every 0.5 seconds by default; stage completion,
+failure, fatal GPU errors, and database flush states are written immediately.
+This avoids synchronous status-file I/O on every image while retaining useful
+evidence if a run stalls. Change the interval with
+`EMBEDIMAGES_STATUS_INTERVAL_SECONDS` (minimum 50 ms).
+Each status record also includes bounded `effective_configuration` provenance:
+models, devices, batch sizes, thresholds, worker counts, and explicit rerun
+decisions. Error messages retain bounded Python exception cause/context chains.
+
 ## Text Model Export
 
 Iris uses an exported ONNX text tower from the default

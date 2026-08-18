@@ -2,6 +2,30 @@ use super::*;
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let ui_state = if self.show_home_page {
+            "home"
+        } else if self.show_grid {
+            "grid"
+        } else if self.is_comparison_mode() {
+            "comparison"
+        } else {
+            "viewer"
+        };
+        let background_active = self.thumbnail_active_threads
+            + usize::from(self.db_loading)
+            + usize::from(self.metadata_loading)
+            + usize::from(self.flat_refresh_in_flight)
+            + usize::from(self.sift_running)
+            + usize::from(self.sift_align_all_running)
+            + usize::from(self.sift_repair_running)
+            + usize::from(self.face_compare_running);
+        self.diagnostics.heartbeat(
+            ui_state,
+            background_active,
+            self.thumbnail_active_threads,
+            self.db_loaded,
+            self.grid_loading || self.flat_loading,
+        );
         let frame_scroll_delta = ctx.input(|i| {
             if i.smooth_scroll_delta.y.abs() > f32::EPSILON {
                 i.smooth_scroll_delta.y

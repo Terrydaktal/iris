@@ -7,6 +7,7 @@ impl ImageViewer {
         ctx_shared: Arc<Mutex<Option<egui::Context>>>,
         start_on_home_page: bool,
         comparison_paths: Option<Vec<PathBuf>>,
+        diagnostics: DiagnosticState,
     ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
         let open_target = path.clone();
@@ -50,7 +51,9 @@ impl ImageViewer {
             } else {
                 path.parent().unwrap_or(Path::new(".")).to_path_buf()
             };
+            let diagnostics_for_scan = diagnostics.clone();
             std::thread::spawn(move || {
+                let task = diagnostics_for_scan.task_guard("initial_gallery_scan");
                 let parent_absolute = parent.canonicalize().unwrap_or(parent);
                 let collected = collect_flat_images(&parent_absolute);
                 if let Ok(mut lock) = shared.lock() {
@@ -65,6 +68,7 @@ impl ImageViewer {
                         });
                     }
                 }
+                task.complete();
             });
         }
 
@@ -78,11 +82,18 @@ impl ImageViewer {
         let metadata_worker_queue = Arc::new(MetadataJobQueue::default());
         let worker_queue = Arc::clone(&metadata_worker_queue);
         let worker_ctx_shared = Arc::clone(&ctx_shared);
+        let worker_diagnostics = diagnostics.clone();
         std::thread::spawn(move || {
-            run_metadata_worker(worker_queue, metadata_tx, worker_ctx_shared)
+            run_metadata_worker(
+                worker_queue,
+                metadata_tx,
+                worker_ctx_shared,
+                worker_diagnostics,
+            )
         });
 
         let mut viewer = Self {
+            diagnostics,
             images,
             current_index: 0,
             comparison_paths,
@@ -238,6 +249,9 @@ impl ImageViewer {
             viewer.update_current_file_info();
         }
         viewer
+            .diagnostics
+            .record_event("application", 0, "started", "viewer_initialized");
+        viewer
     }
 
     pub(crate) fn start_lazy_db_load(&mut self, ctx: &egui::Context) {
@@ -251,8 +265,10 @@ impl ImageViewer {
         let (tx, rx) = std::sync::mpsc::channel();
         self.db_rx = Some(rx);
         let ctx_clone = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
 
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("database_lazy_load");
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -301,6 +317,7 @@ impl ImageViewer {
                 .map_err(|e| e.to_string());
             let _ = tx.send(DatabaseLoadMessage::SupplementalReady(supplemental_result));
             ctx_clone.request_repaint();
+            task.complete();
         });
     }
 

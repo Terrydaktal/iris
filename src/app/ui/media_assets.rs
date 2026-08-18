@@ -153,10 +153,13 @@ impl ImageViewer {
             let path_clone = path.to_path_buf();
             let tx = self.video_duration_tx.clone();
             let ctx_clone = ctx.clone();
+            let diagnostics = self.diagnostics.clone();
             rayon::spawn(move || {
+                let task = diagnostics.task_guard("video_metadata_probe");
                 let metadata = load_video_metadata(&path_clone);
                 let _ = tx.send((path_clone, metadata));
                 ctx_clone.request_repaint();
+                task.complete();
             });
         }
         None
@@ -245,7 +248,9 @@ impl ImageViewer {
                 let thumbnail_generation = self.gallery_thumbnail_generation;
                 let tx_clone = self.thumbnail_tx.clone();
                 let ctx_clone = ui.ctx().clone();
+                let diagnostics = self.diagnostics.clone();
                 rayon::spawn(move || {
+                    let task = diagnostics.task_guard("sidebar_thumbnail_decode");
                     if let Ok(img) = image::open(&path_clone) {
                         let thumb = img.thumbnail(128, 128);
                         let size = [thumb.width() as usize, thumb.height() as usize];
@@ -258,6 +263,7 @@ impl ImageViewer {
                         let _ = tx_clone.send((thumbnail_generation, path_clone, empty_img));
                         ctx_clone.request_repaint();
                     }
+                    task.complete();
                 });
             }
         }

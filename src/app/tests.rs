@@ -58,3 +58,18 @@ fn metadata_queue_keeps_only_the_latest_pending_request() {
     assert_eq!(request.logical_path, PathBuf::from("second.jpg"));
     assert!(request.load_layout);
 }
+
+#[test]
+fn build_identity_exposes_reproducible_fields() {
+    let info = build_info_value();
+
+    assert_eq!(info["application"], "iris");
+    assert!(
+        !info["package_version"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(!info["git_revision"].as_str().unwrap_or_default().is_empty());
+    assert!(!info["rustc"].as_str().unwrap_or_default().is_empty());
+}

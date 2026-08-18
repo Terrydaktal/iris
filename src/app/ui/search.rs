@@ -225,7 +225,9 @@ impl ImageViewer {
         let (tx, rx) = std::sync::mpsc::channel();
         self.filename_search_rx = Some(rx);
         self.semantic_status = format!("Searching filenames for {query_for_status}...");
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("filename_search");
             let query_is_path = query.contains('/');
             let query_basename = query.rsplit('/').next().filter(|name| name.contains('.'));
             let mut matches = Vec::new();
@@ -282,6 +284,7 @@ impl ImageViewer {
                 gallery_generation,
                 matches,
             });
+            task.complete();
         });
     }
 
@@ -527,7 +530,9 @@ impl ImageViewer {
         self.pending_similarity_label = None;
         self.semantic_status = "Searching CLIP index...".to_string();
         let ctx_clone = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("clip_search");
             let started = Instant::now();
             let ann_result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -566,6 +571,7 @@ impl ImageViewer {
                 video_only,
             }));
             ctx_clone.request_repaint();
+            task.complete();
         });
     }
 
@@ -632,7 +638,9 @@ impl ImageViewer {
         self.pending_similarity_label = None;
         self.semantic_status = "Searching OCR index...".to_string();
         let ctx_clone = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("ocr_search");
             let started = Instant::now();
             let rows = search_ocr_index(&ocr_index, &q, pre_limit, video_only, &folder_scope);
             let _ = tx.send(Ok(SemanticSearchWorkerResult {
@@ -647,6 +655,7 @@ impl ImageViewer {
                 video_only,
             }));
             ctx_clone.request_repaint();
+            task.complete();
         });
     }
 }
@@ -707,7 +716,9 @@ impl ImageViewer {
             .lock()
             .ok()
             .and_then(|lock| lock.as_ref().cloned());
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("clip_similarity_search");
             let started = Instant::now();
             let ann_result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -741,6 +752,7 @@ impl ImageViewer {
             if let Some(ctx) = ctx {
                 ctx.request_repaint();
             }
+            task.complete();
         });
     }
 
@@ -852,7 +864,9 @@ impl ImageViewer {
             .lock()
             .ok()
             .and_then(|lock| lock.as_ref().cloned());
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("face_similarity_search");
             let started = Instant::now();
             let ann_result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -886,6 +900,7 @@ impl ImageViewer {
             if let Some(ctx) = ctx {
                 ctx.request_repaint();
             }
+            task.complete();
         });
     }
 
@@ -947,7 +962,9 @@ impl ImageViewer {
         self.on_demand_embed_rx = Some(rx);
         let request_clone = request.clone();
         let ctx_clone = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("on_demand_embedding");
             let result = compute_on_demand_embeddings(&image_path, need_clip, need_faces)
                 .map(|(clip_vector, face_vectors)| OnDemandEmbedResult {
                     request: request_clone,
@@ -957,6 +974,7 @@ impl ImageViewer {
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
             ctx_clone.request_repaint();
+            task.complete();
         });
     }
 

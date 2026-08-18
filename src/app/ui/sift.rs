@@ -22,11 +22,14 @@ impl ImageViewer {
         self.sift_pair_overlay = None;
         let (tx, rx) = std::sync::mpsc::channel();
         self.sift_rx = Some(rx);
+        let diagnostics = self.diagnostics.clone();
 
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("sift_pair_compare");
             let result = compute_sift_summary(&path_a, &path_b).map_err(|e| e.to_string());
             let _ = tx.send(result);
             ctx.request_repaint();
+            task.complete();
         });
     }
 
@@ -78,11 +81,14 @@ impl ImageViewer {
         let (tx, rx) = std::sync::mpsc::channel();
         self.sift_align_all_rx = Some(rx);
         let ctx = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("sift_align_all");
             let result = run_sift_alignment_batch(&reference, &candidates, &output_dir)
                 .map_err(|err| err.to_string());
             let _ = tx.send(result);
             ctx.request_repaint();
+            task.complete();
         });
     }
 
@@ -177,10 +183,13 @@ impl ImageViewer {
             "Running SIFT repair on {selected_count} selected images ({repair_count} including current SIFT groups)..."
         );
         let ctx = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("sift_repair");
             let result = run_sift_repair_for_files(&file_names).map_err(|err| err.to_string());
             let _ = tx.send(result);
             ctx.request_repaint();
+            task.complete();
         });
     }
 

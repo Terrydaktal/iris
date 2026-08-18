@@ -10,7 +10,11 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 .
 ├── Cargo.toml
 ├── Cargo.lock
+├── build.rs                    # Build identity generation
+├── debuggability.toml          # Stateful diagnostic contract
 ├── README.md
+├── docs
+│   └── DEBUGGABILITY.md        # Live capture and diagnostic build guide
 ├── iris.desktop
 ├── icon.png
 ├── make_transparent.py
@@ -47,6 +51,10 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 │       └── make_transparent.rs
 └── tools
     ├── on_demand_embeddings.py
+    ├── diagnose_iris.sh        # Bounded live-process evidence capture
+    ├── replay_iris_capture.sh  # Print or explicitly replay a captured command
+    ├── measure_debug_overhead.sh # Minimal/observable release comparison
+    ├── check_debuggability.sh  # Build, test, and contract checks
     └── media_indexer
         ├── README.md
         ├── main.py
@@ -141,6 +149,46 @@ External commands used by the viewer:
 - `ffprobe` for video metadata.
 - `mpv` for video playback.
 - `dolphin` if available for opening folders, with fallback openers otherwise.
+
+## Debugging And Diagnostics
+
+The default release build has diagnostics compiled out:
+
+```bash
+cargo build --release
+```
+
+For a run that may need live inspection, build the observable release. Its
+private diagnostic socket is available immediately, while diagnostic collection
+is off unless `IRIS_DIAGNOSTICS=1` is set or a running process is activated
+through `--diagnose-pid`. Collection expires after 15 minutes by default and
+writes no diagnostic files unless the explicit `IRIS_DIAGNOSTICS_FAILURE_FILE`
+opt-in is set:
+
+```bash
+cargo build --release --features diagnostics
+IRIS_DIAGNOSTICS=1 IRIS_DIAGNOSTICS_TTL_SECS=900 \
+  target/release/iris --no-daemon
+```
+
+The observable binary supports `--build-info`, `--capabilities`, and
+`--diagnose snapshot|events|activate|deactivate|inject`.
+The `inject task_failure ...` probe validates the capture path without changing
+application state. Use
+`--diagnose-pid PID COMMAND` when inspecting a specific running process. Each
+process exposes a private `0600` Unix socket under `$XDG_RUNTIME_DIR`, with bounded snapshot/event data and
+independently switchable heartbeat, event, and task categories. To capture an
+already-running process using external tools:
+
+```bash
+tools/diagnose_iris.sh PID ./iris-diagnostic-capture
+```
+
+See [docs/DEBUGGABILITY.md](docs/DEBUGGABILITY.md) for the evidence schema,
+GDB/perf capture, OOM evidence, replay procedure, symbolization, privacy limits,
+overhead measurement, and indexer status behavior.
+The machine-readable implementation contract is in
+[`debuggability.toml`](debuggability.toml).
 
 ## Build And Run Iris
 

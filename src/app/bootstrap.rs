@@ -23,6 +23,10 @@ pub(crate) fn initial_window_size(path: &Path, start_on_home_page: bool) -> [f32
 
 pub(crate) fn run() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(result) = handle_cli(&args) {
+        return result
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    }
     let mut reuse_window = false;
     let mut no_daemon = false;
     let mut image_args = Vec::new();
@@ -158,6 +162,8 @@ pub(crate) fn run() -> eframe::Result {
         });
     }
 
+    let diagnostics = DiagnosticState::new();
+    diagnostics.install_global();
     let window_size = initial_window_size(&image_path, start_on_home_page);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -172,6 +178,7 @@ pub(crate) fn run() -> eframe::Result {
     let image_path_clone = image_path.clone();
     let comparison_paths_clone = comparison_paths.clone();
     let ctx_shared_clone = ctx_shared.clone();
+    let diagnostics_clone = diagnostics.clone();
 
     let mut result = eframe::run_native(
         "iris",
@@ -185,6 +192,7 @@ pub(crate) fn run() -> eframe::Result {
                 ctx_shared_clone,
                 start_on_home_page,
                 comparison_paths_clone,
+                diagnostics_clone,
             )))
         }),
     );
@@ -194,6 +202,7 @@ pub(crate) fn run() -> eframe::Result {
         unsafe {
             std::env::set_var("WINIT_UNIX_BACKEND", "x11");
         }
+        let diagnostics_clone = diagnostics.clone();
         result = eframe::run_native(
             "iris",
             options,
@@ -206,6 +215,7 @@ pub(crate) fn run() -> eframe::Result {
                     ctx_shared,
                     start_on_home_page,
                     comparison_paths,
+                    diagnostics_clone,
                 )))
             }),
         );
@@ -214,6 +224,10 @@ pub(crate) fn run() -> eframe::Result {
     if bind_socket {
         let _ = std::fs::remove_file(&socket_path);
     }
+    // Keep the control plane alive across a failed native backend attempt so the
+    // X11 fallback can reuse the same diagnostic state. Shut it down only after
+    // the final backend has returned.
+    diagnostics.shutdown();
 
     result
 }

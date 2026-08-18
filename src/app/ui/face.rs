@@ -76,7 +76,9 @@ impl ImageViewer {
         let (tx, rx) = std::sync::mpsc::channel();
         self.face_compare_rx = Some(rx);
         let ctx = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
         std::thread::spawn(move || {
+            let task = diagnostics.task_guard("face_compare");
             let result = if video_count == 0 {
                 compare_photo_faces(&selected[0].path, &selected[1].path)
             } else {
@@ -84,6 +86,7 @@ impl ImageViewer {
             };
             let _ = tx.send(result.map_err(|err| err.to_string()));
             ctx.request_repaint();
+            task.complete();
         });
     }
 

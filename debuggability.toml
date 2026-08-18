@@ -1,0 +1,288 @@
+# Machine-readable Stateful diagnostic contract for Iris.
+# Status values: implemented_tested | implemented_untested | planned | absent |
+#                not_applicable | waived
+schema_version = 5
+template = false
+profile = "stateful"
+owner = "Iris maintainers"
+expected_failure_modes = [
+  "GUI event loop blocked by synchronous I/O or database work",
+  "background worker stalled or failed while the window remains responsive",
+  "thumbnail, metadata, search, or SIFT generation backlog",
+  "LanceDB or external metadata command failure",
+  "GPU runtime, CUDA, or subprocess failure",
+]
+
+[architecture]
+state_owners = [
+  "ImageViewer owns GUI state and result application on the egui thread",
+  "metadata queue owns latest-request coalescing and metadata worker lifecycle",
+  "LanceDB owns persisted media/index rows; media_indexer owns pipeline mutation",
+]
+mutation_points = [
+  "UI result polling methods apply generation-checked background results",
+  "media_indexer upsert batches mutate media_index and ANN side tables",
+  "image editor is the explicit source-media mutation boundary",
+]
+side_effect_boundaries = [
+  "metadata worker subprocesses exiftool and ffprobe",
+  "on-demand embedding and SIFT helper subprocesses",
+  "media_indexer filesystem scan, model workers, and LanceDB writes",
+]
+fault_containment = "Diagnostic control and capture are bounded and independent of the main GUI work loop; individual metadata/indexing failures carry stage/file context and do not silently become successful work."
+
+[errors]
+typed_codes = "implemented_untested: diagnostic events carry bounded code fields and indexer status carries typed stage/error states"
+preserves_source_chain = "implemented_untested: media_indexer compact_error_message retains bounded __cause__/__context__ chains and Rust task failures retain structured failure codes"
+preserves_first_failure = "implemented_untested"
+causal_ids = [
+  "diagnostic operation_id and event sequence for registered tasks",
+  "media_indexer run_id plus stage, file_index, frame_index, and error state",
+]
+
+[invariants]
+release_checks = [
+  "cargo check",
+  "cargo check --features diagnostics",
+  "cargo test --bin iris",
+  "cargo test --bin iris --features diagnostics",
+]
+progress_rules = [
+  "every bounded diagnostic event has a sequence and monotonic timestamp",
+  "the indexer publishes stage/file progress with a resumable status schema",
+  "diagnostic event and response sizes are bounded",
+]
+resource_balances = [
+  "metadata worker queue shutdown is explicit and idempotent",
+  "diagnostic task registry removes completed and failed operations",
+  "indexer worker/process failures are surfaced as failed stage/file status",
+]
+
+[configuration]
+effective_config = "implemented_untested: Iris snapshots expose effective diagnostic categories and the indexer status file records bounded effective model, device, threshold, rerun, and stage policy configuration"
+decision_provenance = "implemented_untested: configuration changes are semantic events and indexer status records the policy that selected each stage"
+dynamic_change_history = "implemented_untested: bounded configuration events are retained in the diagnostic flight recorder"
+
+[build]
+identity = "build.rs emits package version, Git revision/dirty state, rustc, target, and profile; --build-info exposes it"
+exact_artifact_retention = "implemented_untested: live captures retain executable path, Build ID, and SHA-256 identity so the exact artifact can be identified; the executable is not copied into the bundle"
+symbols_and_unwind = "implemented_untested"
+source_retrieval = "implemented_untested"
+
+[artifacts]
+cache_identity = "implemented_untested"
+atomic_publication = "implemented_tested"
+generation_manifest = "implemented_tested: external capture writes capture-manifest.txt and replay artifacts atomically enough for post-capture inspection"
+
+[live]
+capabilities_command = "--capabilities reports build mode, socket path, commands, categories, and bounds"
+snapshot_command = "--diagnose-pid PID snapshot queries the selected process's private local diagnostic socket"
+snapshot_consistency = "best-effort"
+independent_of_failure_loop = "implemented_untested"
+capture_timeout_ms = 3000
+
+[history]
+flight_recorder = "implemented_untested"
+schema = "JSON schema 2 event ring with sequence, monotonic_ms, kind, operation_id, state, bounded code, and bounded reason"
+capacity_events = 512
+drop_and_overwrite_reporting = "implemented_tested"
+
+[audit_trail]
+mutation_audit = "not_applicable"
+event_schema = "No durable mutation audit log; the bounded diagnostic ring is a troubleshooting record only."
+actor_writer_and_reason = "No multi-user durable mutation ledger is required for this local single-user application."
+attribution_policy = "Not applicable to rebuildable local index updates."
+transaction_binding = "LanceDB transactions are not exported as an application audit record."
+attempted_write_policy = "Write failures are reported through stage/file errors and process exit state."
+provenance_and_deduplication = "Media index rows retain source collection and path identity; this is not an audit ledger."
+change_representation = "Source image edits are user-initiated in place or as a new file, outside the diagnostic event ring."
+direct_write_coverage = "not_applicable"
+tamper_evidence = "No durable audit artifact is produced."
+retention_and_access = "No durable audit artifact is retained."
+query_and_export = "No durable audit query/export surface is provided."
+sink_failure_policy = "Diagnostic sink failure is non-fatal and never blocks the GUI."
+cost_and_backpressure = "Bounded in-memory events and coalesced indexer status avoid unbounded diagnostic cost."
+assurance_test = "not_applicable"
+max_event_bytes = 0
+max_added_commit_p99_ms = 0.0
+max_throughput_regression_percent = 0.0
+max_audit_wait_ms = 0
+max_storage_bytes_per_day = 0
+
+[concurrency]
+task_registry = "implemented_untested"
+lock_wait_introspection = "implemented_untested: metadata queue/context waits record count, total, max, last wait, and long-wait events"
+cross_process_correlation = "implemented_untested"
+
+[resources]
+ownership_reporting = "implemented_untested: active task details identify the owning subsystem for registered work"
+declared_budgets = [
+  "diagnostic event ring: 512 events",
+  "diagnostic request: 16 KiB; response: 1 MiB",
+  "diagnostic activation: 1 second to 24 hours, default 15 minutes",
+  "indexer status writes: at most every 0.5 seconds by default",
+]
+high_water_reporting = "implemented_untested: snapshots report active task, thumbnail, background task, and lock-wait high water"
+
+[reproduction]
+recorded_inputs = [
+  "build identity and process identity",
+  "GUI state/counters and bounded semantic events when enabled",
+  "indexer run_id/stage/file/frame status",
+]
+replay_command = "tools/diagnose_iris.sh records a shell-escaped command, working directory, selected environment, and tools/replay_iris_capture.sh restores that context only with explicit --run; full environment capture is opt-in."
+fault_injection = ["Observable builds expose an explicit task_failure probe through the private diagnostic socket; it emits a synthetic failure event without faulting application state."]
+
+[postmortem]
+crash_capture = "implemented_untested"
+includes_history = "implemented_untested"
+oom_or_external_kill_detection = "implemented_untested: snapshots and external captures record oom_score, oom_score_adj, RSS, process-specific cgroup memory.events when available, and process-alive-at-completion"
+retention_policy = "The external capture script writes only to the caller-selected directory; systemd-coredump controls crash-dump retention."
+
+[recovery]
+pre_repair_evidence = "implemented_untested"
+restart_or_fallback_history = "implemented_untested: process/run identity and capture manifests correlate restarts; task failures remain in the bounded event history"
+last_failure_retention = "implemented_untested: snapshot exposes the last structured task failure and IRIS_DIAGNOSTICS_FAILURE_FILE enables opt-in atomic persistence"
+
+[domain]
+state_dump = "Snapshot reports UI mode, database/grid loading, thumbnail activity, background count, named tasks, heartbeat age, build identity, and unavailable subsystems without media content."
+cross_boundary_ids = [
+  "diagnostic operation_id",
+  "diagnostic event sequence",
+  "indexer run_id and stage/file/frame coordinates",
+]
+
+[security]
+authorization = "Each diagnostic Unix socket is per-user, per-process, and mode 0600; no network listener is used."
+redaction = [
+  "diagnostic snapshots and events do not include media paths, OCR text, or image bytes",
+  "external capture bundles may contain command lines, mappings, paths, and file descriptors and must be treated as private",
+]
+max_bundle_bytes = 67108864
+retention_days = 0
+
+[budgets]
+measurement_status = "implemented_untested: tools/measure_debug_overhead.sh records release binary size and CLI startup/RSS comparisons for minimal versus observable builds"
+steady_cpu_percent = 0.5
+steady_memory_bytes = 8388608
+activated_cpu_percent = 10.0
+
+[deployment_modes]
+minimal_release = "cargo build --release; diagnostics feature is compiled out"
+observable_release = "cargo build --release --features diagnostics; runtime collection remains opt-in"
+global_runtime_switch = "IRIS_DIAGNOSTICS=1 at startup, or activate through the private socket when the observable control plane is present"
+per_category_switches = [
+  "IRIS_DIAGNOSTICS_HEARTBEAT and --diagnose set heartbeat on|off",
+  "IRIS_DIAGNOSTICS_EVENTS and --diagnose set events on|off",
+  "IRIS_DIAGNOSTICS_TASKS and --diagnose set tasks on|off",
+]
+diagnostic_builds = ["release + diagnostics feature", "debug + diagnostics feature"]
+optional_diagnostics_default_enabled = false
+lazy_buffer_allocation = true
+lazy_helper_start = false
+
+[performance_isolation]
+preserves_release_optimization = true
+compile_time_exclusion_supported = true
+critical_hot_paths = [
+  "egui update loop heartbeat call",
+  "thumbnail result polling",
+  "metadata/search/SIFT worker result polling",
+  "media_indexer per-file progress status",
+]
+disabled_hot_path_extra_instructions = 0
+baseline_comparison = "Default feature-off release versus diagnostics release with runtime collection disabled; measurement procedure is documented but not automated."
+minimal_mode_test = "implemented_untested"
+runtime_disabled_test = "implemented_untested"
+always_on_test = "implemented_untested"
+activated_mode_tests = ["diagnostic ring bound test", "active task snapshot test", "external capture script smoke checks"]
+
+[instrumentation_policy]
+facility_admission = "required"
+default_class = "activated"
+max_steady_cpu_percent = 0.5
+max_steady_memory_bytes = 8388608
+max_event_rate_per_second = 1000
+max_disk_bytes_per_day = 0
+max_snapshot_pause_ms = 100
+max_activation_ttl_seconds = 86400
+max_activated_capture_bytes = 67108864
+max_minimal_cpu_regression_percent = 0.0
+max_runtime_disabled_cpu_regression_percent = 0.1
+max_steady_p99_latency_regression_percent = 1.0
+max_activated_cpu_percent = 10.0
+synchronous_hot_path_io = false
+global_contended_event_index = false
+require_overhead_test = true
+promotion_requires_measurement = true
+
+[assurance]
+contract_test = "Set DEBUGGABILITY_VALIDATOR to the build-debuggable-software validate_contract.py script, then run tools/check_debuggability.sh; without it the script performs a local schema sanity check."
+synthetic_scenarios = [
+  "cargo test --bin iris",
+  "cargo test --bin iris --features diagnostics",
+  "tools/diagnose_iris.sh with a known sleep process and unavailable optional tools",
+]
+symbolization_test = "readelf --debug-dump=decodedline target/release/iris and GDB backtrace capture"
+redaction_test = "diagnostic snapshot unit test asserts no /media/ path appears"
+overhead_test = "implemented_untested: tools/measure_debug_overhead.sh compares feature-off and diagnostics release builds; it must be run for the workload-specific claim"
+snapshot_test = "diagnostics feature unit tests validate bounded ring and active-task snapshot"
+
+[exceptions]
+items = [
+  { control = "audit_trail.mutation_audit", disposition = "not_applicable", reason = "This is a local single-user viewer/indexer with rebuildable derived search data, not a regulated multi-user mutation ledger." },
+  { control = "audit_trail.direct_write_coverage", disposition = "not_applicable", reason = "No durable mutation audit stream is provided, so direct-write coverage has no applicable sink." },
+]
+
+[controls]
+"architecture.fault_containment" = { status = "implemented_untested", reason = "The diagnostic path is bounded and separate from GUI work; stage/file failures retain context.", implementation = "diagnostics.rs control thread and media_indexer stage status/error paths", test = "cargo check --features diagnostics; live capture procedure" }
+"architecture.mutation_points" = { status = "implemented_untested", reason = "The contract names the GUI, database, and image-edit mutation boundaries.", implementation = "ImageViewer result polling, LanceDB upserts, and editor save paths", test = "code review and existing application tests" }
+"architecture.side_effect_boundaries" = { status = "implemented_untested", reason = "External process and database boundaries are identified.", implementation = "metadata, hashing, bootstrap, and media_indexer modules", test = "cargo test --bin iris" }
+"architecture.state_owners" = { status = "implemented_untested", reason = "Primary GUI, metadata, and database state owners are explicit.", implementation = "ImageViewer, MetadataJobQueue, LanceDB/media_indexer", test = "module ownership review" }
+"assurance.contract_test" = { status = "implemented_untested", reason = "The repository check runs a local contract sanity check and accepts the strict validator through an explicit environment variable.", implementation = "debuggability.toml plus tools/check_debuggability.sh", test = "tools/check_debuggability.sh" }
+"assurance.overhead_test" = { status = "implemented_untested", reason = "A reproducible measurement tool now compares minimal and observable release artifacts; GUI workload measurements remain workload-specific.", implementation = "tools/measure_debug_overhead.sh and release profiles", test = "tools/measure_debug_overhead.sh" }
+"assurance.redaction_test" = { status = "implemented_tested", reason = "Snapshot tests assert media paths are absent.", implementation = "diagnostics snapshot test", test = "cargo test --bin iris --features diagnostics" }
+"assurance.snapshot_test" = { status = "implemented_tested", reason = "Snapshot and bounded-ring tests run in the diagnostics feature test suite.", implementation = "src/app/diagnostics.rs tests", test = "cargo test --bin iris --features diagnostics" }
+"assurance.symbolization_test" = { status = "implemented_untested", reason = "Release line tables and external GDB capture are specified.", implementation = "Cargo release debug line tables and diagnose_iris.sh", test = "readelf/GDB smoke check" }
+"assurance.synthetic_scenarios" = { status = "implemented_untested", reason = "Build/test and capture scenarios are declared.", implementation = "Cargo tests and bounded capture script", test = "commands in docs/DEBUGGABILITY.md" }
+"audit_trail.actor_writer_and_reason" = { status = "not_applicable", reason = "No durable audit ledger is required.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.assurance_test" = { status = "not_applicable", reason = "No durable audit ledger is required.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.attempted_write_policy" = { status = "not_applicable", reason = "Operational status is not a durable audit ledger.", implementation = "Stage/file error status only", test = "Exception recorded above" }
+"audit_trail.attribution_policy" = { status = "not_applicable", reason = "No durable audit records are emitted.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.change_representation" = { status = "not_applicable", reason = "Image edits are outside the diagnostic audit facility.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.cost_and_backpressure" = { status = "not_applicable", reason = "Bounded diagnostics are not a mutation audit stream.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.event_schema" = { status = "not_applicable", reason = "The event ring is troubleshooting history only.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.provenance_and_deduplication" = { status = "not_applicable", reason = "Database provenance is not a mutation audit stream.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.query_and_export" = { status = "not_applicable", reason = "No durable audit artifact is produced.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.retention_and_access" = { status = "not_applicable", reason = "No durable audit artifact is retained.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.sink_failure_policy" = { status = "not_applicable", reason = "No durable audit sink is used.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.tamper_evidence" = { status = "not_applicable", reason = "No durable audit artifact is produced.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"audit_trail.transaction_binding" = { status = "not_applicable", reason = "No durable audit records are emitted.", implementation = "No durable audit sink", test = "Exception recorded above" }
+"build.identity" = { status = "implemented_tested", reason = "Build identity is generated and exposed by CLI.", implementation = "build.rs and --build-info", test = "build_identity_exposes_reproducible_fields" }
+"deployment_modes.diagnostic_builds" = { status = "implemented_tested", reason = "Cargo feature defines the observable build.", implementation = "diagnostics feature in Cargo.toml", test = "cargo check --features diagnostics" }
+"deployment_modes.global_runtime_switch" = { status = "implemented_tested", reason = "Runtime diagnostics are opt-in and can be activated through the local socket even when the observable process started disabled.", implementation = "IRIS_DIAGNOSTICS and activate command", test = "control_plane_can_activate_runtime_disabled_state" }
+"deployment_modes.minimal_release" = { status = "implemented_tested", reason = "Default features exclude the diagnostic implementation.", implementation = "default Cargo feature set", test = "cargo check" }
+"deployment_modes.observable_release" = { status = "implemented_tested", reason = "Release diagnostics are separately compiled and opt-in.", implementation = "release profile plus diagnostics feature", test = "cargo check --features diagnostics" }
+"deployment_modes.per_category_switches" = { status = "implemented_untested", reason = "Heartbeat, event, and task categories have environment and socket controls.", implementation = "diagnostics category atomics and set command", test = "manual set command procedure" }
+"domain.cross_boundary_ids" = { status = "implemented_untested", reason = "Operation/event/run/stage coordinates correlate work across boundaries.", implementation = "diagnostics events and indexer status schema", test = "snapshot/event and status inspection" }
+"domain.state_dump" = { status = "implemented_untested", reason = "Snapshot contains bounded semantic GUI and worker state.", implementation = "snapshot_value", test = "snapshot feature test" }
+"errors.causal_ids" = { status = "implemented_untested", reason = "Registered work has operation ids and ordered events.", implementation = "DiagnosticState operation/event counters", test = "diagnostic ring test" }
+"history.schema" = { status = "implemented_tested", reason = "Event schema and capacity are explicit and tested.", implementation = "DiagnosticEvent JSON serializer", test = "diagnostic_ring_is_bounded_and_reports_overwrites" }
+"invariants.progress_rules" = { status = "implemented_untested", reason = "Event/status progress fields and bounds are documented.", implementation = "diagnostics.rs and coalesced indexer status", test = "status and feature tests" }
+"invariants.release_checks" = { status = "implemented_tested", reason = "Default and feature builds plus tests are listed.", implementation = "Cargo checks/tests", test = "commands in this contract" }
+"invariants.resource_balances" = { status = "implemented_untested", reason = "Task completion/removal and worker status paths are explicit.", implementation = "task registry and indexer status", test = "feature task snapshot test" }
+"live.capabilities_command" = { status = "implemented_tested", reason = "CLI returns diagnostic capabilities and bounds.", implementation = "handle_cli/capabilities_value", test = "cargo test build identity and manual CLI check" }
+"live.snapshot_command" = { status = "implemented_tested", reason = "Private socket snapshot command is implemented.", implementation = "diagnostics control plane", test = "snapshot feature test" }
+"performance_isolation.activated_mode_tests" = { status = "implemented_untested", reason = "Activated ring/task tests and external capture checks are declared.", implementation = "diagnostics tests and capture script", test = "commands in docs/DEBUGGABILITY.md" }
+"performance_isolation.always_on_test" = { status = "implemented_untested", reason = "Always-on means the observable build with diagnostics enabled; it has bounded structures and no disk sink.", implementation = "diagnostics feature runtime", test = "representative workload comparison" }
+"performance_isolation.baseline_comparison" = { status = "implemented_untested", reason = "Feature-off versus runtime-disabled comparison is specified.", implementation = "release profiles and contract", test = "manual benchmark procedure" }
+"performance_isolation.critical_hot_paths" = { status = "implemented_untested", reason = "Critical GUI and indexer update paths are enumerated.", implementation = "heartbeat atomics and coalesced status writer", test = "code review and workload measurement" }
+"performance_isolation.minimal_mode_test" = { status = "implemented_tested", reason = "Minimal build compiles with diagnostics removed.", implementation = "default Cargo features", test = "cargo check and cargo test --bin iris" }
+"performance_isolation.runtime_disabled_test" = { status = "implemented_untested", reason = "Observable binary defaults to disabled runtime collection.", implementation = "IRIS_DIAGNOSTICS gate", test = "run observable binary without environment flag" }
+"postmortem.retention_policy" = { status = "implemented_untested", reason = "Capture output location and system crash retention are documented.", implementation = "DEBUGGABILITY.md postmortem section", test = "manual capture review" }
+"reproduction.fault_injection" = { status = "implemented_untested", reason = "The observable socket accepts an explicit synthetic task-failure probe without changing application state.", implementation = "diagnostics.rs inject task_failure command", test = "--diagnose-pid PID inject task_failure synthetic_probe synthetic_code synthetic_reason" }
+"reproduction.recorded_inputs" = { status = "implemented_untested", reason = "Build/process/run and stage context are recorded.", implementation = "build info, capture script, indexer status", test = "capture/status inspection" }
+"reproduction.replay_command" = { status = "implemented_tested", reason = "Live capture records a shell-escaped command plus working directory and selected environment; the helper restores that context only with explicit execution.", implementation = "diagnose_iris.sh and replay_iris_capture.sh", test = "tools/check_debuggability.sh replay integration test" }
+"resources.declared_budgets" = { status = "implemented_tested", reason = "All diagnostic buffers, request sizes, TTL, and status interval have bounds.", implementation = "constants and contract", test = "diagnostic ring test and code review" }
+"security.authorization" = { status = "implemented_tested", reason = "Local socket permissions restrict the control surface to the user.", implementation = "Unix socket mode 0600", test = "control_plane_can_activate_runtime_disabled_state" }
+"security.redaction" = { status = "implemented_tested", reason = "Snapshot path redaction is asserted and bundle privacy is documented.", implementation = "snapshot fields omit media content", test = "snapshot redaction test" }

@@ -437,7 +437,11 @@ pub(crate) fn get_db_roots() -> HashMap<String, PathBuf> {
 
     if should_refresh {
         let cache_ref = cache;
+        let diagnostics = DiagnosticState::global();
         std::thread::spawn(move || {
+            let task = diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.task_guard("database_roots_refresh"));
             let db_dir = get_db_dir();
             let fresh = load_or_discover_db_roots(&db_dir);
             if let Ok(mut guard) = cache_ref.lock() {
@@ -446,6 +450,9 @@ pub(crate) fn get_db_roots() -> HashMap<String, PathBuf> {
                 }
                 guard.0 = Instant::now();
                 guard.2 = false;
+            }
+            if let Some(task) = task {
+                task.complete();
             }
         });
     }
