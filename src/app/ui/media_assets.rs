@@ -1,6 +1,37 @@
 use super::*;
 
 impl ImageViewer {
+    pub(crate) fn thumbnail_worker_limit(path: &Path) -> usize {
+        if is_video_path(path) {
+            // Video thumbnails each launch a decoder. Keep HDD seeks and process
+            // pressure bounded when a directory contains many unindexed videos.
+            4
+        } else {
+            num_cpus::get().max(4)
+        }
+    }
+
+    pub(crate) fn load_thumbnail_color_image(
+        path: &Path,
+        width: u32,
+        height: u32,
+        fill: bool,
+    ) -> Result<egui::ColorImage, String> {
+        let image = if is_video_path(path) {
+            load_video_thumbnail(path, width, height, fill)?
+        } else {
+            image::open(path).map_err(|error| format!("{}: {error}", path.display()))?
+        };
+        let thumbnail = if fill {
+            image.resize_to_fill(width, height, image::imageops::FilterType::Triangle)
+        } else {
+            image.thumbnail(width, height)
+        };
+        let size = [thumbnail.width() as usize, thumbnail.height() as usize];
+        let pixels = thumbnail.to_rgba8().into_raw();
+        Ok(egui::ColorImage::from_rgba_unmultiplied(size, &pixels))
+    }
+
     pub(crate) fn get_db_filename_from_path(&self, path: &Path) -> Option<String> {
         let roots = get_db_roots();
         let path_norm = path.to_string_lossy().replace('\\', "/");
@@ -238,7 +269,7 @@ impl ImageViewer {
                 egui::Color32::GRAY,
             );
 
-            let max_threads = num_cpus::get().max(4);
+            let max_threads = Self::thumbnail_worker_limit(&resolved_path);
             if !self.thumbnail_loading.contains(&resolved_path)
                 && self.thumbnail_active_threads < max_threads
             {
@@ -251,11 +282,9 @@ impl ImageViewer {
                 let diagnostics = self.diagnostics.clone();
                 rayon::spawn(move || {
                     let task = diagnostics.task_guard("sidebar_thumbnail_decode");
-                    if let Ok(img) = image::open(&path_clone) {
-                        let thumb = img.thumbnail(128, 128);
-                        let size = [thumb.width() as usize, thumb.height() as usize];
-                        let pixels = thumb.to_rgba8().into_raw();
-                        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    if let Ok(color_img) =
+                        Self::load_thumbnail_color_image(&path_clone, 128, 128, false)
+                    {
                         let _ = tx_clone.send((thumbnail_generation, path_clone, color_img));
                         ctx_clone.request_repaint();
                     } else {

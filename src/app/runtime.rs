@@ -589,7 +589,7 @@ impl eframe::App for ImageViewer {
                                 ui.label("No EXIF data available.");
                             } else {
                                 let filter = self.exif_search.to_lowercase();
-                                let filtered_lines: Vec<String> = self.exif_data
+                                let filtered_lines: Vec<&str> = self.exif_data
                                     .lines()
                                     .filter(|line| {
                                         if filter.is_empty() {
@@ -598,20 +598,18 @@ impl eframe::App for ImageViewer {
                                             line.to_lowercase().contains(&filter)
                                         }
                                     })
-                                    .map(|s| s.to_string())
                                     .collect();
 
                                 if filtered_lines.is_empty() {
                                     ui.weak("No matching tags found.");
                                 } else {
-                                    let content = filtered_lines.join("\n");
                                     egui::ScrollArea::horizontal().show(ui, |ui| {
+                                        let content = raw_exif_layout_job(
+                                            &filtered_lines,
+                                            ui.visuals().text_color(),
+                                        );
                                         ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(content)
-                                                    .monospace()
-                                                    .size(11.0)
-                                            )
+                                            egui::Label::new(content)
                                             .selectable(true)
                                         );
                                     });

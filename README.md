@@ -58,11 +58,13 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
     └── media_indexer
         ├── README.md
         ├── main.py
+        ├── relocate_collection.py # Manifest-aware shadow LanceDB relocation
         ├── easyocr_worker.py
         ├── face_worker.py
         ├── paddle_worker.py
         ├── pyproject.toml
         ├── uv.lock
+        ├── tests/test_relocate_collection.py # Relocation/integrity tests
         ├── models/clip-text   # generated locally, ignored by Git
         └── tools
 ```
@@ -242,6 +244,31 @@ UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media \
 ```
 
 Use stable collection ids. Iris resolves database paths such as `my_collection/sub/folder/file.jpg` through the `collection_roots` table, not through hardcoded source paths.
+
+If an indexed tgbackman archive is reorganised, use the committed migration
+manifest to port Iris without recomputing its AI metadata. Start with the
+read-only validation pass, then create a separately validated LanceDB:
+
+```bash
+cd tools/media_indexer
+UV_CACHE_DIR="/data/.cache/uv" uv run iris-relocate-collection \
+  --db-dir ../../lancedb \
+  --manifest /path/to/reorganize.json \
+  --collection-id telegram_backup
+
+UV_CACHE_DIR="/data/.cache/uv" uv run iris-relocate-collection \
+  --db-dir ../../lancedb \
+  --manifest /path/to/reorganize.json \
+  --collection-id telegram_backup \
+  --output-db-dir ../../lancedb-relocated \
+  --apply
+```
+
+The relocation is manifest-, size-, and SHA-256-aware; supports one old path
+becoming several per-chat paths; preserves computed rows and ANN vectors; and
+updates path references and collection roots in a shadow database. It never
+mutates the source database or Telegram files. See
+`tools/media_indexer/README.md` for unmapped-row handling and recovery details.
 
 ## Indexing Stages
 

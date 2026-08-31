@@ -51,7 +51,8 @@ pub(crate) use clipboard::{
 pub(crate) use diagnostics::build_info_value;
 pub(crate) use diagnostics::{DiagnosticState, handle_cli};
 pub(crate) use formatting::{
-    file_resolution_and_size, file_size_and_modified, sift_info_line, wrapping_monospace_path,
+    file_resolution_and_size, file_size_and_modified, raw_exif_layout_job, sift_info_line,
+    wrapping_monospace_path,
 };
 pub(crate) use hashing::{
     compute_face_details, compute_on_demand_embeddings, compute_sift_summary,
@@ -61,7 +62,8 @@ pub(crate) use media_scan::{
     collect_flat_images, collect_images_recursive_cancelable, is_supported_media_path,
 };
 pub(crate) use metadata::{
-    VideoMetadata, format_video_duration, load_video_metadata, run_metadata_worker,
+    VideoMetadata, format_video_duration, load_video_metadata, load_video_thumbnail,
+    run_metadata_worker,
 };
 pub(crate) use model::{
     ClipEntry, ClipIndex, ClipTextEncoder, CropDragMode, DatabaseIndices, DatabaseLoadMessage,

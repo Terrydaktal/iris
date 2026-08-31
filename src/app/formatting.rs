@@ -68,3 +68,81 @@ pub(crate) fn wrapping_monospace_path(ui: &mut egui::Ui, text: &str) {
         .selectable(true);
     ui.add(label);
 }
+
+pub(crate) fn is_important_exif_line(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    if value.trim().is_empty() {
+        return false;
+    }
+
+    let key = key.to_ascii_lowercase();
+    if key.contains("x resolution") || key.contains("y resolution") {
+        return false;
+    }
+
+    let highlighted_phrases = [
+        "image width",
+        "image height",
+        "image size",
+        "pixel dimensions",
+        "megapixels",
+        "resolution",
+        "bit depth",
+        "bitdepth",
+        "bits per sample",
+        "bits per pixel",
+        "date/time original",
+        "create date",
+        "creation date",
+        "date created",
+        "modify date",
+        "modification date",
+        "date modified",
+    ];
+    if highlighted_phrases
+        .iter()
+        .any(|phrase| key.contains(phrase))
+    {
+        return true;
+    }
+
+    key.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "width" | "height"))
+}
+
+pub(crate) fn raw_exif_layout_job(
+    lines: &[&str],
+    normal_color: egui::Color32,
+) -> egui::text::LayoutJob {
+    let normal_format = egui::TextFormat {
+        font_id: egui::FontId::monospace(11.0),
+        color: normal_color,
+        ..Default::default()
+    };
+    let important_format = egui::TextFormat {
+        color: egui::Color32::from_rgb(80, 220, 120),
+        ..normal_format.clone()
+    };
+    let mut job = egui::text::LayoutJob::default();
+
+    for (index, line) in lines.iter().enumerate() {
+        if is_important_exif_line(line) {
+            if let Some(separator) = line.find(':') {
+                let value_start = separator + 1;
+                job.append(&line[..value_start], 0.0, normal_format.clone());
+                job.append(&line[value_start..], 0.0, important_format.clone());
+            } else {
+                job.append(line, 0.0, normal_format.clone());
+            }
+        } else {
+            job.append(line, 0.0, normal_format.clone());
+        }
+        if index + 1 < lines.len() {
+            job.append("\n", 0.0, normal_format.clone());
+        }
+    }
+
+    job
+}

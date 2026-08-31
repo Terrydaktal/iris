@@ -84,6 +84,50 @@ Results are stored in LanceDB with one record per file:
 UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media --db-dir ./lancedb
 ```
 
+## Relocate A Collection From A Tgbackman Manifest
+
+After `tgbackman-media-reorganize` has completed and its manifest says
+`db_committed: true`, relocate the corresponding Iris collection without
+recomputing Iris perceptual hashes, OCR, faces, SIFT data, or embeddings:
+
+```bash
+UV_CACHE_DIR="/data/.cache/uv" uv run iris-relocate-collection \
+  --db-dir ./lancedb \
+  --manifest /path/to/reorganize.json \
+  --collection-id telegram_backup
+```
+
+That is a strict read-only dry run. It verifies every manifest destination by
+size and SHA-256 and reports mapped, unmapped, colliding, and unused manifest
+keys. Applying always builds a separate database; it never edits the current
+database or either media tree:
+
+```bash
+UV_CACHE_DIR="/data/.cache/uv" uv run iris-relocate-collection \
+  --db-dir ./lancedb \
+  --manifest /path/to/reorganize.json \
+  --collection-id telegram_backup \
+  --output-db-dir ./lancedb-relocated \
+  --apply
+```
+
+The command rewrites the primary file keys, duplicate and SIFT references,
+cross-media references, every `file_name` ANN side table, path-derived ANN IDs,
+and `collection_roots`. One old file mapped to several per-chat reflinks becomes
+several database rows with the existing computed metadata and vectors preserved.
+All source tables are version-checked before publication, all existing scalar
+and vector indexes are rebuilt, and the completed database includes
+`relocation-report.json` with the source manifest digest and row counts.
+
+An apply refuses unmapped collection rows because changing the collection root
+would make those keys invalid. If a reviewed dry run proves they are redundant
+legacy entries, repeat the dry run with `--drop-unmapped`, then use the same flag
+with `--apply`; removal happens only in the new database.
+Interrupted or failed work remains in a clearly named `.partial-*` directory for
+diagnosis, while the source database remains usable. Derived scene-still and
+cross-media work caches are deliberately invalidated because their directory
+keys encode the old layout; the SIFT BoVW codebook is copied.
+
 ## Progress Status
 
 Each run publishes one atomic status file per collection and run under the

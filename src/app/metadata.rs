@@ -232,6 +232,102 @@ pub(crate) fn resolve_ffprobe_path() -> Option<PathBuf> {
         .clone()
 }
 
+pub(crate) fn resolve_ffmpeg_path() -> Option<PathBuf> {
+    static FFMPEG_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FFMPEG_PATH
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("IRIS_FFMPEG").map(PathBuf::from) {
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    let candidate = dir.join("ffmpeg");
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+
+            ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .clone()
+}
+
+pub(crate) fn load_video_thumbnail(
+    path: &Path,
+    width: u32,
+    height: u32,
+    fill: bool,
+) -> Result<image::DynamicImage, String> {
+    let ffmpeg_path = resolve_ffmpeg_path()
+        .ok_or_else(|| "ffmpeg was not found; set IRIS_FFMPEG or install ffmpeg".to_string())?;
+    let width = width.max(1);
+    let height = height.max(1);
+    let scale_mode = if fill { "increase" } else { "decrease" };
+    let mut filter = format!("scale={width}:{height}:force_original_aspect_ratio={scale_mode}");
+    if fill {
+        filter.push_str(&format!(",crop={width}:{height}"));
+    }
+
+    let mut command = Command::new(&ffmpeg_path);
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ss",
+            "0",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-frames:v",
+            "1",
+            "-vf",
+        ])
+        .arg(filter)
+        .args([
+            "-threads",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ]);
+
+    let output = command_output_with_timeout(command, Duration::from_secs(15))
+        .map_err(|error| format!("ffmpeg thumbnail extraction failed: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("ffmpeg could not decode a frame from {}", path.display())
+        } else {
+            format!("ffmpeg could not decode {}: {stderr}", path.display())
+        });
+    }
+    if output.stdout.is_empty() {
+        return Err(format!(
+            "ffmpeg produced no thumbnail frame for {}",
+            path.display()
+        ));
+    }
+    image::load_from_memory(&output.stdout)
+        .map_err(|error| format!("ffmpeg returned an invalid thumbnail image: {error}"))
+}
+
 pub(crate) fn load_ffprobe_metadata(path: &Path) -> String {
     if let Some(ffprobe_path) = resolve_ffprobe_path() {
         let mut command = Command::new(&ffprobe_path);

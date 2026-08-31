@@ -539,6 +539,7 @@ impl ImageViewer {
                                             self.gallery_visible_thumbnail_paths
                                                 .insert(resolved_path.clone());
                                             if self.thumbnail_failed.contains(&resolved_path)
+                                                && !is_video_path(&resolved_path)
                                                 && self
                                                     .thumbnail_retry_at
                                                     .get(&resolved_path)
@@ -570,7 +571,7 @@ impl ImageViewer {
                                                     ui.add(egui::Spinner::new().size(20.0 * self.gallery_thumbnail_scale));
                                                 });
 
-                                                let max_threads = num_cpus::get().max(4);
+                                                let max_threads = Self::thumbnail_worker_limit(&resolved_path);
                                                 if !self.thumbnail_loading.contains(&resolved_path) && self.thumbnail_active_threads < max_threads {
                                                     self.thumbnail_loading.insert(resolved_path.clone());
                                                     self.thumbnail_active_threads += 1;
@@ -582,11 +583,14 @@ impl ImageViewer {
                                                     let diagnostics = self.diagnostics.clone();
                                                     rayon::spawn(move || {
                                                         let task = diagnostics.task_guard("gallery_thumbnail_decode");
-                                                        if let Ok(img) = image::open(&path_clone) {
-                                                            let thumb = img.resize_to_fill(260, 320, image::imageops::FilterType::Triangle);
-                                                            let size = [thumb.width() as usize, thumb.height() as usize];
-                                                            let pixels = thumb.to_rgba8().into_raw();
-                                                            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                        if let Ok(color_img) =
+                                                            Self::load_thumbnail_color_image(
+                                                                &path_clone,
+                                                                260,
+                                                                320,
+                                                                true,
+                                                            )
+                                                        {
                                                             let _ = tx_clone.send((
                                                                 thumbnail_generation,
                                                                 path_clone,
