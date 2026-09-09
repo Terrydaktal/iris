@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
 
 impl ImageViewer {
     pub(crate) fn new(
@@ -8,6 +9,7 @@ impl ImageViewer {
         start_on_home_page: bool,
         comparison_paths: Option<Vec<PathBuf>>,
         diagnostics: DiagnosticState,
+        outbound_file_drag: OutboundFileDrag,
     ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
         let open_target = path.clone();
@@ -75,7 +77,7 @@ impl ImageViewer {
         let (thumbnail_tx, thumbnail_rx) =
             std::sync::mpsc::channel::<(u64, PathBuf, egui::ColorImage)>();
         let (viewer_texture_tx, viewer_texture_rx) =
-            std::sync::mpsc::channel::<(PathBuf, u64, Result<egui::ColorImage, String>)>();
+            std::sync::mpsc::channel::<(PathBuf, u64, Result<ViewerPreview, String>)>();
         let (video_duration_tx, video_duration_rx) =
             std::sync::mpsc::channel::<(PathBuf, Option<VideoMetadata>)>();
         let (metadata_tx, metadata_rx) = std::sync::mpsc::channel::<MetadataLoadResult>();
@@ -94,6 +96,7 @@ impl ImageViewer {
 
         let mut viewer = Self {
             diagnostics,
+            outbound_file_drag,
             images,
             current_index: 0,
             comparison_paths,
@@ -152,6 +155,9 @@ impl ImageViewer {
             thumbnail_tx,
             thumbnail_active_threads: 0,
             viewer_textures: HashMap::new(),
+            viewer_source_sizes: HashMap::new(),
+            viewer_detail: ViewerDetail::default(),
+            viewer_sampling: ViewerSampling::default(),
             viewer_texture_loading: HashSet::new(),
             viewer_texture_failed: HashSet::new(),
             viewer_texture_retry_at: HashMap::new(),
@@ -183,10 +189,14 @@ impl ImageViewer {
             applied_filename_query: String::new(),
             filename_search_results: None,
             semantic_folder: String::new(),
-            semantic_limit: 300,
+            semantic_match_threshold: DEFAULT_MATCH_THRESHOLD,
             semantic_video_only: false,
+            semantic_result_order: SemanticResultOrder::BestMatch,
             semantic_mode: SearchMode::Filename,
             semantic_results: Vec::new(),
+            semantic_results_revision: 0,
+            semantic_gallery_cache_key: None,
+            semantic_gallery_indices: Arc::from([]),
             semantic_results_mode: None,
             semantic_status: "Ready. Enter a phrase and press Search.".to_string(),
             pending_search_request: None,
@@ -222,6 +232,9 @@ impl ImageViewer {
             metadata_generation: 0,
             semantic_search_rx: None,
             semantic_search_generation: 0,
+            semantic_date_sort_rx: None,
+            semantic_date_sort_generation: 0,
+            semantic_date_sort_token: Arc::new(AtomicU64::new(0)),
             filename_search_rx: None,
             filename_search_generation: 0,
             pending_similarity_source: None,
@@ -229,7 +242,7 @@ impl ImageViewer {
             show_home_page: start_on_home_page,
             home_current_dir: None,
             home_selected_dir: None,
-            viewer_rotation_quarter_turns: 0,
+            viewer_rotation_degrees: 0.0,
             viewer_rotation_path: None,
         };
 
@@ -357,12 +370,14 @@ impl ImageViewer {
                     clip_embedded_files: Arc::new(clip_embedded_files),
                     ocr_embedded_files: Arc::new(HashSet::new()),
                     similar_by_master: HashMap::new(),
-                    phash_master_by_file: HashMap::new(),
+                    source_mtime_by_file: Arc::new(HashMap::new()),
+                    phash_master_by_file: Arc::new(HashMap::new()),
+                    phash_members_by_master: Arc::new(HashMap::new()),
                     phash_by_file: HashMap::new(),
                     video_frame_phashes_by_file: HashMap::new(),
                     sift_info_by_file: HashMap::new(),
-                    sift_root_by_file: HashMap::new(),
-                    sift_members_by_root: HashMap::new(),
+                    sift_root_by_file: Arc::new(HashMap::new()),
+                    sift_members_by_root: Arc::new(HashMap::new()),
                     skipped_processing_files: Arc::new(HashSet::new()),
                     basename_to_db_filename: Arc::new(basename_to_db_filename),
                     encoder,
@@ -386,12 +401,14 @@ impl ImageViewer {
                     indices.ocr_index = Arc::new(data.ocr_index);
                     indices.ocr_embedded_files = Arc::new(data.ocr_embedded_files);
                     indices.similar_by_master = data.similar_by_master;
-                    indices.phash_master_by_file = data.phash_master_by_file;
+                    indices.source_mtime_by_file = Arc::new(data.source_mtime_by_file);
+                    indices.phash_master_by_file = Arc::new(data.phash_master_by_file);
+                    indices.phash_members_by_master = Arc::new(data.phash_members_by_master);
                     indices.phash_by_file = data.phash_by_file;
                     indices.video_frame_phashes_by_file = data.video_frame_phashes_by_file;
                     indices.sift_info_by_file = data.sift_info_by_file;
-                    indices.sift_root_by_file = data.sift_root_by_file;
-                    indices.sift_members_by_root = data.sift_members_by_root;
+                    indices.sift_root_by_file = Arc::new(data.sift_root_by_file);
+                    indices.sift_members_by_root = Arc::new(data.sift_members_by_root);
                     indices.skipped_processing_files = Arc::new(data.skipped_processing_files);
                     let mut basename_to_db_filename = (*indices.basename_to_db_filename).clone();
                     for key in indices
@@ -416,6 +433,25 @@ impl ImageViewer {
                 if self.semantic_status.starts_with("CLIP ready.") {
                     self.semantic_status =
                         "CLIP, OCR, face, duplicate, and SIFT indexes ready.".to_string();
+                }
+                if self.semantic_result_order != SemanticResultOrder::BestMatch
+                    && !self.semantic_results.is_empty()
+                    && self.pending_search_request.is_none()
+                    && self.pending_semantic_search_mode.is_none()
+                {
+                    let ctx = self
+                        .ctx_shared
+                        .lock()
+                        .ok()
+                        .and_then(|ctx| ctx.as_ref().cloned());
+                    if let Some(ctx) = ctx {
+                        let rows = self.take_semantic_results();
+                        let mode = self.semantic_results_mode.unwrap_or(self.semantic_mode);
+                        let status =
+                            "Supplemental duplicate indexes loaded; refreshing date order."
+                                .to_string();
+                        self.apply_semantic_result_order(rows, mode, status, None, &ctx);
+                    }
                 }
                 self.run_pending_db_request(true);
             }

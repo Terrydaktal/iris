@@ -193,6 +193,7 @@ pub(crate) fn run() -> eframe::Result {
                 start_on_home_page,
                 comparison_paths_clone,
                 diagnostics_clone,
+                OutboundFileDrag::new(cc),
             )))
         }),
     );
@@ -216,6 +217,7 @@ pub(crate) fn run() -> eframe::Result {
                     start_on_home_page,
                     comparison_paths,
                     diagnostics_clone,
+                    OutboundFileDrag::new(cc),
                 )))
             }),
         );

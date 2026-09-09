@@ -1,4 +1,7 @@
-use super::{DiagnosticState, binary::FileChunk, metadata::VideoMetadata};
+use super::{
+    DiagnosticState, OutboundFileDrag, ViewerDetail, ViewerPreview, ViewerSampling, ViewerTexture,
+    binary::FileChunk, metadata::VideoMetadata,
+};
 use anyhow::Result;
 use eframe::egui;
 use ort::session::Session;
@@ -24,6 +27,17 @@ pub(crate) enum SearchMode {
     Ocr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticResultOrder {
+    BestMatch,
+    DateDescending,
+    DateAscending,
+}
+
+// The former search UI had no minimum-match filter, so 0% preserves its
+// default behavior while allowing users to raise the threshold explicitly.
+pub(crate) const DEFAULT_MATCH_THRESHOLD: f32 = 0.0;
+
 pub(crate) enum OpenRequest {
     Single(PathBuf),
     Comparison(Vec<PathBuf>),
@@ -35,8 +49,9 @@ pub(crate) struct SearchSnapshot {
     pub(crate) applied_filename_query: String,
     pub(crate) filename_search_results: Option<Vec<usize>>,
     pub(crate) semantic_folder: String,
-    pub(crate) semantic_limit: usize,
+    pub(crate) semantic_match_threshold: f32,
     pub(crate) semantic_video_only: bool,
+    pub(crate) semantic_result_order: SemanticResultOrder,
     pub(crate) semantic_mode: SearchMode,
     pub(crate) semantic_results: Vec<SearchResult>,
     pub(crate) semantic_results_mode: Option<SearchMode>,
@@ -178,12 +193,21 @@ pub(crate) struct SemanticSearchWorkerResult {
     pub(crate) generation: u64,
     pub(crate) mode: SearchMode,
     pub(crate) rows: Vec<SearchResult>,
+    pub(crate) match_threshold: f32,
     pub(crate) took_ms: u128,
     pub(crate) indexed_items: usize,
     pub(crate) folder_scope: String,
     pub(crate) display_label: String,
-    pub(crate) limit: usize,
     pub(crate) video_only: bool,
+}
+
+pub(crate) struct SemanticDateSortWorkerResult {
+    pub(crate) generation: u64,
+    pub(crate) order: SemanticResultOrder,
+    pub(crate) mode: SearchMode,
+    pub(crate) rows: Vec<SearchResult>,
+    pub(crate) status: String,
+    pub(crate) took_ms: u128,
 }
 
 pub(crate) struct FilenameSearchWorkerResult {
@@ -284,6 +308,15 @@ pub(crate) struct ClipTextEncoder {
     pub(crate) context_len: usize,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DuplicateDateIndex {
+    pub(crate) source_mtime_by_file: Arc<HashMap<String, i64>>,
+    pub(crate) phash_master_by_file: Arc<HashMap<String, String>>,
+    pub(crate) phash_members_by_master: Arc<HashMap<String, Vec<String>>>,
+    pub(crate) sift_root_by_file: Arc<HashMap<String, String>>,
+    pub(crate) sift_members_by_root: Arc<HashMap<String, Vec<String>>>,
+}
+
 pub(crate) struct DatabaseIndices {
     pub(crate) clip_index: Arc<ClipIndex>,
     pub(crate) face_index: Arc<FaceIndex>,
@@ -291,15 +324,29 @@ pub(crate) struct DatabaseIndices {
     pub(crate) clip_embedded_files: Arc<HashSet<String>>,
     pub(crate) ocr_embedded_files: Arc<HashSet<String>>,
     pub(crate) similar_by_master: HashMap<String, Vec<SimilarFile>>,
-    pub(crate) phash_master_by_file: HashMap<String, String>,
+    pub(crate) source_mtime_by_file: Arc<HashMap<String, i64>>,
+    pub(crate) phash_master_by_file: Arc<HashMap<String, String>>,
+    pub(crate) phash_members_by_master: Arc<HashMap<String, Vec<String>>>,
     pub(crate) phash_by_file: HashMap<String, u64>,
     pub(crate) video_frame_phashes_by_file: HashMap<String, Vec<VideoFramePhash>>,
     pub(crate) sift_info_by_file: HashMap<String, SiftInfo>,
-    pub(crate) sift_root_by_file: HashMap<String, String>,
-    pub(crate) sift_members_by_root: HashMap<String, Vec<String>>,
+    pub(crate) sift_root_by_file: Arc<HashMap<String, String>>,
+    pub(crate) sift_members_by_root: Arc<HashMap<String, Vec<String>>>,
     pub(crate) skipped_processing_files: Arc<HashSet<String>>,
     pub(crate) basename_to_db_filename: Arc<HashMap<String, Vec<String>>>,
     pub(crate) encoder: ClipTextEncoder,
+}
+
+impl DatabaseIndices {
+    pub(crate) fn duplicate_date_index(&self) -> DuplicateDateIndex {
+        DuplicateDateIndex {
+            source_mtime_by_file: Arc::clone(&self.source_mtime_by_file),
+            phash_master_by_file: Arc::clone(&self.phash_master_by_file),
+            phash_members_by_master: Arc::clone(&self.phash_members_by_master),
+            sift_root_by_file: Arc::clone(&self.sift_root_by_file),
+            sift_members_by_root: Arc::clone(&self.sift_members_by_root),
+        }
+    }
 }
 
 pub(crate) struct SupplementalDbData {
@@ -307,7 +354,9 @@ pub(crate) struct SupplementalDbData {
     pub(crate) ocr_index: OcrIndex,
     pub(crate) ocr_embedded_files: HashSet<String>,
     pub(crate) similar_by_master: HashMap<String, Vec<SimilarFile>>,
+    pub(crate) source_mtime_by_file: HashMap<String, i64>,
     pub(crate) phash_master_by_file: HashMap<String, String>,
+    pub(crate) phash_members_by_master: HashMap<String, Vec<String>>,
     pub(crate) phash_by_file: HashMap<String, u64>,
     pub(crate) video_frame_phashes_by_file: HashMap<String, Vec<VideoFramePhash>>,
     pub(crate) sift_info_by_file: HashMap<String, SiftInfo>,
@@ -339,6 +388,7 @@ pub(crate) struct ImageEditor {
     pub(crate) source_path: PathBuf,
     pub(crate) image: image::DynamicImage,
     pub(crate) texture: egui::TextureHandle,
+    pub(crate) rotation_degrees: f32,
     pub(crate) crop_min: egui::Pos2,
     pub(crate) crop_max: egui::Pos2,
     pub(crate) crop_drag_mode: Option<CropDragMode>,
@@ -350,6 +400,7 @@ pub(crate) struct ImageEditor {
 
 pub(crate) struct ImageViewer {
     pub(crate) diagnostics: DiagnosticState,
+    pub(crate) outbound_file_drag: OutboundFileDrag,
     pub(crate) images: Vec<PathBuf>,
     pub(crate) current_index: usize,
     pub(crate) comparison_paths: Option<Vec<PathBuf>>,
@@ -407,15 +458,18 @@ pub(crate) struct ImageViewer {
     pub(crate) thumbnail_rx: std::sync::mpsc::Receiver<(u64, PathBuf, egui::ColorImage)>,
     pub(crate) thumbnail_tx: std::sync::mpsc::Sender<(u64, PathBuf, egui::ColorImage)>,
     pub(crate) thumbnail_active_threads: usize,
-    pub(crate) viewer_textures: HashMap<PathBuf, egui::TextureHandle>,
+    pub(crate) viewer_textures: HashMap<PathBuf, ViewerTexture>,
+    pub(crate) viewer_source_sizes: HashMap<PathBuf, [u32; 2]>,
+    pub(crate) viewer_detail: ViewerDetail,
+    pub(crate) viewer_sampling: ViewerSampling,
     pub(crate) viewer_texture_loading: HashSet<PathBuf>,
     pub(crate) viewer_texture_failed: HashSet<PathBuf>,
     pub(crate) viewer_texture_retry_at: HashMap<PathBuf, Instant>,
     pub(crate) viewer_texture_revisions: HashMap<PathBuf, u64>,
     pub(crate) viewer_texture_rx:
-        std::sync::mpsc::Receiver<(PathBuf, u64, Result<egui::ColorImage, String>)>,
+        std::sync::mpsc::Receiver<(PathBuf, u64, Result<ViewerPreview, String>)>,
     pub(crate) viewer_texture_tx:
-        std::sync::mpsc::Sender<(PathBuf, u64, Result<egui::ColorImage, String>)>,
+        std::sync::mpsc::Sender<(PathBuf, u64, Result<ViewerPreview, String>)>,
     pub(crate) video_duration_cache: std::cell::RefCell<HashMap<PathBuf, Option<VideoMetadata>>>,
     pub(crate) video_duration_loading: std::cell::RefCell<HashSet<PathBuf>>,
     pub(crate) video_duration_rx: std::sync::mpsc::Receiver<(PathBuf, Option<VideoMetadata>)>,
@@ -439,10 +493,14 @@ pub(crate) struct ImageViewer {
     pub(crate) applied_filename_query: String,
     pub(crate) filename_search_results: Option<Vec<usize>>,
     pub(crate) semantic_folder: String,
-    pub(crate) semantic_limit: usize,
+    pub(crate) semantic_match_threshold: f32,
     pub(crate) semantic_video_only: bool,
+    pub(crate) semantic_result_order: SemanticResultOrder,
     pub(crate) semantic_mode: SearchMode,
     pub(crate) semantic_results: Vec<SearchResult>,
+    pub(crate) semantic_results_revision: u64,
+    pub(crate) semantic_gallery_cache_key: Option<(u64, bool)>,
+    pub(crate) semantic_gallery_indices: Arc<[usize]>,
     pub(crate) semantic_results_mode: Option<SearchMode>,
     pub(crate) semantic_status: String,
     pub(crate) pending_search_request: Option<PendingSearchRequest>,
@@ -475,6 +533,9 @@ pub(crate) struct ImageViewer {
     pub(crate) metadata_generation: u64,
     pub(crate) semantic_search_rx: Option<Receiver<Result<SemanticSearchWorkerResult, String>>>,
     pub(crate) semantic_search_generation: u64,
+    pub(crate) semantic_date_sort_rx: Option<Receiver<SemanticDateSortWorkerResult>>,
+    pub(crate) semantic_date_sort_generation: u64,
+    pub(crate) semantic_date_sort_token: Arc<AtomicU64>,
     pub(crate) filename_search_rx: Option<Receiver<FilenameSearchWorkerResult>>,
     pub(crate) filename_search_generation: u64,
     pub(crate) pending_similarity_source: Option<SearchResult>,
@@ -482,6 +543,6 @@ pub(crate) struct ImageViewer {
     pub(crate) show_home_page: bool,
     pub(crate) home_current_dir: Option<PathBuf>,
     pub(crate) home_selected_dir: Option<PathBuf>,
-    pub(crate) viewer_rotation_quarter_turns: u8,
+    pub(crate) viewer_rotation_degrees: f32,
     pub(crate) viewer_rotation_path: Option<PathBuf>,
 }

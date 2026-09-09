@@ -2,6 +2,13 @@ use super::*;
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Err(error) = self.outbound_file_drag.poll() {
+            self.semantic_status = error;
+        }
+        if self.outbound_file_drag.is_active() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         let ui_state = if self.show_home_page {
             "home"
         } else if self.show_grid {
@@ -51,6 +58,7 @@ impl eframe::App for ImageViewer {
         self.poll_on_demand_embeddings(ctx);
         self.poll_face_compare(ctx);
         self.poll_semantic_search(ctx);
+        self.poll_semantic_date_sort(ctx);
         self.poll_filename_search(ctx);
 
         if !self.db_loaded && !self.db_loading {
@@ -101,13 +109,18 @@ impl eframe::App for ImageViewer {
             }
             self.viewer_texture_loading.remove(&path);
             match result {
-                Ok(color_image) => {
+                Ok(preview) => {
                     self.viewer_texture_failed.remove(&path);
                     self.viewer_texture_retry_at.remove(&path);
-                    let texture = ctx.load_texture(
+                    self.viewer_source_sizes
+                        .insert(path.clone(), preview.source_size);
+                    let native_resolution = preview.is_native_resolution();
+                    let texture = ViewerTexture::new(
+                        ctx,
                         format!("viewer_image: {}", path.display()),
-                        color_image,
-                        egui::TextureOptions::LINEAR,
+                        preview.image,
+                        native_resolution,
+                        self.viewer_sampling,
                     );
                     self.viewer_textures.insert(path, texture);
                 }
@@ -120,6 +133,15 @@ impl eframe::App for ImageViewer {
             ctx.request_repaint();
         }
         self.trim_viewer_texture_cache();
+        if self.show_grid
+            || self.show_home_page
+            || self.image_editor.is_some()
+            || self.compare_target.is_some()
+            || self.images.get(self.current_index).is_none()
+        {
+            self.viewer_detail.clear();
+            self.viewer_detail.poll(ctx);
+        }
 
         while let Ok((path, metadata)) = self.video_duration_rx.try_recv() {
             self.video_duration_loading.borrow_mut().remove(&path);
@@ -355,131 +377,7 @@ impl eframe::App for ImageViewer {
             return;
         }
 
-        egui::TopBottomPanel::top("top_bar")
-            .exact_height(IMAGE_VIEWER_TOP_BAR_HEIGHT)
-            .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Iris");
-                ui.separator();
-
-                if ui.button("🏠 Filesystem").clicked() {
-                    self.clear_comparison_mode();
-                    self.show_home_page = true;
-                }
-                if ui.button("Open File [Ctrl+O]").clicked() {
-                    self.open_file_dialog(ctx);
-                }
-                if ui.button("Compare Paths [Ctrl+Shift+O]").clicked() {
-                    self.open_comparison_path_dialog();
-                }
-
-                if self.is_comparison_mode() {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 190, 80),
-                        format!(
-                            "Compare {}/{} (←/→)",
-                            self.current_index + 1,
-                            self.images.len()
-                        ),
-                    );
-                    if ui
-                        .checkbox(&mut self.comparison_sync_view, "Sync View")
-                        .on_hover_text(
-                            "Share the current zoom and pan position across every comparison image.",
-                        )
-                        .changed()
-                        && self.comparison_sync_view
-                    {
-                        self.apply_comparison_view_state_to_all();
-                    }
-                    let can_align_all = !self.sift_align_all_running
-                        && self.images.iter().all(|path| !is_video_path(path));
-                    let align_label = if self.sift_align_all_running {
-                        "SIFT Aligning..."
-                    } else if !self.comparison_aligned_paths.is_empty() {
-                        "SIFT Re-align All"
-                    } else {
-                        "SIFT Align All"
-                    };
-                    if ui
-                        .add_enabled(can_align_all, egui::Button::new(align_label))
-                        .on_hover_text(
-                            "Use the first comparison image as the reference and recompute every SIFT alignment.",
-                        )
-                        .clicked()
-                    {
-                        self.start_sift_align_all(ctx);
-                    }
-                    if !self.comparison_alignment_status.is_empty() {
-                        ui.weak(&self.comparison_alignment_status);
-                    }
-                    if ui.button("Exit Compare").clicked() {
-                        if let Some(path) = self.images.get(self.current_index).cloned() {
-                            self.open_image_path(path);
-                        }
-                    }
-                }
-
-                ui.separator();
-                if let Some(path) = self.images.get(self.current_index) {
-                    let filename = self
-                        .resolve_db_filename(path)
-                        .and_then(|db_name| {
-                            db_name
-                                .split_once('/')
-                                .map(|(_, rel)| rel.to_string())
-                        })
-                        .and_then(|rel| {
-                            Path::new(&rel)
-                                .file_name()
-                                .and_then(|f| f.to_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_else(|| {
-                            path.file_name()
-                                .and_then(|f| f.to_str())
-                                .unwrap_or("")
-                                .to_string()
-                        });
-                    let gallery_position = self
-                        .gallery_navigation_indices
-                        .as_ref()
-                        .map(|_| self.gallery_navigation_position + 1)
-                        .unwrap_or(self.current_index + 1);
-                    let gallery_count = self
-                        .gallery_navigation_indices
-                        .as_ref()
-                        .map_or(self.images.len(), |indices| indices.len());
-                    ui.label(format!("{} ({}/{}) - {} - {}", filename, gallery_position, gallery_count, self.current_dimensions, self.current_file_size));
-                } else {
-                    ui.label("No image loaded");
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Layout Button
-                    let show_layout_active = (self.show_exif || self.side_panel_open_pending)
-                        && self.side_panel_mode == SidePanelMode::Layout;
-                    let layout_button_text = if show_layout_active { "📂 Hide Layout [E]" } else { "📂 Show Layout [E]" };
-                    if ui.button(layout_button_text).clicked() {
-                        self.toggle_layout_side_panel(ctx);
-                    }
-
-                    ui.add_space(8.0);
-
-                    let gallery_text = if self.show_grid { "🖼 Hide Gallery [G]" } else { "🖼 Show Gallery [G]" };
-                    if ui.button(gallery_text).clicked() {
-                        if !self.show_grid {
-                            self.clear_comparison_mode();
-                        }
-                        self.show_grid = !self.show_grid;
-                        if self.show_grid && self.recursive_images.is_empty() {
-                            self.start_recursive_scan();
-                        }
-                    }
-                });
-            });
-        });
+        self.show_top_bar(ctx);
 
         self.apply_pending_side_panel_open(ctx);
 
@@ -1153,7 +1051,7 @@ impl eframe::App for ImageViewer {
                 if let Some(path) = self.images.get(self.current_index).cloned() {
                     if self.viewer_rotation_path.as_ref() != Some(&path) {
                         self.viewer_rotation_path = Some(path.clone());
-                        self.viewer_rotation_quarter_turns = 0;
+                        self.viewer_rotation_degrees = 0.0;
                     }
                     let resolved_path = if self.is_comparison_mode() {
                         self.comparison_display_path(&path)
@@ -1166,7 +1064,18 @@ impl eframe::App for ImageViewer {
                     let mut view_changed = false;
                     let primary_button_down =
                         ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-                    if response.dragged() && primary_button_down {
+                    let shift_down = ui.input(|i| i.modifiers.shift);
+                    if response.drag_started() && primary_button_down && shift_down {
+                        let actual_path = self.resolve_actual_path(&path);
+                        if let Err(error) = self.outbound_file_drag.start(&actual_path) {
+                            self.semantic_status = format!("File drag failed: {error}");
+                        }
+                    }
+                    if response.dragged()
+                        && primary_button_down
+                        && !shift_down
+                        && !self.outbound_file_drag.is_active()
+                    {
                         self.offset += response.drag_delta();
                         view_changed = true;
                     }
@@ -1184,17 +1093,25 @@ impl eframe::App for ImageViewer {
                             .hover_pos()
                             .is_some_and(|position| rect.contains(position))
                     });
+                    if pointer_over_viewport && shift_down {
+                        ctx.set_cursor_icon(if self.outbound_file_drag.is_active() {
+                            egui::CursorIcon::Grabbing
+                        } else {
+                            egui::CursorIcon::Grab
+                        });
+                    }
                     if pointer_over_viewport && frame_scroll_delta != 0.0 {
                         let zoom_factor = (frame_scroll_delta / 200.0).exp();
-
-                        if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                            let screen_center = rect.center();
-                            let v_m = mouse_pos - screen_center;
-                            self.offset = v_m - (v_m - self.offset) * zoom_factor;
-                        }
-
-                        self.zoom = (self.zoom * zoom_factor).clamp(0.05, 32.0);
-                        view_changed = true;
+                        let mut view = ImageViewState {
+                            zoom: self.zoom,
+                            offset: self.offset,
+                        };
+                        let anchor = ui
+                            .input(|i| i.pointer.hover_pos())
+                            .map_or(view.offset, |mouse_pos| mouse_pos - rect.center());
+                        view_changed |= view.zoom_at(zoom_factor, anchor);
+                        self.zoom = view.zoom;
+                        self.offset = view.offset;
                     }
                     if view_changed {
                         self.apply_comparison_view_state_to_all();
@@ -1227,16 +1144,42 @@ impl eframe::App for ImageViewer {
                             self.start_image_editor(&path, ui.ctx());
                             ui.close();
                         }
-                        if !is_video_item && ui.button("🔄 Rotate image").clicked() {
-                            self.viewer_rotation_quarter_turns =
-                                (self.viewer_rotation_quarter_turns + 1) % 4;
-                            self.viewer_rotation_path = Some(path.clone());
-                            self.zoom = 1.0;
-                            self.offset = egui::Vec2::ZERO;
-                            self.apply_comparison_view_state_to_all();
-                            ui.ctx().request_repaint();
-                            ui.close();
+                        if !is_video_item {
+                            ui.menu_button("🔄 Rotate image", |ui| {
+                                if ui.button("Rotate left").clicked() {
+                                    self.set_viewer_rotation(
+                                        &path,
+                                        self.viewer_rotation_degrees - 90.0,
+                                        ui.ctx(),
+                                    );
+                                    ui.close();
+                                }
+                                if ui.button("Rotate right").clicked() {
+                                    self.set_viewer_rotation(
+                                        &path,
+                                        self.viewer_rotation_degrees + 90.0,
+                                        ui.ctx(),
+                                    );
+                                    ui.close();
+                                }
+                                ui.separator();
+                                let mut rotation = self.viewer_rotation_degrees;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut rotation, 0.0..=360.0)
+                                            .text("Rotation")
+                                            .suffix("°")
+                                            .step_by(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    self.set_viewer_rotation(&path, rotation, ui.ctx());
+                                }
+                            });
                         }
+                        ui.menu_button("Image Smoothing", |ui| {
+                            self.show_viewer_sampling_controls(ui);
+                        });
                         if ui.button("🔍 Fit Image / Recenter").clicked() {
                             self.zoom = 1.0;
                             self.offset = egui::Vec2::ZERO;
@@ -1434,36 +1377,38 @@ impl eframe::App for ImageViewer {
 
                         let viewer_texture = self.request_viewer_texture(&resolved_path, ctx);
                         if let Some(texture) = viewer_texture {
-                            let texture_size = texture.size_vec2();
-                            let fit_scale = (draw_rect.width() / texture_size.x)
-                                .min(draw_rect.height() / texture_size.y);
+                            let source_size = self
+                                .viewer_source_sizes
+                                .get(&resolved_path)
+                                .copied()
+                                .unwrap_or_else(|| texture.size().map(|v| v as u32));
+                            let texture_size =
+                                egui::vec2(source_size[0] as f32, source_size[1] as f32);
+                            let angle = self.viewer_rotation_degrees.to_radians();
+                            let rotated_texture_size =
+                                Self::rotated_bounding_size(texture_size, angle);
+                            let fit_scale = (draw_rect.width() / rotated_texture_size.x)
+                                .min(draw_rect.height() / rotated_texture_size.y);
                             let image_rect = egui::Rect::from_center_size(
                                 draw_rect.center(),
                                 texture_size * fit_scale,
                             );
-                            let mut mesh = egui::Mesh::with_texture(texture.id());
-                            mesh.add_rect_with_uv(
+                            let revision = self
+                                .viewer_texture_revisions
+                                .get(&resolved_path)
+                                .copied()
+                                .unwrap_or(0);
+                            self.viewer_detail.paint(
+                                &ui.painter().with_clip_rect(rect),
+                                &resolved_path,
+                                revision,
+                                source_size,
+                                &texture,
                                 image_rect,
-                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                                egui::Color32::WHITE,
+                                angle,
+                                &self.diagnostics,
                             );
-                            let angle = self.viewer_rotation_quarter_turns as f32
-                                * std::f32::consts::FRAC_PI_2;
-                            if angle != 0.0 {
-                                let (sin, cos) = angle.sin_cos();
-                                for vertex in &mut mesh.vertices {
-                                    let relative = vertex.pos - image_rect.center();
-                                    vertex.pos = image_rect.center()
-                                        + egui::vec2(
-                                            relative.x * cos - relative.y * sin,
-                                            relative.x * sin + relative.y * cos,
-                                        );
-                                }
-                            }
-                            ui.painter().add(egui::Shape::mesh(mesh));
                             if let Some(boxes) = self.face_overlay_boxes.get(&path) {
-                                let angle = self.viewer_rotation_quarter_turns as f32
-                                    * std::f32::consts::FRAC_PI_2;
                                 let (sin, cos) = angle.sin_cos();
                                 for bbox in boxes {
                                     let points = [
@@ -1593,27 +1538,27 @@ impl ImageViewer {
                     rows.retain(|candidate| candidate.file_name != source.file_name);
                 }
                 if !payload.video_only {
-                    rows = collapse_sift_grouped_results(
-                        rows,
-                        &indices.sift_root_by_file,
-                        payload.limit,
-                    );
-                } else {
-                    rows.truncate(payload.limit);
+                    rows = collapse_sift_grouped_results(rows, &indices.sift_root_by_file);
                 }
                 let db_roots = get_db_roots();
                 let db_dir_buf = get_db_dir();
                 let db_dir = db_dir_buf.as_path();
-                for row in &mut rows {
-                    row.media_path =
-                        resolve_media_path(&db_roots, db_dir, &row.file_name, row.timestamp_sec)
-                            .ok();
-                    if let Some(path) = &row.media_path {
-                        self.db_filename_by_path
-                            .insert(path.clone(), row.file_name.clone());
+                if self.semantic_result_order == SemanticResultOrder::BestMatch {
+                    for row in &mut rows {
+                        row.media_path = resolve_media_path(
+                            &db_roots,
+                            db_dir,
+                            &row.file_name,
+                            row.timestamp_sec,
+                        )
+                        .ok();
+                        if let Some(path) = &row.media_path {
+                            self.db_filename_by_path
+                                .insert(path.clone(), row.file_name.clone());
+                        }
                     }
                 }
-                if let Some(mut source) = source.take() {
+                if let Some(source) = source.as_mut() {
                     if source.media_path.is_none() {
                         source.media_path = resolve_media_path(
                             &db_roots,
@@ -1629,22 +1574,17 @@ impl ImageViewer {
                         rows.retain(|candidate| candidate.media_path.as_ref() != Some(source_path));
                     }
                     source.score = 1.0;
-                    rows.insert(0, source);
-                    rows.truncate(payload.limit);
                 }
-                for (idx, row) in rows.iter_mut().enumerate() {
-                    row.rank = idx + 1;
-                }
-                self.semantic_status = format!(
-                    "Found {} {} results in {} ms across {} index entries within {}",
+                let status = format!(
+                    "Found {} {} results at or above {:.0}% in {} ms across {} index entries within {}",
                     rows.len(),
                     source_label.as_deref().unwrap_or(&payload.display_label),
+                    payload.match_threshold * 100.0,
                     payload.took_ms,
                     payload.indexed_items,
                     payload.folder_scope
                 );
-                self.semantic_results = rows;
-                self.semantic_results_mode = Some(payload.mode);
+                self.apply_semantic_result_order(rows, payload.mode, status, source, ctx);
                 ctx.request_repaint();
             }
             Ok(Err(error)) => {
@@ -1657,6 +1597,38 @@ impl ImageViewer {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.semantic_status = "Search worker disconnected.".to_string();
             }
+        }
+    }
+
+    fn poll_semantic_date_sort(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.semantic_date_sort_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(payload) => {
+                if payload.generation != self.semantic_date_sort_generation
+                    || payload.order != self.semantic_result_order
+                {
+                    return;
+                }
+                for row in &payload.rows {
+                    if let Some(path) = &row.media_path {
+                        self.db_filename_by_path
+                            .insert(path.clone(), row.file_name.clone());
+                    }
+                }
+                self.replace_semantic_results(payload.rows);
+                self.semantic_results_mode = Some(payload.mode);
+                self.semantic_status = format!(
+                    "{} Date ordering completed in {} ms.",
+                    payload.status, payload.took_ms
+                );
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.semantic_date_sort_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 }

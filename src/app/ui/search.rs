@@ -40,13 +40,143 @@ fn db_filename_for_search(
 }
 
 impl ImageViewer {
+    pub(crate) fn replace_semantic_results(&mut self, rows: Vec<SearchResult>) {
+        self.semantic_results = rows;
+        self.semantic_results_revision = self.semantic_results_revision.wrapping_add(1);
+        self.semantic_gallery_cache_key = None;
+    }
+
+    pub(crate) fn clear_semantic_results(&mut self) {
+        self.semantic_results.clear();
+        self.semantic_results_revision = self.semantic_results_revision.wrapping_add(1);
+        self.semantic_gallery_cache_key = None;
+    }
+
+    pub(crate) fn take_semantic_results(&mut self) -> Vec<SearchResult> {
+        let rows = std::mem::take(&mut self.semantic_results);
+        self.semantic_results_revision = self.semantic_results_revision.wrapping_add(1);
+        self.semantic_gallery_cache_key = None;
+        rows
+    }
+
+    pub(crate) fn cancel_semantic_date_sort(&mut self) {
+        let generation = self.semantic_date_sort_generation.wrapping_add(1);
+        self.semantic_date_sort_generation = generation;
+        self.semantic_date_sort_token
+            .store(generation, std::sync::atomic::Ordering::Release);
+        self.semantic_date_sort_rx = None;
+    }
+
     pub(crate) fn invalidate_background_searches(&mut self) {
         self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
         self.semantic_search_rx = None;
+        self.cancel_semantic_date_sort();
         self.filename_search_generation = self.filename_search_generation.wrapping_add(1);
         self.filename_search_rx = None;
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
+    }
+
+    pub(crate) fn apply_semantic_result_order(
+        &mut self,
+        mut rows: Vec<SearchResult>,
+        mode: SearchMode,
+        status: String,
+        source: Option<SearchResult>,
+        ctx: &egui::Context,
+    ) {
+        self.cancel_semantic_date_sort();
+
+        if self.semantic_result_order == SemanticResultOrder::BestMatch {
+            sort_semantic_results_by_order(&mut rows, self.semantic_result_order, None);
+            if let Some(source) = source {
+                rows.insert(0, source);
+            }
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.rank = index + 1;
+            }
+            self.replace_semantic_results(rows);
+            self.semantic_results_mode = Some(mode);
+            self.semantic_status = status;
+            return;
+        }
+
+        let Some(indices) = self.db_indices.as_ref() else {
+            self.semantic_status = "AI database index is not loaded yet.".to_string();
+            return;
+        };
+        let duplicate_date_index = indices.duplicate_date_index();
+        let db_roots = get_db_roots();
+        let db_dir = get_db_dir();
+        let order = self.semantic_result_order;
+        let generation = self.semantic_date_sort_generation.wrapping_add(1);
+        self.semantic_date_sort_generation = generation;
+        self.semantic_date_sort_token
+            .store(generation, std::sync::atomic::Ordering::Release);
+        let generation_token = Arc::clone(&self.semantic_date_sort_token);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.semantic_date_sort_rx = Some(rx);
+
+        let mut provisional = rows.clone();
+        sort_semantic_results_by_order(&mut provisional, SemanticResultOrder::BestMatch, None);
+        if let Some(source) = source.as_ref() {
+            provisional.insert(0, source.clone());
+        }
+        for (index, row) in provisional.iter_mut().enumerate() {
+            row.rank = index + 1;
+        }
+        self.replace_semantic_results(provisional);
+        self.semantic_results_mode = Some(mode);
+        self.semantic_status = format!(
+            "{status} Sorting {} result(s) by date in the background...",
+            rows.len()
+        );
+
+        let ctx_clone = ctx.clone();
+        let diagnostics = self.diagnostics.clone();
+        std::thread::spawn(move || {
+            let task = diagnostics.task_guard("semantic_date_sort");
+            let started = Instant::now();
+            for row in &mut rows {
+                if generation_token.load(std::sync::atomic::Ordering::Acquire) != generation {
+                    task.complete();
+                    return;
+                }
+                if row.media_path.is_none() {
+                    row.media_path =
+                        resolve_media_path(&db_roots, &db_dir, &row.file_name, row.timestamp_sec)
+                            .ok();
+                }
+            }
+            let Some(oldest_duplicate_dates) = oldest_duplicate_timestamps(
+                &rows,
+                &duplicate_date_index,
+                &db_roots,
+                &generation_token,
+                generation,
+            ) else {
+                task.complete();
+                return;
+            };
+            sort_semantic_results_by_order(&mut rows, order, Some(&oldest_duplicate_dates));
+            if let Some(source) = source {
+                rows.insert(0, source);
+            }
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.rank = index + 1;
+            }
+            let took_ms = started.elapsed().as_millis();
+            let _ = tx.send(SemanticDateSortWorkerResult {
+                generation,
+                order,
+                mode,
+                rows,
+                status,
+                took_ms,
+            });
+            ctx_clone.request_repaint();
+            task.complete();
+        });
     }
 
     pub(crate) fn run_semantic_search_mode(&mut self, mode: SearchMode, ctx: &egui::Context) {
@@ -63,8 +193,9 @@ impl ImageViewer {
             applied_filename_query: self.applied_filename_query.clone(),
             filename_search_results: self.filename_search_results.clone(),
             semantic_folder: self.semantic_folder.clone(),
-            semantic_limit: self.semantic_limit,
+            semantic_match_threshold: self.semantic_match_threshold,
             semantic_video_only: self.semantic_video_only,
+            semantic_result_order: self.semantic_result_order,
             semantic_mode: self.semantic_mode,
             semantic_results: self.semantic_results.clone(),
             semantic_results_mode: self.semantic_results_mode,
@@ -77,8 +208,9 @@ impl ImageViewer {
             && left.applied_filename_query == right.applied_filename_query
             && left.filename_search_results == right.filename_search_results
             && left.semantic_folder == right.semantic_folder
-            && left.semantic_limit == right.semantic_limit
+            && left.semantic_match_threshold.to_bits() == right.semantic_match_threshold.to_bits()
             && left.semantic_video_only == right.semantic_video_only
+            && left.semantic_result_order == right.semantic_result_order
             && left.semantic_mode == right.semantic_mode
             && left.semantic_results_mode == right.semantic_results_mode
             && left.semantic_results.len() == right.semantic_results.len()
@@ -155,10 +287,11 @@ impl ImageViewer {
         self.applied_filename_query = snapshot.applied_filename_query;
         self.filename_search_results = snapshot.filename_search_results;
         self.semantic_folder = snapshot.semantic_folder;
-        self.semantic_limit = snapshot.semantic_limit;
+        self.semantic_match_threshold = snapshot.semantic_match_threshold;
         self.semantic_video_only = snapshot.semantic_video_only;
+        self.semantic_result_order = snapshot.semantic_result_order;
         self.semantic_mode = snapshot.semantic_mode;
-        self.semantic_results = snapshot.semantic_results;
+        self.replace_semantic_results(snapshot.semantic_results);
         self.semantic_results_mode = snapshot.semantic_results_mode;
         self.semantic_status = snapshot.semantic_status;
         self.pending_search_request = None;
@@ -290,13 +423,14 @@ impl ImageViewer {
 
     pub(crate) fn submit_semantic_search(&mut self, ctx: &egui::Context) {
         self.push_search_history();
+        self.cancel_semantic_date_sort();
         if self.semantic_mode == SearchMode::Filename {
             self.apply_filename_search();
             return;
         }
 
         self.pending_semantic_search_mode = Some(self.semantic_mode);
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         let mode_label = match self.semantic_mode {
             SearchMode::Clip => "CLIP",
@@ -473,6 +607,7 @@ impl ImageViewer {
     }
 
     pub(crate) fn search_clip_now(&mut self, ctx: &egui::Context) {
+        self.cancel_semantic_date_sort();
         self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
@@ -480,13 +615,13 @@ impl ImageViewer {
         let folder_scope = self.effective_semantic_folder();
         if q.is_empty() {
             self.semantic_status = "Please enter a search phrase first.".to_string();
-            self.semantic_results.clear();
+            self.clear_semantic_results();
             self.semantic_results_mode = None;
             return;
         }
 
         if let Some(request) = self.clip_query_to_pending_request(&q) {
-            self.semantic_results.clear();
+            self.clear_semantic_results();
             self.run_search_request_now(request, ctx);
             return;
         }
@@ -513,8 +648,7 @@ impl ImageViewer {
             return;
         }
 
-        let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let result_limit = self.semantic_limit;
+        let match_threshold = self.semantic_match_threshold;
         let video_only = self.semantic_video_only;
         let indexed_items = indices.clip_index.entries.len();
         let clip_index = Arc::clone(&indices.clip_index);
@@ -524,7 +658,7 @@ impl ImageViewer {
         self.semantic_search_generation = generation;
         let (tx, rx) = std::sync::mpsc::channel();
         self.semantic_search_rx = Some(rx);
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
@@ -544,9 +678,9 @@ impl ImageViewer {
                             &db_dir,
                             MEDIA_INDEX_TABLE,
                             &query_vector,
-                            pre_limit,
                             video_only,
                             &folder_scope,
+                            match_threshold,
                         ))
                         .ok()
                 });
@@ -554,7 +688,7 @@ impl ImageViewer {
                 search_index(
                     &clip_index,
                     &query_vector,
-                    pre_limit,
+                    match_threshold,
                     video_only,
                     &folder_scope,
                 )
@@ -563,11 +697,11 @@ impl ImageViewer {
                 generation,
                 mode: SearchMode::Clip,
                 rows,
+                match_threshold,
                 took_ms: started.elapsed().as_millis(),
                 indexed_items,
                 folder_scope,
                 display_label: "CLIP".to_string(),
-                limit: result_limit,
                 video_only,
             }));
             ctx_clone.request_repaint();
@@ -606,6 +740,7 @@ impl ImageViewer {
     }
 
     pub(crate) fn search_ocr_now(&mut self, ctx: &egui::Context) {
+        self.cancel_semantic_date_sort();
         self.semantic_search_generation = self.semantic_search_generation.wrapping_add(1);
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
@@ -613,7 +748,7 @@ impl ImageViewer {
         let folder_scope = self.effective_semantic_folder();
         if q.is_empty() {
             self.semantic_status = "Please enter an OCR word or phrase first.".to_string();
-            self.semantic_results.clear();
+            self.clear_semantic_results();
             self.semantic_results_mode = None;
             return;
         }
@@ -622,8 +757,7 @@ impl ImageViewer {
             return;
         };
 
-        let pre_limit = (self.semantic_limit.saturating_mul(6)).max(self.semantic_limit);
-        let result_limit = self.semantic_limit;
+        let match_threshold = self.semantic_match_threshold;
         let video_only = self.semantic_video_only;
         let indexed_items = indices.ocr_index.entries.len();
         let ocr_index = Arc::clone(&indices.ocr_index);
@@ -632,7 +766,7 @@ impl ImageViewer {
         self.semantic_search_generation = generation;
         let (tx, rx) = std::sync::mpsc::channel();
         self.semantic_search_rx = Some(rx);
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
@@ -642,16 +776,16 @@ impl ImageViewer {
         std::thread::spawn(move || {
             let task = diagnostics.task_guard("ocr_search");
             let started = Instant::now();
-            let rows = search_ocr_index(&ocr_index, &q, pre_limit, video_only, &folder_scope);
+            let rows = search_ocr_index(&ocr_index, &q, match_threshold, video_only, &folder_scope);
             let _ = tx.send(Ok(SemanticSearchWorkerResult {
                 generation,
                 mode: SearchMode::Ocr,
                 rows,
+                match_threshold,
                 took_ms: started.elapsed().as_millis(),
                 indexed_items,
                 folder_scope,
                 display_label: "OCR".to_string(),
-                limit: result_limit,
                 video_only,
             }));
             ctx_clone.request_repaint();
@@ -685,6 +819,7 @@ impl ImageViewer {
         source: Option<SearchResult>,
         label: &str,
     ) {
+        self.cancel_semantic_date_sort();
         let Some(indices) = &self.db_indices else {
             return;
         };
@@ -696,8 +831,7 @@ impl ImageViewer {
             );
             return;
         }
-        let pre_limit = (self.semantic_limit.saturating_mul(12)).max(self.semantic_limit + 32);
-        let result_limit = self.semantic_limit;
+        let match_threshold = self.semantic_match_threshold;
         let clip_index = Arc::clone(&indices.clip_index);
         let indexed_items = clip_index.entries.len();
         let db_dir = get_db_dir();
@@ -708,7 +842,7 @@ impl ImageViewer {
         self.semantic_search_rx = Some(rx);
         self.pending_similarity_source = source;
         self.pending_similarity_label = Some(label.clone());
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         self.semantic_status = format!("Searching CLIP similars for {label}...");
         let ctx = self
@@ -730,23 +864,24 @@ impl ImageViewer {
                             &db_dir,
                             MEDIA_INDEX_TABLE,
                             &query_vector,
-                            pre_limit,
                             false,
                             "",
+                            match_threshold,
                         ))
                         .ok()
                 });
-            let rows = ann_result
-                .unwrap_or_else(|| search_index(&clip_index, &query_vector, pre_limit, false, ""));
+            let rows = ann_result.unwrap_or_else(|| {
+                search_index(&clip_index, &query_vector, match_threshold, false, "")
+            });
             let _ = tx.send(Ok(SemanticSearchWorkerResult {
                 generation,
                 mode: SearchMode::Clip,
                 rows,
+                match_threshold,
                 took_ms: started.elapsed().as_millis(),
                 indexed_items,
                 folder_scope: label.to_string(),
                 display_label: "CLIP-similar".to_string(),
-                limit: result_limit,
                 video_only: false,
             }));
             if let Some(ctx) = ctx {
@@ -834,26 +969,26 @@ impl ImageViewer {
         query_faces: Vec<Vec<f32>>,
         label: &str,
     ) {
+        self.cancel_semantic_date_sort();
         let Some(indices) = &self.db_indices else {
             return;
         };
         if query_faces.is_empty() {
             self.semantic_status = format!("No face embeddings available for {label}");
-            self.semantic_results = Vec::new();
+            self.replace_semantic_results(Vec::new());
             self.semantic_results_mode = Some(SearchMode::Clip);
             return;
         }
         let face_index = Arc::clone(&indices.face_index);
         let indexed_items = face_index.entries.len();
         let query_count = query_faces.len();
-        let result_limit = self.semantic_limit;
         let label = label.to_string();
         let db_dir = get_db_dir();
         let generation = self.semantic_search_generation.wrapping_add(1);
         self.semantic_search_generation = generation;
         let (tx, rx) = std::sync::mpsc::channel();
         self.semantic_search_rx = Some(rx);
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         self.pending_similarity_source = None;
         self.pending_similarity_label = None;
@@ -878,23 +1013,22 @@ impl ImageViewer {
                             &db_dir,
                             MEDIA_INDEX_TABLE,
                             &query_faces,
-                            500,
                             FACE_MATCH_MIN_SCORE,
                         ))
                         .ok()
                 });
             let rows = ann_result.unwrap_or_else(|| {
-                search_face_index(&face_index, &query_faces, 500, FACE_MATCH_MIN_SCORE)
+                search_face_index(&face_index, &query_faces, FACE_MATCH_MIN_SCORE)
             });
             let _ = tx.send(Ok(SemanticSearchWorkerResult {
                 generation,
                 mode: SearchMode::Clip,
                 rows,
+                match_threshold: FACE_MATCH_MIN_SCORE,
                 took_ms: started.elapsed().as_millis(),
                 indexed_items,
                 folder_scope: label.clone(),
                 display_label: format!("person ({label})"),
-                limit: result_limit,
                 video_only: false,
             }));
             if let Some(ctx) = ctx {
@@ -1043,7 +1177,7 @@ impl ImageViewer {
         let label = Self::label_for_request(&request);
         self.semantic_mode = SearchMode::Clip;
         self.semantic_query = label.clone();
-        self.semantic_results.clear();
+        self.clear_semantic_results();
         self.semantic_results_mode = None;
         self.pending_search_request = Some(request.clone());
 

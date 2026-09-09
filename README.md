@@ -24,7 +24,7 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 │   │   ├── mod.rs              # Application module wiring and internal facade
 │   │   ├── model.rs            # Shared application state and database/search value types
 │   │   ├── bootstrap.rs        # CLI parsing, daemon socket, and window startup
-│   │   ├── viewer_assets.rs    # Viewer texture sizing and conversion
+│   │   ├── viewer_assets.rs    # Viewer previews, visible-region detail loading, and texture limits
 │   │   ├── metadata.rs         # exiftool and ffprobe integration
 │   │   ├── binary.rs           # Image binary/chunk inspection parsers
 │   │   ├── media_scan.rs       # Folder media discovery
@@ -44,6 +44,7 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 │   │       ├── search.rs       # Search controls and related-media actions
 │   │       ├── sift.rs         # SIFT compare, align, and repair actions
 │   │       ├── navigation.rs   # Folder scans, comparison paths, and navigation
+│   │       ├── toolbar.rs      # Compact single-row toolbar and responsive action menus
 │   │       ├── viewer.rs       # Viewer, metadata panel, editor, and texture cache
 │   │       ├── gallery.rs      # Gallery grid and duplicate actions
 │   │       └── home.rs         # File-browser home page
@@ -212,6 +213,12 @@ cargo run --release -- --no-daemon /path/to/first.jpg /path/to/second.jpg /path/
 
 The normal `Ctrl+O` picker opens one file. To enter paths inside Iris, use `Compare Paths` or `Ctrl+Shift+O` and enter one path per line. Select one file with `Ctrl+O` for normal single-file viewing. In comparison mode, `Sync View` shares the current zoom and pan position across every image; when it is off, each image keeps its own view state. `SIFT Align All` uses the first image as the reference, computes pairwise SIFT homographies in a background worker, and displays aligned temporary copies without changing the source files. Run `SIFT Re-align All` to discard the temporary results and recompute every alignment. It is intended for still images; files that cannot produce a reliable homography remain unwarped and are reported in the status.
 
+Large images use a small preview when fitted to the window. Zooming loads a sharper crop of the visible area in the background, including for tall screenshots and aligned comparison images. Nearby pans reuse the decoded source and an overscan margin. Iris keeps one detail texture of at most 4096 x 4096 pixels (64 MiB of RGBA pixels) and one cached decoded source of at most 128 MiB; larger sources are released after each crop. PNG and JPEG files still require a full decode in system memory before cropping. The detail cache is cleared on image changes, leaving the viewer, and saving edits.
+
+The toolbar stays one row high. `File` contains Filesystem, Open File, and Compare Paths. `Gallery` and `Layout` are highlighted when active, and their shortcuts appear in tooltips. The filename uses the remaining width and is shortened with an ellipsis when needed; hover it for the full name, dimensions, and file size. Comparison actions move into `More` when space is tight. On very narrow windows, controls that no longer fit remain available through `File`. Keyboard shortcuts are unchanged.
+
+The mouse wheel zooms up to 256 times the fitted view. Use the toolbar's smoothing dropdown, or the right-click menu's `Image Smoothing` submenu, to choose how enlarged images look. `Smooth` is the default; `Pixel Sharp` shows distinct source pixels. Downscaling stays smooth in both modes. The choice applies to the current window, including comparison images, and switches immediately without reloading the image or creating a second GPU texture. At native zoom and above, Iris requires a full-resolution crop instead of reusing a slightly downsampled one. Enlarging the image cannot add detail beyond the original pixels.
+
 Reuse an existing window:
 
 ```bash
@@ -332,6 +339,7 @@ Filename, CLIP, and OCR share one search UI in Iris.
 - Filename search scans the visible filesystem tree.
 - CLIP search uses the LanceDB CLIP ANN side table and can search by text, pasted image, or image path.
 - OCR search supports normal multi-term matching and quoted exact phrases.
+- CLIP and OCR searches retrieve every indexed result meeting the `Min match` threshold; there is no fixed 500-result cap. The existing gallery display still collapses images from the same SIFT duplicate group to one representative. The default is `0%`, matching the previous behavior. CLIP uses its similarity score, while OCR uses the fraction of query words found (quoted phrases count as an exact match).
 - Folder scope can be blank for all indexed folders, an absolute path, a collection-relative path, a partial path section, or a single folder segment.
 
 ## Notes For Public Repo Hygiene

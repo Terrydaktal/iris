@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, ListArray, RecordBatch,
     RecordBatchIterator, StringArray, StructArray,
 };
 use futures::TryStreamExt;
@@ -26,6 +26,7 @@ mod binary;
 mod bootstrap;
 mod clipboard;
 mod diagnostics;
+mod drag_out;
 mod formatting;
 mod hashing;
 mod media_scan;
@@ -50,6 +51,7 @@ pub(crate) use clipboard::{
 #[cfg(test)]
 pub(crate) use diagnostics::build_info_value;
 pub(crate) use diagnostics::{DiagnosticState, handle_cli};
+pub(crate) use drag_out::OutboundFileDrag;
 pub(crate) use formatting::{
     file_resolution_and_size, file_size_and_modified, raw_exif_layout_job, sift_info_line,
     wrapping_monospace_path,
@@ -66,13 +68,15 @@ pub(crate) use metadata::{
     run_metadata_worker,
 };
 pub(crate) use model::{
-    ClipEntry, ClipIndex, ClipTextEncoder, CropDragMode, DatabaseIndices, DatabaseLoadMessage,
-    FaceComparisonResult, FaceDetail, FaceEntry, FaceIndex, FilenameSearchWorkerResult,
-    FlatRefreshResult, GalleryFilterKey, GalleryImageSnapshot, GallerySelection, ImageEditor,
-    ImageViewState, ImageViewer, MetadataJobQueue, MetadataLoadRequest, MetadataLoadResult,
-    OcrEntry, OcrIndex, OnDemandEmbedResult, OpenRequest, PendingSearchRequest, SearchMode,
-    SearchResult, SearchSnapshot, SemanticSearchWorkerResult, SidePanelMode, SiftAlignAllResult,
-    SiftInfo, SiftRepairResult, SimilarFile, SupplementalDbData, VideoFramePhash,
+    ClipEntry, ClipIndex, ClipTextEncoder, CropDragMode, DEFAULT_MATCH_THRESHOLD, DatabaseIndices,
+    DatabaseLoadMessage, DuplicateDateIndex, FaceComparisonResult, FaceDetail, FaceEntry,
+    FaceIndex, FilenameSearchWorkerResult, FlatRefreshResult, GalleryFilterKey,
+    GalleryImageSnapshot, GallerySelection, ImageEditor, ImageViewState, ImageViewer,
+    MetadataJobQueue, MetadataLoadRequest, MetadataLoadResult, OcrEntry, OcrIndex,
+    OnDemandEmbedResult, OpenRequest, PendingSearchRequest, SearchMode, SearchResult,
+    SearchSnapshot, SemanticDateSortWorkerResult, SemanticResultOrder, SemanticSearchWorkerResult,
+    SidePanelMode, SiftAlignAllResult, SiftInfo, SiftRepairResult, SimilarFile, SupplementalDbData,
+    VideoFramePhash,
 };
 pub(crate) use paths::{
     MEDIA_INDEX_TABLE, db_filename_from_video_still_path, file_matches_folder, get_db_dir,
@@ -90,9 +94,10 @@ pub(crate) use search::search_face_ann;
 pub(crate) use search::{
     FACE_MATCH_MIN_SCORE, collapse_sift_grouped_results, dot, draw_embedding_markers,
     duplicate_database_detail_lines, load_clip_database_index, load_supplemental_database_indices,
-    search_face_index, search_index, search_ocr_index, similarity_to_active, string_col,
+    oldest_duplicate_timestamps, search_face_index, search_index, search_ocr_index,
+    similarity_to_active, sort_semantic_results_by_order, string_col,
 };
 pub(crate) use viewer_assets::{
-    IMAGE_VIEWER_TOP_BAR_HEIGHT, INITIAL_IMAGE_DISPLAY_HEIGHT, viewer_color_image,
-    viewer_color_image_ref,
+    IMAGE_VIEWER_TOP_BAR_HEIGHT, INITIAL_IMAGE_DISPLAY_HEIGHT, ViewerDetail, ViewerPreview,
+    ViewerSampling, ViewerTexture, viewer_color_image_ref,
 };

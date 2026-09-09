@@ -1,5 +1,84 @@
 use super::*;
 
+#[test]
+fn viewer_zoom_stops_moving_at_both_limits() {
+    for (zoom, factor) in [
+        (ImageViewState::MAX_ZOOM, 1.2),
+        (ImageViewState::MIN_ZOOM, 0.8),
+    ] {
+        let offset = egui::vec2(85.5, 125.25);
+        let mut view = ImageViewState { zoom, offset };
+        for step in 0..100 {
+            let anchor = egui::vec2(-148.25 + step as f32, -339.5);
+            assert!(!view.zoom_at(factor, anchor));
+            assert_eq!(view.zoom, zoom);
+            assert_eq!(view.offset, offset);
+        }
+    }
+}
+
+#[test]
+fn viewer_zoom_preserves_cursor_anchor_when_crossing_limits() {
+    for (zoom, factor, expected_zoom) in [
+        (
+            ImageViewState::MAX_ZOOM - 1.0,
+            1.2,
+            ImageViewState::MAX_ZOOM,
+        ),
+        (0.06, 0.5, 0.05),
+        (1.0, 1.2, 1.2),
+        (1.0, 0.8, 0.8),
+    ] {
+        let mut view = ImageViewState {
+            zoom,
+            offset: egui::vec2(85.5, 125.25),
+        };
+        let anchor = egui::vec2(-148.25, -339.5);
+        let image_point_at_cursor = (anchor - view.offset) / view.zoom;
+        assert!(view.zoom_at(factor, anchor));
+        assert_eq!(view.zoom, expected_zoom);
+        let projected_cursor = view.offset + image_point_at_cursor * view.zoom;
+        assert!((projected_cursor - anchor).length() < 0.001);
+    }
+}
+
+#[test]
+fn viewer_zoom_can_reverse_after_scrolling_past_limit() {
+    for (zoom, outward, inward) in [
+        (ImageViewState::MAX_ZOOM, 1.2, 0.9),
+        (ImageViewState::MIN_ZOOM, 0.8, 1.1),
+    ] {
+        let mut view = ImageViewState {
+            zoom,
+            offset: egui::vec2(150.0, 275.0),
+        };
+        let anchor = egui::vec2(-120.0, -230.0);
+        let image_point_at_cursor = (anchor - view.offset) / view.zoom;
+        for _ in 0..10 {
+            view.zoom_at(outward, anchor);
+        }
+        assert!(view.zoom_at(inward, anchor));
+        assert_eq!(view.zoom, zoom * inward);
+        let projected_cursor = view.offset + image_point_at_cursor * view.zoom;
+        assert!((projected_cursor - anchor).length() < 0.001);
+    }
+}
+
+#[test]
+fn viewer_zoom_continues_beyond_previous_limit() {
+    let anchor = egui::vec2(-120.0, -230.0);
+    let mut view = ImageViewState {
+        zoom: 32.0,
+        offset: egui::vec2(150.0, 275.0),
+    };
+    let image_point_at_cursor = (anchor - view.offset) / view.zoom;
+    for expected_zoom in [64.0, 128.0, 256.0] {
+        assert!(view.zoom_at(2.0, anchor));
+        assert_eq!(view.zoom, expected_zoom);
+        assert!((view.offset + image_point_at_cursor * view.zoom - anchor).length() < 0.001);
+    }
+}
+
 fn test_roots() -> HashMap<String, PathBuf> {
     HashMap::from([("collection".to_string(), PathBuf::from("/media/library"))])
 }
@@ -150,4 +229,88 @@ fn raw_exif_highlights_only_resolution_and_file_dates() {
     assert!(!formatting::is_important_exif_line(
         "[ExifTool] ExifTool Version Number : 13.00"
     ));
+}
+
+#[test]
+fn semantic_results_can_be_sorted_by_file_date_in_both_directions() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!(
+        "iris-semantic-date-sort-test-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp_dir).expect("create semantic date sort test directory");
+
+    let oldest_path = temp_dir.join("oldest.jpg");
+    let middle_path = temp_dir.join("middle.jpg");
+    let newest_path = temp_dir.join("newest.jpg");
+    std::fs::File::create(&oldest_path)
+        .expect("create oldest test file")
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(120))
+        .expect("set oldest test file date");
+    std::fs::File::create(&middle_path)
+        .expect("create middle test file")
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+        .expect("set middle test file date");
+    std::fs::File::create(&newest_path)
+        .expect("create newest test file")
+        .set_modified(SystemTime::now())
+        .expect("set newest test file date");
+
+    let make_result = |name: &str, path: &Path, score: f32| SearchResult {
+        rank: 0,
+        score,
+        file_name: name.to_string(),
+        is_video: false,
+        timestamp_sec: 0.0,
+        media_path: Some(path.to_path_buf()),
+        ocr_term_hits: 0,
+        ocr_query_terms: 0,
+        ocr_phrase_query: false,
+    };
+    let mut rows = vec![
+        make_result("collection/oldest.jpg", &oldest_path, 0.9),
+        make_result("collection/newest.jpg", &newest_path, 0.1),
+        make_result("collection/middle.jpg", &middle_path, 0.5),
+    ];
+
+    sort_semantic_results_by_order(&mut rows, SemanticResultOrder::DateDescending, None);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.file_name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "collection/newest.jpg",
+            "collection/middle.jpg",
+            "collection/oldest.jpg"
+        ]
+    );
+
+    sort_semantic_results_by_order(&mut rows, SemanticResultOrder::DateAscending, None);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.file_name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "collection/oldest.jpg",
+            "collection/middle.jpg",
+            "collection/newest.jpg"
+        ]
+    );
+
+    sort_semantic_results_by_order(&mut rows, SemanticResultOrder::BestMatch, None);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.file_name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "collection/oldest.jpg",
+            "collection/middle.jpg",
+            "collection/newest.jpg"
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
 }

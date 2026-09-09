@@ -1,6 +1,46 @@
 use super::*;
 
+impl ImageViewState {
+    pub(crate) const MIN_ZOOM: f32 = 0.05;
+    pub(crate) const MAX_ZOOM: f32 = 256.0;
+
+    pub(crate) fn zoom_at(&mut self, zoom_factor: f32, anchor: egui::Vec2) -> bool {
+        let zoom = (self.zoom * zoom_factor).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        if zoom == self.zoom {
+            return false;
+        }
+        // Keep the cursor over the same image point using the actual scale
+        // change, not the requested one, which can exceed the zoom limits.
+        let actual_factor = zoom / self.zoom;
+        self.offset = anchor - (anchor - self.offset) * actual_factor;
+        self.zoom = zoom;
+        true
+    }
+}
+
 impl ImageViewer {
+    pub(crate) fn show_viewer_sampling_controls(&mut self, ui: &mut egui::Ui) {
+        let mut sampling = self.viewer_sampling;
+        ui.selectable_value(&mut sampling, ViewerSampling::Smooth, "Smooth")
+            .on_hover_text("Smooth enlarged text and edges. This is the default.");
+        ui.selectable_value(&mut sampling, ViewerSampling::PixelSharp, "Pixel Sharp")
+            .on_hover_text(
+                "Show distinct source pixels when enlarged, without smoothing them together.",
+            );
+        self.set_viewer_sampling(sampling, ui.ctx());
+    }
+
+    pub(crate) fn set_viewer_sampling(&mut self, sampling: ViewerSampling, ctx: &egui::Context) {
+        if sampling != self.viewer_sampling {
+            self.viewer_sampling = sampling;
+            for texture in self.viewer_textures.values_mut() {
+                texture.set_sampling(sampling);
+            }
+            self.viewer_detail.set_sampling(sampling);
+            ctx.request_repaint();
+        }
+    }
+
     fn request_metadata_load(&mut self, load_exif: bool, load_layout: bool) {
         let Some(path) = self.images.get(self.current_index).cloned() else {
             self.metadata_generation = self.metadata_generation.wrapping_add(1);
@@ -141,6 +181,8 @@ impl ImageViewer {
         }
         self.viewer_textures
             .retain(|path, _| keep_paths.contains(path));
+        self.viewer_source_sizes
+            .retain(|path, _| keep_paths.contains(path));
         self.viewer_texture_failed
             .retain(|path| keep_paths.contains(path));
         self.viewer_texture_revisions
@@ -155,7 +197,7 @@ impl ImageViewer {
         ctx: &egui::Context,
     ) -> Option<egui::TextureHandle> {
         if let Some(texture) = self.viewer_textures.get(path) {
-            return Some(texture.clone());
+            return Some(texture.handle.clone());
         }
         if self.viewer_texture_failed.contains(path) {
             let retry_ready = self
@@ -188,7 +230,7 @@ impl ImageViewer {
             rayon::spawn(move || {
                 let task = diagnostics.task_guard("viewer_texture_decode");
                 let result = image::open(&path)
-                    .map(viewer_color_image)
+                    .map(ViewerPreview::from_image)
                     .map_err(|err| format!("{}: {err}", path.display()));
                 let _ = tx.send((path, revision, result));
                 ctx.request_repaint();
@@ -210,22 +252,17 @@ impl ImageViewer {
             resolved_path
         };
         let viewer_rotation = if self.viewer_rotation_path.as_deref() == Some(path) {
-            self.viewer_rotation_quarter_turns
+            self.viewer_rotation_degrees
         } else {
-            0
+            0.0
         };
         match image::open(&source_path) {
-            Ok(mut image) => {
-                image = match viewer_rotation {
-                    1 => image.rotate90(),
-                    2 => image.rotate180(),
-                    3 => image.rotate270(),
-                    _ => image,
-                };
+            Ok(image) => {
                 self.image_editor = Some(ImageEditor {
                     texture: Self::editor_texture(ctx, &image),
                     source_path,
                     image,
+                    rotation_degrees: viewer_rotation,
                     crop_min: egui::pos2(0.0, 0.0),
                     crop_max: egui::pos2(1.0, 1.0),
                     crop_drag_mode: None,
@@ -242,38 +279,135 @@ impl ImageViewer {
         ctx.request_repaint();
     }
 
-    pub(crate) fn rotate_editor_image(
-        editor: &mut ImageEditor,
-        quarter_turns: i32,
-        ctx: &egui::Context,
-    ) {
-        let old_min = editor.crop_min;
-        let old_max = editor.crop_max;
-        let (new_min, new_max, rotated) = match quarter_turns.rem_euclid(4) {
-            1 => (
-                egui::pos2(1.0 - old_max.y, old_min.x),
-                egui::pos2(1.0 - old_min.y, old_max.x),
-                editor.image.rotate90(),
-            ),
-            2 => (
-                egui::pos2(1.0 - old_max.x, 1.0 - old_max.y),
-                egui::pos2(1.0 - old_min.x, 1.0 - old_min.y),
-                editor.image.rotate180(),
-            ),
-            3 => (
-                egui::pos2(old_min.y, 1.0 - old_max.x),
-                egui::pos2(old_max.y, 1.0 - old_min.x),
-                editor.image.rotate270(),
-            ),
-            _ => return,
-        };
-        editor.image = rotated;
-        editor.crop_min = new_min;
-        editor.crop_max = new_max;
-        editor.crop_drag_mode = None;
-        editor.crop_drag_initial_min = new_min;
-        editor.crop_drag_initial_max = new_max;
-        editor.texture = Self::editor_texture(ctx, &editor.image);
+    pub(crate) fn normalized_rotation_degrees(degrees: f32) -> f32 {
+        let normalized = degrees.rem_euclid(360.0);
+        if normalized.abs() < 0.001 || (360.0 - normalized).abs() < 0.001 {
+            0.0
+        } else {
+            normalized
+        }
+    }
+
+    pub(crate) fn set_viewer_rotation(&mut self, path: &Path, degrees: f32, ctx: &egui::Context) {
+        self.viewer_rotation_degrees = Self::normalized_rotation_degrees(degrees);
+        self.viewer_rotation_path = Some(path.to_path_buf());
+        self.zoom = 1.0;
+        self.offset = egui::Vec2::ZERO;
+        self.apply_comparison_view_state_to_all();
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn rotated_bounding_size(size: egui::Vec2, angle: f32) -> egui::Vec2 {
+        let (sin, cos) = angle.sin_cos();
+        egui::vec2(
+            size.x * cos.abs() + size.y * sin.abs(),
+            size.x * sin.abs() + size.y * cos.abs(),
+        )
+    }
+
+    fn rotate_point(point: egui::Pos2, center: egui::Pos2, angle: f32) -> egui::Pos2 {
+        let relative = point - center;
+        let (sin, cos) = angle.sin_cos();
+        center
+            + egui::vec2(
+                relative.x * cos - relative.y * sin,
+                relative.x * sin + relative.y * cos,
+            )
+    }
+
+    fn rotate_image_degrees(
+        image: &image::DynamicImage,
+        degrees: f32,
+    ) -> Result<image::DynamicImage> {
+        let degrees = Self::normalized_rotation_degrees(degrees);
+        let rounded = degrees.round();
+        if (degrees - rounded).abs() < 0.001 {
+            match rounded as i32 {
+                0 | 360 => return Ok(image.clone()),
+                90 => return Ok(image.rotate90()),
+                180 => return Ok(image.rotate180()),
+                270 => return Ok(image.rotate270()),
+                _ => {}
+            }
+        }
+
+        let source = image.to_rgba8();
+        let source_width = source.width();
+        let source_height = source.height();
+        let angle = degrees.to_radians();
+        let bounds = Self::rotated_bounding_size(
+            egui::vec2(source_width as f32, source_height as f32),
+            angle,
+        );
+        let output_width = bounds.x.ceil().max(1.0) as u32;
+        let output_height = bounds.y.ceil().max(1.0) as u32;
+        let source_center_x = (source_width.saturating_sub(1)) as f32 / 2.0;
+        let source_center_y = (source_height.saturating_sub(1)) as f32 / 2.0;
+        let output_center_x = (output_width.saturating_sub(1)) as f32 / 2.0;
+        let output_center_y = (output_height.saturating_sub(1)) as f32 / 2.0;
+        let (sin, cos) = angle.sin_cos();
+        let source_bytes = source.as_raw();
+        let source_stride = source_width as usize * 4;
+        let output_stride = output_width as usize * 4;
+        let output_len = output_stride
+            .checked_mul(output_height as usize)
+            .ok_or_else(|| anyhow!("Rotated image dimensions are too large"))?;
+        let mut output = vec![0_u8; output_len];
+
+        output
+            .par_chunks_mut(output_stride)
+            .enumerate()
+            .for_each(|(output_y, row)| {
+                let dy = output_y as f32 - output_center_y;
+                for output_x in 0..output_width as usize {
+                    let dx = output_x as f32 - output_center_x;
+                    let source_x = dx * cos + dy * sin + source_center_x;
+                    let source_y = -dx * sin + dy * cos + source_center_y;
+                    if source_x < 0.0
+                        || source_y < 0.0
+                        || source_x > source_width.saturating_sub(1) as f32
+                        || source_y > source_height.saturating_sub(1) as f32
+                    {
+                        continue;
+                    }
+
+                    let x0 = source_x.floor() as usize;
+                    let y0 = source_y.floor() as usize;
+                    let x1 = (x0 + 1).min(source_width.saturating_sub(1) as usize);
+                    let y1 = (y0 + 1).min(source_height.saturating_sub(1) as usize);
+                    let x_fraction = source_x - x0 as f32;
+                    let y_fraction = source_y - y0 as f32;
+                    let samples = [
+                        (x0, y0, (1.0 - x_fraction) * (1.0 - y_fraction)),
+                        (x1, y0, x_fraction * (1.0 - y_fraction)),
+                        (x0, y1, (1.0 - x_fraction) * y_fraction),
+                        (x1, y1, x_fraction * y_fraction),
+                    ];
+                    let mut weighted_alpha = 0.0_f32;
+                    let mut premultiplied = [0.0_f32; 3];
+                    for (sample_x, sample_y, weight) in samples {
+                        let offset = sample_y * source_stride + sample_x * 4;
+                        let alpha = source_bytes[offset + 3] as f32;
+                        weighted_alpha += alpha * weight;
+                        for channel in 0..3 {
+                            premultiplied[channel] +=
+                                source_bytes[offset + channel] as f32 * alpha * weight;
+                        }
+                    }
+                    let destination = &mut row[output_x * 4..output_x * 4 + 4];
+                    if weighted_alpha > 0.0 {
+                        for channel in 0..3 {
+                            destination[channel] =
+                                (premultiplied[channel] / weighted_alpha).round() as u8;
+                        }
+                    }
+                    destination[3] = weighted_alpha.round() as u8;
+                }
+            });
+
+        image::RgbaImage::from_raw(output_width, output_height, output)
+            .map(image::DynamicImage::ImageRgba8)
+            .ok_or_else(|| anyhow!("Unable to construct rotated image buffer"))
     }
 
     pub(crate) fn edited_copy_path(source: &Path) -> PathBuf {
@@ -312,6 +446,7 @@ impl ImageViewer {
             bail!("Crop area cannot be empty");
         }
         let cropped = editor.image.crop_imm(left, top, width, height);
+        let edited = Self::rotate_image_degrees(&cropped, editor.rotation_degrees)?;
         let format = image::ImageFormat::from_path(destination)
             .with_context(|| format!("Unsupported output format: {}", destination.display()))?;
         if overwrite {
@@ -332,12 +467,12 @@ impl ImageViewer {
                     .unwrap_or_default(),
                 extension,
             ));
-            cropped.save_with_format(&temp_path, format)?;
+            edited.save_with_format(&temp_path, format)?;
             std::fs::rename(&temp_path, destination)?;
         } else {
-            cropped.save_with_format(destination, format)?;
+            edited.save_with_format(destination, format)?;
         }
-        Ok(cropped)
+        Ok(edited)
     }
 
     pub(crate) fn refresh_after_image_edit(
@@ -346,6 +481,7 @@ impl ImageViewer {
         edited_image: image::DynamicImage,
         ctx: &egui::Context,
     ) {
+        self.viewer_detail.clear();
         let mut cache_paths = HashSet::from([path.to_path_buf()]);
         for candidate in &self.images {
             if candidate == path || self.resolve_actual_path(candidate) == path {
@@ -374,15 +510,21 @@ impl ImageViewer {
                 .remove(cache_path.as_path());
             ctx.forget_image(&format!("file://{}", cache_path.to_string_lossy()));
         }
-        let texture = ctx.load_texture(
+        let preview = ViewerPreview::from_image(edited_image);
+        let native_resolution = preview.is_native_resolution();
+        let texture = ViewerTexture::new(
+            ctx,
             format!("viewer_image edited: {}:{latest_revision}", path.display()),
-            viewer_color_image(edited_image),
-            egui::TextureOptions::LINEAR,
+            preview.image,
+            native_resolution,
+            self.viewer_sampling,
         );
         for cache_path in cache_paths {
+            self.viewer_source_sizes
+                .insert(cache_path.clone(), preview.source_size);
             self.viewer_textures.insert(cache_path, texture.clone());
         }
-        self.viewer_rotation_quarter_turns = 0;
+        self.viewer_rotation_degrees = 0.0;
         self.viewer_rotation_path = self.images.get(self.current_index).cloned();
         self.gallery_filter_cache_key = None;
         self.side_panel_metadata_path = None;
@@ -406,14 +548,21 @@ impl ImageViewer {
                     ui.strong("Crop image");
                     ui.separator();
                     if ui.button("Rotate left").clicked() {
-                        Self::rotate_editor_image(editor_for_ui, 3, ctx);
+                        editor_for_ui.rotation_degrees = Self::normalized_rotation_degrees(
+                            editor_for_ui.rotation_degrees - 90.0,
+                        );
                     }
                     if ui.button("Rotate right").clicked() {
-                        Self::rotate_editor_image(editor_for_ui, 1, ctx);
+                        editor_for_ui.rotation_degrees = Self::normalized_rotation_degrees(
+                            editor_for_ui.rotation_degrees + 90.0,
+                        );
                     }
-                    if ui.button("Rotate 180").clicked() {
-                        Self::rotate_editor_image(editor_for_ui, 2, ctx);
-                    }
+                    ui.add(
+                        egui::Slider::new(&mut editor_for_ui.rotation_degrees, 0.0..=360.0)
+                            .text("Rotation")
+                            .suffix("°")
+                            .step_by(1.0),
+                    );
                     if ui.button("Reset crop").clicked() {
                         editor_for_ui.crop_min = egui::pos2(0.0, 0.0);
                         editor_for_ui.crop_max = egui::pos2(1.0, 1.0);
@@ -469,28 +618,28 @@ impl ImageViewer {
                 }
 
                 let available = ui.available_size();
-                let image_aspect = editor_for_ui.image.width() as f32 / editor_for_ui.image.height() as f32;
-                let available_aspect = available.x / available.y.max(1.0);
-                let draw_size = if available_aspect > image_aspect {
-                    egui::vec2(available.y * image_aspect, available.y)
-                } else {
-                    egui::vec2(available.x, available.x / image_aspect)
-                };
+                let source_size = egui::vec2(
+                    editor_for_ui.image.width() as f32,
+                    editor_for_ui.image.height() as f32,
+                );
+                let angle = editor_for_ui.rotation_degrees.to_radians();
+                let rotated_source_size = Self::rotated_bounding_size(source_size, angle);
+                let fit_scale = (available.x / rotated_source_size.x.max(1.0))
+                    .min(available.y / rotated_source_size.y.max(1.0));
+                let draw_size = source_size * fit_scale;
+                let rotated_draw_size = rotated_source_size * fit_scale;
                 let (viewport_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(viewport_rect.center(), draw_size);
+                let rotated_bounds =
+                    egui::Rect::from_center_size(viewport_rect.center(), rotated_draw_size);
                 let crop_response = ui.interact(
-                    image_rect.expand(12.0),
+                    rotated_bounds.expand(12.0),
                     ui.make_persistent_id("embedded_image_crop"),
                     egui::Sense::click_and_drag(),
                 );
-                ui.painter().image(
-                    editor_for_ui.texture.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-
+                let rotate_point = |point| Self::rotate_point(point, image_rect.center(), angle);
                 let pointer_to_normalized = |pointer: egui::Pos2| {
+                    let pointer = Self::rotate_point(pointer, image_rect.center(), -angle);
                     egui::pos2(
                         ((pointer.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0),
                         ((pointer.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0),
@@ -506,9 +655,30 @@ impl ImageViewer {
                         image_rect.top() + editor_for_ui.crop_max.y * image_rect.height(),
                     ),
                 );
+                let paint_image_region =
+                    |rect: egui::Rect, uv: egui::Rect, tint: egui::Color32| {
+                        let mut mesh = egui::Mesh::with_texture(editor_for_ui.texture.id());
+                        mesh.add_rect_with_uv(rect, uv, tint);
+                        for vertex in &mut mesh.vertices {
+                            vertex.pos = rotate_point(vertex.pos);
+                        }
+                        ui.painter().add(egui::Shape::mesh(mesh));
+                    };
+                paint_image_region(
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_gray(90),
+                );
+                paint_image_region(
+                    crop_rect,
+                    egui::Rect::from_min_max(editor_for_ui.crop_min, editor_for_ui.crop_max),
+                    egui::Color32::WHITE,
+                );
+
                 let handle_distance = 14.0;
                 if crop_response.hovered() {
                     if let Some(pointer) = ctx.pointer_hover_pos() {
+                        let pointer = Self::rotate_point(pointer, image_rect.center(), -angle);
                         let near_left = (pointer.x - crop_rect.left()).abs() <= handle_distance;
                         let near_right = (pointer.x - crop_rect.right()).abs() <= handle_distance;
                         let near_top = (pointer.y - crop_rect.top()).abs() <= handle_distance;
@@ -535,14 +705,20 @@ impl ImageViewer {
                 }
                 if crop_response.drag_started() {
                     if let Some(pointer) = crop_response.interact_pointer_pos() {
-                        let near_left = (pointer.x - crop_rect.left()).abs() <= handle_distance;
-                        let near_right = (pointer.x - crop_rect.right()).abs() <= handle_distance;
-                        let near_top = (pointer.y - crop_rect.top()).abs() <= handle_distance;
-                        let near_bottom = (pointer.y - crop_rect.bottom()).abs() <= handle_distance;
-                        let within_x = pointer.x >= crop_rect.left() - handle_distance
-                            && pointer.x <= crop_rect.right() + handle_distance;
-                        let within_y = pointer.y >= crop_rect.top() - handle_distance
-                            && pointer.y <= crop_rect.bottom() + handle_distance;
+                        let unrotated_pointer =
+                            Self::rotate_point(pointer, image_rect.center(), -angle);
+                        let near_left =
+                            (unrotated_pointer.x - crop_rect.left()).abs() <= handle_distance;
+                        let near_right =
+                            (unrotated_pointer.x - crop_rect.right()).abs() <= handle_distance;
+                        let near_top =
+                            (unrotated_pointer.y - crop_rect.top()).abs() <= handle_distance;
+                        let near_bottom =
+                            (unrotated_pointer.y - crop_rect.bottom()).abs() <= handle_distance;
+                        let within_x = unrotated_pointer.x >= crop_rect.left() - handle_distance
+                            && unrotated_pointer.x <= crop_rect.right() + handle_distance;
+                        let within_y = unrotated_pointer.y >= crop_rect.top() - handle_distance
+                            && unrotated_pointer.y <= crop_rect.bottom() + handle_distance;
                         editor_for_ui.crop_drag_mode = Some(if near_left && near_top {
                             CropDragMode::TopLeft
                         } else if near_right && near_top {
@@ -559,7 +735,7 @@ impl ImageViewer {
                             CropDragMode::Top
                         } else if near_bottom && within_x {
                             CropDragMode::Bottom
-                        } else if crop_rect.contains(pointer) {
+                        } else if crop_rect.contains(unrotated_pointer) {
                             CropDragMode::Move
                         } else {
                             CropDragMode::New
@@ -625,33 +801,19 @@ impl ImageViewer {
                 if crop_response.drag_stopped() {
                     editor_for_ui.crop_drag_mode = None;
                 }
-                let shade = egui::Color32::from_black_alpha(150);
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(image_rect.min, egui::pos2(image_rect.right(), crop_rect.top())),
-                    0.0,
-                    shade,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(image_rect.left(), crop_rect.bottom()), image_rect.max),
-                    0.0,
-                    shade,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(image_rect.left(), crop_rect.top()), egui::pos2(crop_rect.left(), crop_rect.bottom())),
-                    0.0,
-                    shade,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(crop_rect.right(), crop_rect.top()), egui::pos2(image_rect.right(), crop_rect.bottom())),
-                    0.0,
-                    shade,
-                );
-                ui.painter().rect_stroke(
-                    crop_rect,
-                    0.0,
-                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    egui::StrokeKind::Inside,
-                );
+                let crop_points = [
+                    crop_rect.left_top(),
+                    crop_rect.right_top(),
+                    crop_rect.right_bottom(),
+                    crop_rect.left_bottom(),
+                ]
+                .map(rotate_point);
+                for edge in 0..4 {
+                    ui.painter().line_segment(
+                        [crop_points[edge], crop_points[(edge + 1) % 4]],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+                }
                 for handle in [
                     crop_rect.left_top(),
                     crop_rect.right_top(),
@@ -662,6 +824,7 @@ impl ImageViewer {
                     egui::pos2(crop_rect.left(), crop_rect.center().y),
                     egui::pos2(crop_rect.right(), crop_rect.center().y),
                 ] {
+                    let handle = rotate_point(handle);
                     ui.painter().circle_filled(handle, 5.0, egui::Color32::WHITE);
                     ui.painter().circle_stroke(
                         handle,
@@ -840,5 +1003,39 @@ impl ImageViewer {
 
     pub(crate) fn current_folder_has_db_mappings(&self) -> bool {
         self.folder_has_db_mappings(&self.default_semantic_folder().to_string_lossy())
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use image::GenericImageView as _;
+
+    #[test]
+    fn arbitrary_rotation_expands_the_output_without_clipping() {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            2,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+
+        let quarter_turn = ImageViewer::rotate_image_degrees(&source, 90.0).unwrap();
+        let diagonal = ImageViewer::rotate_image_degrees(&source, 45.0).unwrap();
+
+        assert_eq!(quarter_turn.dimensions(), (2, 4));
+        assert_eq!(diagonal.dimensions(), (5, 5));
+
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        diagonal
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        assert!(!encoded.into_inner().is_empty());
+    }
+
+    #[test]
+    fn rotation_degrees_wrap_cleanly() {
+        assert_eq!(ImageViewer::normalized_rotation_degrees(-90.0), 270.0);
+        assert_eq!(ImageViewer::normalized_rotation_degrees(360.0), 0.0);
+        assert_eq!(ImageViewer::normalized_rotation_degrees(450.0), 90.0);
     }
 }

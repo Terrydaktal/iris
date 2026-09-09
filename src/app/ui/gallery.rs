@@ -1,6 +1,46 @@
 use super::*;
 
+fn semantic_gallery_indices_for_results(results: &[SearchResult], video_only: bool) -> Vec<usize> {
+    let mut seen_paths: HashSet<&Path> = HashSet::new();
+    results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            if video_only && !item.is_video {
+                return None;
+            }
+            let path = item.media_path.as_deref()?;
+            seen_paths.insert(path).then_some(index)
+        })
+        .collect()
+}
+
 impl ImageViewer {
+    fn cached_semantic_gallery_indices(&mut self) -> Arc<[usize]> {
+        let key = (self.semantic_results_revision, self.semantic_video_only);
+        if self.semantic_gallery_cache_key != Some(key) {
+            let indices = semantic_gallery_indices_for_results(
+                &self.semantic_results,
+                self.semantic_video_only,
+            );
+            self.semantic_gallery_indices = Arc::from(indices);
+            self.semantic_gallery_cache_key = Some(key);
+        }
+        self.semantic_gallery_indices.clone()
+    }
+
+    fn semantic_gallery_paths(&self, semantic_indices: &[usize]) -> Vec<(PathBuf, String)> {
+        semantic_indices
+            .iter()
+            .filter_map(|&index| self.semantic_results.get(index))
+            .filter_map(|item| {
+                item.media_path
+                    .as_ref()
+                    .map(|path| (path.clone(), item.file_name.clone()))
+            })
+            .collect()
+    }
+
     fn cached_gallery_indices(&mut self, semantic_active: bool) -> Arc<[usize]> {
         let key = GalleryFilterKey {
             scan_generation: self.gallery_scan_generation,
@@ -80,6 +120,7 @@ impl ImageViewer {
 
             // Toolbar Controls
             let old_mode = self.semantic_mode;
+            let old_result_order = self.semantic_result_order;
             ui.horizontal(|ui| {
                 ui.label("Mode:");
                 ui.selectable_value(&mut self.semantic_mode, SearchMode::Filename, "Filename");
@@ -183,13 +224,72 @@ impl ImageViewer {
                 if self.semantic_mode == SearchMode::Clip {
                     ui.add_space(8.0);
                 }
-                ui.add(egui::Slider::new(&mut self.semantic_limit, 1..=500).text("Limit"));
+                if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
+                    let mut threshold_percent = self.semantic_match_threshold * 100.0;
+                    let threshold_response = ui.add(
+                        egui::Slider::new(&mut threshold_percent, 0.0..=100.0)
+                            .text("Min match")
+                            .suffix("%")
+                            .step_by(1.0),
+                    );
+                    if threshold_response.changed() {
+                        self.semantic_match_threshold =
+                            (threshold_percent / 100.0).clamp(0.0, 1.0);
+                    }
+                    threshold_response.on_hover_text(
+                        "Applied when Search is pressed. 0% is the default and keeps every match; OCR uses the fraction of query words matched.",
+                    );
+                }
+
+                if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
+                    ui.add_space(8.0);
+                    ui.label("Order:");
+                    egui::ComboBox::from_id_salt("semantic-result-order")
+                        .selected_text(match self.semantic_result_order {
+                            SemanticResultOrder::BestMatch => "Best match",
+                            SemanticResultOrder::DateDescending => "Date: newest first",
+                            SemanticResultOrder::DateAscending => "Date: oldest first",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.semantic_result_order,
+                                SemanticResultOrder::BestMatch,
+                                "Best match",
+                            );
+                            ui.selectable_value(
+                                &mut self.semantic_result_order,
+                                SemanticResultOrder::DateDescending,
+                                "Date: newest first",
+                            );
+                            ui.selectable_value(
+                                &mut self.semantic_result_order,
+                                SemanticResultOrder::DateAscending,
+                                "Date: oldest first",
+                            );
+                        });
+                }
 
                 ui.add_space(8.0);
                 if ui.button("Search").clicked() || enter_pressed {
                     self.submit_semantic_search(ctx);
                 }
             });
+            if self.semantic_result_order != old_result_order {
+                let rows = self.take_semantic_results();
+                if rows.is_empty() {
+                    self.cancel_semantic_date_sort();
+                } else {
+                    let mode = self.semantic_results_mode.unwrap_or(self.semantic_mode);
+                    let status = format!("Reordering {} existing result(s).", rows.len());
+                    self.apply_semantic_result_order(
+                        rows,
+                        mode,
+                        status,
+                        None,
+                        ctx,
+                    );
+                }
+            }
             if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
                 ui.add_space(6.0);
                 let mut folder_enter_pressed = false;
@@ -286,55 +386,16 @@ impl ImageViewer {
                     });
                 });
             } else {
-                // Populate unified Gallery Items (only if active semantic search is active)
-                let mut gallery_items: Vec<GalleryItem> = Vec::new();
-                if is_active_semantic_search {
-                    let mut seen_semantic_paths: HashSet<PathBuf> = HashSet::new();
-                    for item in &self.semantic_results {
-                        // Some semantic result producers deliberately search broadly (for
-                        // example, "show most similar" and person searches). Apply the
-                        // gallery toggle here as the final display filter so it works for
-                        // every semantic result source, not only text searches.
-                        if self.semantic_video_only && !item.is_video {
-                            continue;
-                        }
-                        if let Some(path) = &item.media_path {
-                            if !seen_semantic_paths.insert(path.clone()) {
-                                continue;
-                            }
-                            gallery_items.push(GalleryItem {
-                                path: path.clone(),
-                                is_video: item.is_video,
-                                score_label: Some(match self.semantic_mode {
-                                    SearchMode::Clip => format!("{:.0}% Match", (item.score * 100.0).clamp(0.0, 100.0)),
-                                    SearchMode::Ocr => {
-                                        if item.ocr_phrase_query {
-                                            format!(
-                                                "{} / {} words (exact phrase)",
-                                                item.ocr_term_hits,
-                                                item.ocr_query_terms
-                                            )
-                                        } else if item.ocr_query_terms > 0 {
-                                            format!(
-                                                "{} / {} words",
-                                                item.ocr_term_hits,
-                                                item.ocr_query_terms
-                                            )
-                                        } else {
-                                            "OCR Match".to_string()
-                                        }
-                                    }
-                                    _ => String::new(),
-                                }),
-                                timestamp_sec: item.timestamp_sec,
-                                db_filename: Some(item.file_name.clone()),
-                            });
-                        }
-                    }
-                }
+                // Cache only result indices. The visible rows below materialize their small
+                // GalleryItem values on demand instead of cloning every result each repaint.
+                let semantic_gallery_indices = if is_active_semantic_search {
+                    self.cached_semantic_gallery_indices()
+                } else {
+                    Arc::from(Vec::<usize>::new())
+                };
 
                 let num_items = if is_active_semantic_search {
-                    gallery_items.len()
+                    semantic_gallery_indices.len()
                 } else {
                     filtered_images.len()
                 };
@@ -343,6 +404,8 @@ impl ImageViewer {
                     ui.centered_and_justified(|ui| {
                         if self.grid_loading {
                             ui.weak("Scanning files, please wait...");
+                        } else if self.semantic_date_sort_rx.is_some() {
+                            ui.weak("Resolving media dates and sorting in the background...");
                         } else {
                             ui.weak("No files found matching filter or query.");
                         }
@@ -408,7 +471,43 @@ impl ImageViewer {
                             for (col_idx, item_idx) in (start_idx..end_idx).enumerate() {
                                     let temp_item;
                                     let item = if is_active_semantic_search {
-                                        &gallery_items[item_idx]
+                                        let result = &self.semantic_results
+                                            [semantic_gallery_indices[item_idx]];
+                                        let path = result
+                                            .media_path
+                                            .as_ref()
+                                            .expect("cached semantic result must have a path");
+                                        temp_item = GalleryItem {
+                                            path: path.clone(),
+                                            is_video: result.is_video,
+                                            score_label: Some(match self.semantic_mode {
+                                                SearchMode::Clip => format!(
+                                                    "{:.0}% Match",
+                                                    (result.score * 100.0).clamp(0.0, 100.0)
+                                                ),
+                                                SearchMode::Ocr => {
+                                                    if result.ocr_phrase_query {
+                                                        format!(
+                                                            "{} / {} words (exact phrase)",
+                                                            result.ocr_term_hits,
+                                                            result.ocr_query_terms
+                                                        )
+                                                    } else if result.ocr_query_terms > 0 {
+                                                        format!(
+                                                            "{} / {} words",
+                                                            result.ocr_term_hits,
+                                                            result.ocr_query_terms
+                                                        )
+                                                    } else {
+                                                        "OCR Match".to_string()
+                                                    }
+                                                }
+                                                _ => String::new(),
+                                            }),
+                                            timestamp_sec: result.timestamp_sec,
+                                            db_filename: Some(result.file_name.clone()),
+                                        };
+                                        &temp_item
                                     } else {
                                         let global_idx = filtered_images[item_idx];
                                         let p = &self.recursive_images[global_idx];
@@ -790,14 +889,16 @@ impl ImageViewer {
                                 .spawn();
                         } else {
                             if is_active_semantic_search {
-                                for item in &gallery_items {
-                                    if let Some(db_name) = &item.db_filename {
-                                        self.db_filename_by_path
-                                            .insert(item.path.clone(), db_name.clone());
-                                    }
+                                let semantic_paths =
+                                    self.semantic_gallery_paths(&semantic_gallery_indices);
+                                for (path, db_name) in &semantic_paths {
+                                    self.db_filename_by_path
+                                        .insert(path.clone(), db_name.clone());
                                 }
-                                self.images =
-                                    gallery_items.iter().map(|item| item.path.clone()).collect();
+                                self.images = semantic_paths
+                                    .iter()
+                                    .map(|(path, _)| path.clone())
+                                    .collect();
                                 self.current_index =
                                     self.images.iter().position(|p| p == &path).unwrap_or(0);
                                 self.gallery_navigation_indices = None;
@@ -827,14 +928,16 @@ impl ImageViewer {
                     if let Some(item) = single_clicked_item {
                         let path = item.path.clone();
                         if is_active_semantic_search {
-                            for item in &gallery_items {
-                                if let Some(db_name) = &item.db_filename {
-                                    self.db_filename_by_path
-                                        .insert(item.path.clone(), db_name.clone());
-                                }
+                            let semantic_paths =
+                                self.semantic_gallery_paths(&semantic_gallery_indices);
+                            for (path, db_name) in &semantic_paths {
+                                self.db_filename_by_path
+                                    .insert(path.clone(), db_name.clone());
                             }
-                            let active_paths: Vec<PathBuf> =
-                                gallery_items.iter().map(|item| item.path.clone()).collect();
+                            let active_paths: Vec<PathBuf> = semantic_paths
+                                .into_iter()
+                                .map(|(path, _)| path)
+                                .collect();
                             if let Some(pos) = active_paths.iter().position(|p| p == &path) {
                                 self.images = active_paths;
                                 self.current_index = pos;
@@ -880,5 +983,40 @@ impl ImageViewer {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(path: Option<&str>, is_video: bool) -> SearchResult {
+        SearchResult {
+            rank: 0,
+            score: 1.0,
+            file_name: path.unwrap_or("missing").to_string(),
+            is_video,
+            timestamp_sec: 0.0,
+            media_path: path.map(PathBuf::from),
+            ocr_term_hits: 0,
+            ocr_query_terms: 0,
+            ocr_phrase_query: false,
+        }
+    }
+
+    #[test]
+    fn semantic_gallery_indices_deduplicate_paths_and_filter_videos() {
+        let rows = vec![
+            result(Some("one.jpg"), false),
+            result(Some("one.jpg"), false),
+            result(Some("two.mp4"), true),
+            result(None, false),
+        ];
+
+        assert_eq!(
+            semantic_gallery_indices_for_results(&rows, false),
+            vec![0, 2]
+        );
+        assert_eq!(semantic_gallery_indices_for_results(&rows, true), vec![2]);
     }
 }

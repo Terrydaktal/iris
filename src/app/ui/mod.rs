@@ -9,4 +9,5 @@ mod media_assets;
 mod navigation;
 mod search;
 mod sift;
+mod toolbar;
 mod viewer;
