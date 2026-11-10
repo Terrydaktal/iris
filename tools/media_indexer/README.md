@@ -377,3 +377,39 @@ The tool only processes unfinished stages:
 - Existing search-index side tables are updated only for rows changed by the processing stages
 - Search-index side tables are incrementally updated for processed files and indexed with IVF-HNSW-SQ
 - Database writes are batched during hash, face, CLIP, PaddleOCR, and EasyOCR stages to reduce LanceDB write overhead
+
+## Repair paths after inserting export date-range folders
+
+`tools/repair_range_paths.py` repairs an existing collection whose files moved
+from `<chat>/<type>/<file>` to `<chat>/<date-range>/<type>/<file>`. It does not
+move media or run the embedding/OCR pipeline. Candidates must be unique within
+the original chat, match a recorded size when available, and contain no symlinks.
+Ambiguous, missing, and colliding paths remain unchanged.
+
+Close Iris and stop its indexer before applying. Preview first:
+
+```bash
+uv run python tools/repair_range_paths.py \
+  --db-dir /path/to/iris-lancedb --collection-id archive
+```
+
+Apply with a new private rollback-journal path:
+
+```bash
+uv run python tools/repair_range_paths.py \
+  --db-dir /path/to/iris-lancedb --collection-id archive \
+  --apply --report /path/to/private-reports/date-range-repair.json
+```
+
+The repair updates main keys, duplicate/SIFT/cross-media references, and ANN keys
+and path-derived IDs together. It retains OCR, vectors, other metadata, collection
+roots, row counts, index definitions, and historical Lance versions. A detected
+failure restores touched tables when their heads are still exclusively owned by
+the repair. Concurrent writes or uncertain commits require manual recovery rather
+than discarding another writer's changes. Do not prune historical table versions
+until the repair has been checked. Reopen Iris afterward to clear cached paths.
+
+The utility defaults to a 1 GiB Lance execution-pool budget; use
+`--memory-pool-mib` to adjust it. An existing `LANCE_MEM_POOL_SIZE` overrides that
+default and must contain an integer byte count. Disk spilling must remain enabled
+(`LANCE_BYPASS_SPILLING` must be unset). This is not a total process-memory cap.
