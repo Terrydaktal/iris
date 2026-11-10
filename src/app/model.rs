@@ -45,6 +45,7 @@ pub(crate) enum OpenRequest {
 
 #[derive(Clone)]
 pub(crate) struct SearchSnapshot {
+    pub(crate) gallery_scan_generation: u64,
     pub(crate) semantic_query: String,
     pub(crate) applied_filename_query: String,
     pub(crate) filename_search_results: Option<Vec<usize>>,
@@ -63,6 +64,7 @@ pub(crate) struct GalleryImageSnapshot {
     pub(crate) images: Vec<PathBuf>,
     pub(crate) current_index: usize,
     pub(crate) navigation_indices: Option<Arc<[usize]>>,
+    pub(crate) navigation_paths: Option<Arc<Vec<PathBuf>>>,
     pub(crate) navigation_position: usize,
 }
 
@@ -70,6 +72,7 @@ pub(crate) struct GalleryImageSnapshot {
 pub(crate) struct GalleryFilterKey {
     pub(crate) scan_generation: u64,
     pub(crate) grid_loading: bool,
+    pub(crate) image_count: usize,
     pub(crate) applied_filename_query: String,
     pub(crate) has_filename_results: bool,
     pub(crate) semantic_mode: SearchMode,
@@ -461,9 +464,7 @@ pub(crate) struct ImageViewer {
     pub(crate) pending_initial_window_size: Option<egui::Vec2>,
     pub(crate) rx: Receiver<OpenRequest>,
     pub(crate) show_grid: bool,
-    pub(crate) recursive_images: Arc<[PathBuf]>,
-    pub(crate) recursive_scan_paths: Vec<PathBuf>,
-    pub(crate) recursive_images_snapshot: Arc<[PathBuf]>,
+    pub(crate) recursive_images: Arc<Vec<PathBuf>>,
     pub(crate) recursive_video_indices: Vec<usize>,
     pub(crate) gallery_thumbnail_scale: f32,
     pub(crate) grid_loading: bool,
@@ -524,6 +525,7 @@ pub(crate) struct ImageViewer {
     pub(crate) gallery_filter_cache_key: Option<GalleryFilterKey>,
     pub(crate) gallery_filtered_indices: Arc<[usize]>,
     pub(crate) gallery_navigation_indices: Option<Arc<[usize]>>,
+    pub(crate) gallery_navigation_paths: Option<Arc<Vec<PathBuf>>>,
     pub(crate) gallery_navigation_position: usize,
     pub(crate) applied_filename_query: String,
     pub(crate) filename_search_results: Option<Vec<usize>>,

@@ -341,7 +341,7 @@ UV_CACHE_DIR="/data/.cache/uv" uv run embedimages /path/to/media \
 
 Filename, CLIP, and OCR share one search UI in Iris.
 
-- Filename search scans the visible filesystem tree.
+- Filename search scans the visible filesystem tree. Folder tiles appear as filenames are discovered, with thumbnails loaded only for visible tiles while the scan continues in the background. The completed folder list uses descending path order. Simply browsing a folder in Filename mode does not load the AI index; database-backed viewing and search actions load it when needed.
 - CLIP search uses the LanceDB CLIP ANN side table and can search by text, pasted image, or image path.
 - OCR search supports normal multi-term matching and quoted exact phrases.
 - CLIP and OCR searches retrieve every indexed result meeting the `Min match` threshold; there is no fixed 500-result cap. The existing gallery display still collapses images from the same SIFT duplicate group to one representative. The default is `0%`, matching the previous behavior. CLIP uses its similarity score, while OCR uses the fraction of query words found (quoted phrases count as an exact match).

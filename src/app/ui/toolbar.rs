@@ -389,7 +389,7 @@ impl ImageViewer {
                     self.clear_comparison_mode();
                 }
                 self.show_grid = !self.show_grid;
-                if self.show_grid && self.recursive_images.is_empty() {
+                if self.show_grid && self.recursive_images.is_empty() && !self.grid_loading {
                     self.start_recursive_scan();
                 }
             }

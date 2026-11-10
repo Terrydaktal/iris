@@ -599,10 +599,7 @@ impl ImageViewer {
                                 if is_video_path(&destination) {
                                     self.recursive_video_indices.push(index);
                                 }
-                                let mut recursive_images = self.recursive_images.to_vec();
-                                recursive_images.push(destination);
-                                self.recursive_images = Arc::from(recursive_images);
-                                self.recursive_images_snapshot = Arc::clone(&self.recursive_images);
+                                Arc::make_mut(&mut self.recursive_images).push(destination);
                             }
                             Err(err) => editor_for_ui.status = format!("Save failed: {err}"),
                         }
@@ -946,7 +943,11 @@ impl ImageViewer {
             if !indices.is_empty() {
                 self.gallery_navigation_position =
                     (self.gallery_navigation_position + 1) % indices.len();
-                let path = self.recursive_images[indices[self.gallery_navigation_position]].clone();
+                let paths = self
+                    .gallery_navigation_paths
+                    .as_ref()
+                    .unwrap_or(&self.recursive_images);
+                let path = paths[indices[self.gallery_navigation_position]].clone();
                 self.images = vec![path];
                 self.current_index = 0;
                 self.update_current_file_info();
@@ -973,7 +974,11 @@ impl ImageViewer {
                 } else {
                     self.gallery_navigation_position - 1
                 };
-                let path = self.recursive_images[indices[self.gallery_navigation_position]].clone();
+                let paths = self
+                    .gallery_navigation_paths
+                    .as_ref()
+                    .unwrap_or(&self.recursive_images);
+                let path = paths[indices[self.gallery_navigation_position]].clone();
                 self.images = vec![path];
                 self.current_index = 0;
                 self.update_current_file_info();

@@ -189,6 +189,7 @@ impl ImageViewer {
 
     pub(crate) fn current_search_snapshot(&self) -> SearchSnapshot {
         SearchSnapshot {
+            gallery_scan_generation: self.gallery_scan_generation,
             semantic_query: self.semantic_query.clone(),
             applied_filename_query: self.applied_filename_query.clone(),
             filename_search_results: self.filename_search_results.clone(),
@@ -205,6 +206,7 @@ impl ImageViewer {
 
     pub(crate) fn same_search_snapshot(left: &SearchSnapshot, right: &SearchSnapshot) -> bool {
         left.semantic_query == right.semantic_query
+            && left.gallery_scan_generation == right.gallery_scan_generation
             && left.applied_filename_query == right.applied_filename_query
             && left.filename_search_results == right.filename_search_results
             && left.semantic_folder == right.semantic_folder
@@ -257,6 +259,7 @@ impl ImageViewer {
             images: self.images.clone(),
             current_index: self.current_index,
             navigation_indices: self.gallery_navigation_indices.clone(),
+            navigation_paths: self.gallery_navigation_paths.clone(),
             navigation_position: self.gallery_navigation_position,
         });
     }
@@ -271,6 +274,7 @@ impl ImageViewer {
             .current_index
             .min(self.images.len().saturating_sub(1));
         self.gallery_navigation_indices = snapshot.navigation_indices;
+        self.gallery_navigation_paths = snapshot.navigation_paths;
         self.gallery_navigation_position = snapshot.navigation_position;
         self.show_grid = false;
         self.back_target_is_gallery = true;
@@ -283,9 +287,14 @@ impl ImageViewer {
     }
 
     pub(crate) fn apply_search_snapshot(&mut self, snapshot: SearchSnapshot, ctx: &egui::Context) {
+        let stale_filenames = snapshot.gallery_scan_generation != self.gallery_scan_generation;
         self.semantic_query = snapshot.semantic_query;
         self.applied_filename_query = snapshot.applied_filename_query;
-        self.filename_search_results = snapshot.filename_search_results;
+        self.filename_search_results = if stale_filenames {
+            None
+        } else {
+            snapshot.filename_search_results
+        };
         self.semantic_folder = snapshot.semantic_folder;
         self.semantic_match_threshold = snapshot.semantic_match_threshold;
         self.semantic_video_only = snapshot.semantic_video_only;
@@ -300,6 +309,9 @@ impl ImageViewer {
         self.selected_grid_items.clear();
         self.show_grid = true;
         self.back_target_is_gallery = false;
+        if stale_filenames && self.semantic_mode == SearchMode::Filename {
+            self.restart_filename_search();
+        }
         ctx.request_repaint();
     }
 
@@ -331,6 +343,10 @@ impl ImageViewer {
 
     pub(crate) fn apply_filename_search(&mut self) {
         self.applied_filename_query = self.semantic_query.trim().to_string();
+        self.restart_filename_search();
+    }
+
+    pub(crate) fn restart_filename_search(&mut self) {
         if self.applied_filename_query.is_empty() {
             self.filename_search_generation = self.filename_search_generation.wrapping_add(1);
             self.filename_search_rx = None;
@@ -345,7 +361,7 @@ impl ImageViewer {
             .as_ref()
             .map(|indices| Arc::clone(&indices.basename_to_db_filename))
             .unwrap_or_else(|| Arc::new(HashMap::new()));
-        let paths = Arc::clone(&self.recursive_images_snapshot);
+        let paths = Arc::clone(&self.recursive_images);
         let query = self
             .applied_filename_query
             .to_lowercase()

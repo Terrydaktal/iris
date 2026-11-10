@@ -41,10 +41,10 @@ impl ImageViewer {
             });
 
         let mut images = initial_images;
-        let flat_loading = !start_on_home_page && !comparison_mode;
+        let flat_loading = !start_on_home_page && !comparison_mode && !open_target_is_dir;
         let flat_images_shared: Arc<Mutex<Option<FlatRefreshResult>>> = Arc::new(Mutex::new(None));
 
-        if !start_on_home_page && !comparison_mode {
+        if flat_loading {
             if !path.is_dir() {
                 images.push(path.clone());
             }
@@ -124,9 +124,7 @@ impl ImageViewer {
             pending_initial_window_size,
             rx,
             show_grid: false,
-            recursive_images: Arc::from([]),
-            recursive_scan_paths: Vec::new(),
-            recursive_images_snapshot: Arc::from([]),
+            recursive_images: Arc::new(Vec::new()),
             recursive_video_indices: Vec::new(),
             gallery_thumbnail_scale: 1.0,
             grid_loading: false,
@@ -187,6 +185,7 @@ impl ImageViewer {
             gallery_filter_cache_key: None,
             gallery_filtered_indices: Arc::from([]),
             gallery_navigation_indices: None,
+            gallery_navigation_paths: None,
             gallery_navigation_position: 0,
             applied_filename_query: String::new(),
             filename_search_results: None,

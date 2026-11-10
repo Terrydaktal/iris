@@ -14,11 +14,10 @@ impl ImageViewer {
         self.gallery_thumbnail_generation = self.gallery_thumbnail_generation.wrapping_add(1);
         self.gallery_filter_cache_key = None;
         self.gallery_navigation_indices = None;
+        self.gallery_navigation_paths = None;
         self.gallery_navigation_position = 0;
         self.grid_loading = true;
-        self.recursive_images = Arc::from([]);
-        self.recursive_scan_paths.clear();
-        self.recursive_images_snapshot = Arc::from([]);
+        self.recursive_images = Arc::new(Vec::new());
         self.recursive_video_indices.clear();
         self.applied_filename_query.clear();
         self.filename_search_results = None;
@@ -77,6 +76,7 @@ impl ImageViewer {
     pub(crate) fn clear_comparison_mode(&mut self) {
         self.clear_comparison_alignment();
         self.gallery_navigation_indices = None;
+        self.gallery_navigation_paths = None;
         self.gallery_navigation_position = 0;
         self.comparison_paths = None;
         self.comparison_view_states.clear();
@@ -162,6 +162,7 @@ impl ImageViewer {
         self.image_editor = None;
         self.clear_comparison_alignment();
         self.gallery_navigation_indices = None;
+        self.gallery_navigation_paths = None;
         self.gallery_navigation_position = 0;
         self.compare_target = None;
         self.sift_pair_overlay = None;
@@ -342,9 +343,7 @@ impl ImageViewer {
         let new_start_dir_norm = normalized_path_for_match(&new_start_dir);
 
         if old_start_dir_norm != new_start_dir_norm {
-            self.recursive_images = Arc::from([]);
-            self.recursive_scan_paths.clear();
-            self.recursive_images_snapshot = Arc::from([]);
+            self.recursive_images = Arc::new(Vec::new());
             self.recursive_video_indices.clear();
             self.back_target_is_gallery = false;
             self.flat_directory_mtime = None;

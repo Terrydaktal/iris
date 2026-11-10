@@ -87,10 +87,11 @@ impl ImageViewer {
             .collect()
     }
 
-    fn cached_gallery_indices(&mut self, semantic_active: bool) -> Arc<[usize]> {
+    fn cached_gallery_indices(&mut self) -> Arc<[usize]> {
         let key = GalleryFilterKey {
             scan_generation: self.gallery_scan_generation,
             grid_loading: self.grid_loading,
+            image_count: self.recursive_images.len(),
             applied_filename_query: self.applied_filename_query.clone(),
             has_filename_results: self.filename_search_results.is_some(),
             semantic_mode: self.semantic_mode,
@@ -98,9 +99,7 @@ impl ImageViewer {
             video_only: self.semantic_video_only,
         };
         if self.gallery_filter_cache_key.as_ref() != Some(&key) {
-            let candidates = if !semantic_active && self.grid_loading {
-                Vec::new()
-            } else if self.semantic_mode == SearchMode::Filename {
+            let candidates = if self.semantic_mode == SearchMode::Filename {
                 self.filename_search_results
                     .clone()
                     .unwrap_or_else(|| (0..self.recursive_images.len()).collect())
@@ -123,6 +122,25 @@ impl ImageViewer {
             self.gallery_filter_cache_key = Some(key);
         }
         self.gallery_filtered_indices.clone()
+    }
+
+    pub(crate) fn refresh_gallery_navigation(&mut self) {
+        if self.gallery_navigation_indices.is_none() {
+            return;
+        }
+        let indices = self.cached_gallery_indices();
+        let current = self.images.get(self.current_index);
+        if let Some(position) = indices
+            .iter()
+            .position(|&index| Some(&self.recursive_images[index]) == current)
+        {
+            self.gallery_navigation_indices = Some(indices);
+            self.gallery_navigation_paths = Some(Arc::clone(&self.recursive_images));
+            self.gallery_navigation_position = position;
+            if !self.show_grid && !self.show_home_page {
+                self.remember_gallery_image();
+            }
+        }
     }
 
     pub(crate) fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -420,12 +438,11 @@ impl ImageViewer {
                     || self.semantic_date_sort_rx.is_some()
                     || (self.db_loading && is_active_semantic_search));
 
-            // Keep the folder grid empty until the recursive scan has completed and cache
-            // the resulting index set so scrolling does not allocate O(N) every frame.
+            // Cache indices between scan batches; only visible tiles request thumbnails.
             let filtered_images = if search_pending {
                 Arc::from([])
             } else {
-                self.cached_gallery_indices(is_active_semantic_search)
+                self.cached_gallery_indices()
             };
 
             // Status message label
@@ -453,7 +470,7 @@ impl ImageViewer {
                     ui.weak(&self.semantic_status);
                 } else if self.grid_loading {
                     ui.add(egui::Spinner::new().size(14.0));
-                    ui.weak("Scanning subdirectories...");
+                    ui.weak(format!("Scanning subdirectories... {} files found", self.recursive_images.len()));
                 } else {
                     let label = if self.semantic_video_only { "videos" } else { "items" };
                     ui.weak(format!("{} {} found in this folder", filtered_images.len(), label));
@@ -536,6 +553,9 @@ impl ImageViewer {
                         num_items,
                         gallery_scroll_source,
                         |ui, item_idx, rect| {
+                                    if !ui.is_rect_visible(rect) {
+                                        return;
+                                    }
                                     let tile_width = rect.width();
                                     let tile_height = rect.height();
                                     let tile_scale = tile_width / 130.0;
@@ -961,6 +981,7 @@ impl ImageViewer {
                                 self.current_index =
                                     self.images.iter().position(|p| p == &path).unwrap_or(0);
                                 self.gallery_navigation_indices = None;
+                                self.gallery_navigation_paths = None;
                             } else if let Some(position) = filtered_images
                                 .iter()
                                 .position(|&index| self.recursive_images[index] == path)
@@ -971,6 +992,7 @@ impl ImageViewer {
                                 self.images = vec![path.clone()];
                                 self.current_index = 0;
                                 self.gallery_navigation_indices = Some(filtered_images.clone());
+                                self.gallery_navigation_paths = Some(Arc::clone(&self.recursive_images));
                                 self.gallery_navigation_position = position;
                             }
                         self.remember_gallery_image();
@@ -1001,6 +1023,7 @@ impl ImageViewer {
                                 self.images = active_paths;
                                 self.current_index = pos;
                                 self.gallery_navigation_indices = None;
+                                self.gallery_navigation_paths = None;
                                 self.update_current_file_info();
                                 if self.show_exif || self.side_panel_open_pending {
                                     self.update_side_panel_metadata_if_needed();
@@ -1019,6 +1042,7 @@ impl ImageViewer {
                             self.images = vec![path.clone()];
                             self.current_index = 0;
                             self.gallery_navigation_indices = Some(filtered_images.clone());
+                            self.gallery_navigation_paths = Some(Arc::clone(&self.recursive_images));
                             self.gallery_navigation_position = pos;
                             self.update_current_file_info();
                             if self.show_exif || self.side_panel_open_pending {

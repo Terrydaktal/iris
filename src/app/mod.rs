@@ -61,7 +61,8 @@ pub(crate) use hashing::{
     run_sift_alignment_batch, run_sift_repair_for_files,
 };
 pub(crate) use media_scan::{
-    collect_flat_images, collect_images_recursive_cancelable, is_supported_media_path,
+    apply_scan_batch, collect_flat_images, collect_images_recursive_cancelable, drain_scan_batch,
+    is_supported_media_path,
 };
 pub(crate) use metadata::{
     VideoMetadata, format_video_duration, load_video_metadata, load_video_thumbnail,

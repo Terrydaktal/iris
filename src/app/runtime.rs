@@ -152,7 +152,10 @@ impl eframe::App for ImageViewer {
         self.poll_semantic_date_sort(ctx);
         self.poll_filename_search(ctx);
 
-        if !self.db_loaded && !self.db_loading {
+        let needs_database = (!self.show_home_page && !self.show_grid && !self.open_target_is_dir)
+            || self.show_exif
+            || self.side_panel_open_pending;
+        if needs_database && !self.db_loaded && !self.db_loading {
             let is_ai = if let Some(p) = self.images.get(self.current_index) {
                 is_path_ai_backed(p)
             } else if is_path_ai_backed(&self.open_target) {
@@ -276,34 +279,27 @@ impl eframe::App for ImageViewer {
         }
 
         if let Some(rx) = &self.recursive_rx {
-            let mut new_images = Vec::new();
-            let mut disconnected = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(path) => new_images.push(path),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-            if !new_images.is_empty() {
-                self.recursive_scan_paths.extend(new_images);
+            // Bound discovery work per frame so a fast producer cannot starve
+            // rendering while the rest of the directory is still being scanned.
+            let (new_images, disconnected) = drain_scan_batch(rx, 4096);
+            if !new_images.is_empty() || disconnected {
+                apply_scan_batch(
+                    &mut self.recursive_images,
+                    &mut self.recursive_video_indices,
+                    new_images,
+                    disconnected,
+                );
                 ctx.request_repaint();
             }
             if disconnected {
-                self.recursive_scan_paths.sort_by(|a, b| b.cmp(a));
-                self.recursive_video_indices = self
-                    .recursive_scan_paths
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, path)| is_video_path(path).then_some(index))
-                    .collect();
-                self.recursive_images = Arc::from(std::mem::take(&mut self.recursive_scan_paths));
-                self.recursive_images_snapshot = Arc::clone(&self.recursive_images);
                 self.grid_loading = false;
                 self.recursive_rx = None;
+                self.gallery_scan_generation = self.gallery_scan_generation.wrapping_add(1);
+                if !self.applied_filename_query.is_empty() {
+                    self.restart_filename_search();
+                } else {
+                    self.refresh_gallery_navigation();
+                }
                 ctx.request_repaint();
             }
         }
@@ -329,6 +325,7 @@ impl eframe::App for ImageViewer {
                         });
                     self.images = result.images;
                     self.gallery_navigation_indices = None;
+                    self.gallery_navigation_paths = None;
                     self.gallery_navigation_position = 0;
                     self.current_index = current_path
                         .as_ref()
@@ -424,7 +421,8 @@ impl eframe::App for ImageViewer {
                             self.clear_comparison_mode();
                         }
                         self.show_grid = !self.show_grid;
-                        if self.show_grid && self.recursive_images.is_empty() {
+                        if self.show_grid && self.recursive_images.is_empty() && !self.grid_loading
+                        {
                             self.start_recursive_scan();
                         }
                     }
@@ -1583,6 +1581,8 @@ impl ImageViewer {
                 }
                 let count = result.matches.len();
                 self.filename_search_results = Some(result.matches);
+                self.gallery_filter_cache_key = None;
+                self.refresh_gallery_navigation();
                 self.semantic_status = format!(
                     "Filename search found {count} item(s) for {}.",
                     self.applied_filename_query
