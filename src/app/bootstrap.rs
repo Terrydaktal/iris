@@ -164,6 +164,7 @@ pub(crate) fn run() -> eframe::Result {
 
     let diagnostics = DiagnosticState::new();
     diagnostics.install_global();
+    let shutdown_cleanup = ShutdownCleanup::default();
     let window_size = initial_window_size(&image_path, start_on_home_page);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -179,6 +180,7 @@ pub(crate) fn run() -> eframe::Result {
     let comparison_paths_clone = comparison_paths.clone();
     let ctx_shared_clone = ctx_shared.clone();
     let diagnostics_clone = diagnostics.clone();
+    let shutdown_cleanup_clone = shutdown_cleanup.clone();
 
     let mut result = eframe::run_native(
         "iris",
@@ -193,6 +195,7 @@ pub(crate) fn run() -> eframe::Result {
                 start_on_home_page,
                 comparison_paths_clone,
                 diagnostics_clone,
+                shutdown_cleanup_clone,
                 DesktopIntegration::new(cc),
             )))
         }),
@@ -204,6 +207,7 @@ pub(crate) fn run() -> eframe::Result {
             std::env::set_var("WINIT_UNIX_BACKEND", "x11");
         }
         let diagnostics_clone = diagnostics.clone();
+        let shutdown_cleanup_clone = shutdown_cleanup.clone();
         result = eframe::run_native(
             "iris",
             options,
@@ -217,6 +221,7 @@ pub(crate) fn run() -> eframe::Result {
                     start_on_home_page,
                     comparison_paths,
                     diagnostics_clone,
+                    shutdown_cleanup_clone,
                     DesktopIntegration::new(cc),
                 )))
             }),
@@ -230,6 +235,7 @@ pub(crate) fn run() -> eframe::Result {
     // X11 fallback can reuse the same diagnostic state. Shut it down only after
     // the final backend has returned.
     diagnostics.shutdown();
+    shutdown_cleanup.finish();
 
     result
 }

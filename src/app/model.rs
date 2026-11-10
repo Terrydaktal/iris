@@ -189,6 +189,40 @@ impl Default for MetadataJobQueue {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ShutdownCleanup {
+    workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+impl ShutdownCleanup {
+    // Only move CPU-owned resources here, never window or graphics objects.
+    pub(crate) fn defer<T: Send + 'static>(&self, resource: T) -> std::io::Result<()> {
+        let worker = std::thread::Builder::new()
+            .name("iris-shutdown-cleanup".to_string())
+            .spawn(move || drop(resource))?;
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(worker);
+        Ok(())
+    }
+
+    // Called after eframe has destroyed the window, before native libraries exit.
+    pub(crate) fn finish(&self) {
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for worker in workers {
+            if worker.join().is_err() {
+                eprintln!("Iris: background shutdown cleanup panicked.");
+            }
+        }
+    }
+}
+
 pub(crate) struct SemanticSearchWorkerResult {
     pub(crate) generation: u64,
     pub(crate) mode: SearchMode,
@@ -400,6 +434,7 @@ pub(crate) struct ImageEditor {
 
 pub(crate) struct ImageViewer {
     pub(crate) diagnostics: DiagnosticState,
+    pub(crate) shutdown_cleanup: ShutdownCleanup,
     pub(crate) desktop: DesktopIntegration,
     pub(crate) images: Vec<PathBuf>,
     pub(crate) current_index: usize,
@@ -545,4 +580,82 @@ pub(crate) struct ImageViewer {
     pub(crate) home_selected_dir: Option<PathBuf>,
     pub(crate) viewer_rotation_degrees: f32,
     pub(crate) viewer_rotation_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct BlockingDrop {
+        started: mpsc::Sender<std::thread::ThreadId>,
+        release: mpsc::Receiver<()>,
+        completed: mpsc::Sender<()>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            self.started.send(std::thread::current().id()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            self.completed.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_defers_slow_destructors_off_the_window_thread_and_waits_for_completion() {
+        let cleanup = ShutdownCleanup::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        cleanup
+            .defer(BlockingDrop {
+                started: started_tx,
+                release: release_rx,
+                completed: completed_tx,
+            })
+            .unwrap();
+        let worker_thread = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(worker_thread, std::thread::current().id());
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let owner = cleanup.clone();
+        let finisher = std::thread::spawn(move || {
+            owner.finish();
+            finished_tx.send(()).unwrap();
+        });
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        completed_rx.try_recv().unwrap();
+        finisher.join().unwrap();
+        cleanup.finish();
+    }
+
+    #[test]
+    fn shutdown_owner_collects_cleanup_from_cloned_handles() {
+        struct DropNotice(mpsc::Sender<()>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+            }
+        }
+
+        let cleanup = ShutdownCleanup::default();
+        let viewer = cleanup.clone();
+        let (tx, rx) = mpsc::channel();
+        cleanup.defer(DropNotice(tx.clone())).unwrap();
+        viewer.defer(DropNotice(tx)).unwrap();
+        drop(viewer);
+        cleanup.finish();
+        assert_eq!(rx.try_iter().count(), 2);
+        cleanup.finish();
+    }
 }

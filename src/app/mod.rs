@@ -75,8 +75,8 @@ pub(crate) use model::{
     MetadataJobQueue, MetadataLoadRequest, MetadataLoadResult, OcrEntry, OcrIndex,
     OnDemandEmbedResult, OpenRequest, PendingSearchRequest, SearchMode, SearchResult,
     SearchSnapshot, SemanticDateSortWorkerResult, SemanticResultOrder, SemanticSearchWorkerResult,
-    SidePanelMode, SiftAlignAllResult, SiftInfo, SiftRepairResult, SimilarFile, SupplementalDbData,
-    VideoFramePhash,
+    ShutdownCleanup, SidePanelMode, SiftAlignAllResult, SiftInfo, SiftRepairResult, SimilarFile,
+    SupplementalDbData, VideoFramePhash,
 };
 pub(crate) use paths::{
     MEDIA_INDEX_TABLE, db_filename_from_video_still_path, file_matches_folder, get_db_dir,

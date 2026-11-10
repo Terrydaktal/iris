@@ -9,6 +9,7 @@ impl ImageViewer {
         start_on_home_page: bool,
         comparison_paths: Option<Vec<PathBuf>>,
         diagnostics: DiagnosticState,
+        shutdown_cleanup: ShutdownCleanup,
         desktop: DesktopIntegration,
     ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
@@ -96,6 +97,7 @@ impl ImageViewer {
 
         let mut viewer = Self {
             diagnostics,
+            shutdown_cleanup,
             desktop,
             images,
             current_index: 0,
@@ -569,6 +571,12 @@ impl Drop for ImageViewer {
             state.pending = None;
             state.shutdown = true;
             self.metadata_worker_queue.wake.notify_one();
+        }
+        let database = (self.db_indices.take(), self.db_rx.take());
+        if (database.0.is_some() || database.1.is_some())
+            && let Err(error) = self.shutdown_cleanup.defer(database)
+        {
+            eprintln!("Iris: could not defer database shutdown cleanup: {error}");
         }
     }
 }
