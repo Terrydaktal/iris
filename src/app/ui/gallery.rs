@@ -600,10 +600,7 @@ impl ImageViewer {
                                                 } else {
                                                     self.resolve_actual_path(path)
                                                 };
-                                                let _ = std::process::Command::new("mpv")
-                                                    .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
-                                                    .arg(playback_path)
-                                                    .spawn();
+                                                self.open_video_in_mpv(&playback_path, Some(item.timestamp_sec));
                                                 ui.close();
                                             }
                                         } else if ui.button("✏ Edit image").clicked() {
@@ -913,10 +910,7 @@ impl ImageViewer {
                             } else {
                                 self.resolve_actual_path(&path)
                             };
-                            let _ = std::process::Command::new("mpv")
-                                .arg(format!("--start={:.3}", item.timestamp_sec.max(0.0)))
-                                .arg(playback_path)
-                                .spawn();
+                            self.open_video_in_mpv(&playback_path, Some(item.timestamp_sec));
                         } else {
                             if is_active_semantic_search {
                                 let semantic_paths =

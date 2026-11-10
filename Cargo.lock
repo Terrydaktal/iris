@@ -3921,6 +3921,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

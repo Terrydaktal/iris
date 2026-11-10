@@ -222,6 +222,8 @@ The mouse wheel zooms up to 256 times the fitted view. Use the toolbar's smoothi
 
 Left-drag the image in the main viewer to pan it. Keep holding the button and drag outside the Iris window to turn that gesture into a file drag, then release over another application to drop the original file. `Shift` + drag starts a file drag immediately. File drag-and-drop currently requires native Wayland.
 
+Video playback opens in `mpv` from the gallery, context menu, and duplicates sidebar. On Wayland, Iris passes a fresh activation token from the click so the player can take focus when it opens.
+
 Reuse an existing window:
 
 ```bash

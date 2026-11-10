@@ -1,6 +1,12 @@
 use super::*;
 
 impl ImageViewer {
+    pub(crate) fn open_video_in_mpv(&mut self, path: &Path, start_seconds: Option<f32>) {
+        if let Err(error) = self.desktop.open_video(path, start_seconds) {
+            self.semantic_status = error;
+        }
+    }
+
     pub(crate) fn thumbnail_worker_limit(path: &Path) -> usize {
         if is_video_path(path) {
             // Video thumbnails each launch a decoder. Keep HDD seeks and process

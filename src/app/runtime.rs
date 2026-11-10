@@ -96,7 +96,7 @@ impl eframe::App for ImageViewer {
         if let Err(error) = self.desktop.poll() {
             self.semantic_status = error;
         }
-        if self.desktop.is_active() {
+        if self.desktop.needs_poll() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -917,9 +917,7 @@ impl eframe::App for ImageViewer {
                                                             }
                                                             if *member_is_video {
                                                                 if ui.button("▶ Open in mpv").clicked() {
-                                                                    let _ = std::process::Command::new("mpv")
-                                                                        .arg(s_path)
-                                                                        .spawn();
+                                                                    self.open_video_in_mpv(s_path, None);
                                                                 }
                                                             } else {
                                                                 if ui.button("👁 View").clicked() {
@@ -1073,9 +1071,7 @@ impl eframe::App for ImageViewer {
                                                                             }
                                                                             if item_is_video {
                                                                                 if ui.button("▶ Open in mpv").clicked() {
-                                                                                    let _ = std::process::Command::new("mpv")
-                                                                                        .arg(s_path)
-                                                                                        .spawn();
+                                                                                    self.open_video_in_mpv(s_path, None);
                                                                                 }
                                                                             } else {
                                                                                 if ui.button("👁 View").clicked() {

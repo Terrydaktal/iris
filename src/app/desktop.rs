@@ -1,4 +1,65 @@
 use std::path::Path;
+use std::process::Command;
+
+fn mpv_command(path: &Path, start_seconds: Option<f32>) -> Command {
+    let mut command = Command::new("mpv");
+    command
+        .arg("--force-window=immediate")
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID");
+    if let Some(seconds) = start_seconds {
+        command.arg(format!("--start={:.3}", seconds.max(0.0)));
+    }
+    command.arg("--").arg(path);
+    command
+}
+
+fn spawn_mpv(command: &mut Command, activation_token: Option<&str>) -> Result<(), String> {
+    if let Some(token) = activation_token {
+        command.env("XDG_ACTIVATION_TOKEN", token);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open video in mpv: {error}"))
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn mpv_launch_requests_focus_and_preserves_the_video_path_and_frame_offset() {
+        let command = mpv_command(Path::new("/media/library/video one.mp4"), Some(12.345));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), OsStr::new("mpv"));
+        assert_eq!(
+            args,
+            [
+                "--force-window=immediate",
+                "--start=12.345",
+                "--",
+                "/media/library/video one.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn mpv_launch_discards_stale_tokens_and_only_adds_requested_seek_offsets() {
+        let command = mpv_command(Path::new("video.mp4"), None);
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(env.get(OsStr::new("XDG_ACTIVATION_TOKEN")), Some(&None));
+        assert_eq!(env.get(OsStr::new("DESKTOP_STARTUP_ID")), Some(&None));
+        assert!(
+            !command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().starts_with("--start="))
+        );
+        let command = mpv_command(Path::new("video.mp4"), Some(-4.0));
+        assert!(command.get_args().any(|arg| arg == "--start=0.000"));
+    }
+}
 
 #[derive(Default)]
 struct ViewerDragGesture {
@@ -222,9 +283,10 @@ mod viewer_gesture_tests {
 }
 
 pub(crate) struct DesktopIntegration {
+    ctx: eframe::egui::Context,
     viewer_gesture: ViewerDragGesture,
     #[cfg(target_os = "linux")]
-    wayland: Option<wayland::WaylandFileDrag>,
+    wayland: Option<wayland::WaylandDesktop>,
 }
 
 impl DesktopIntegration {
@@ -232,15 +294,16 @@ impl DesktopIntegration {
         #[cfg(target_os = "linux")]
         {
             Self {
+                ctx: creation_context.egui_ctx.clone(),
                 viewer_gesture: ViewerDragGesture::default(),
-                wayland: wayland::WaylandFileDrag::new(creation_context).ok(),
+                wayland: wayland::WaylandDesktop::new(creation_context).ok(),
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = creation_context;
             Self {
+                ctx: creation_context.egui_ctx.clone(),
                 viewer_gesture: ViewerDragGesture::default(),
             }
         }
@@ -265,6 +328,29 @@ impl DesktopIntegration {
         Err("outbound file dragging is unavailable on this display backend".to_string())
     }
 
+    pub(crate) fn open_video(
+        &mut self,
+        path: &Path,
+        start_seconds: Option<f32>,
+    ) -> Result<(), String> {
+        let mut command = mpv_command(path, start_seconds);
+        #[cfg(target_os = "linux")]
+        if let Some(wayland) = self.wayland.as_mut() {
+            let result = wayland.launch_mpv(command);
+            self.ctx.request_repaint();
+            return result;
+        }
+        spawn_mpv(&mut command, None)
+    }
+
+    pub(crate) fn needs_poll(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(wayland) = self.wayland.as_ref() {
+            return wayland.is_active() || wayland.has_pending_launches();
+        }
+        false
+    }
+
     pub(crate) fn viewer_export_requested(&mut self, response: &eframe::egui::Response) -> bool {
         let requested = self.viewer_gesture.export_requested(response);
         requested && !self.is_active()
@@ -282,12 +368,15 @@ impl DesktopIntegration {
 
 #[cfg(target_os = "linux")]
 mod wayland {
+    use super::spawn_mpv;
     use raw_window_handle::{HasDisplayHandle as _, RawDisplayHandle};
     use std::fs::File;
     use std::io::Write as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
     use wayland_client::backend::Backend;
     use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
     use wayland_client::protocol::wl_data_device_manager::{self, DndAction, WlDataDeviceManager};
@@ -298,11 +387,17 @@ mod wayland {
     use wayland_client::protocol::wl_seat::{self, WlSeat};
     use wayland_client::protocol::wl_surface::WlSurface;
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::{
+        self, XdgActivationTokenV1,
+    };
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::{
+        self, XdgActivationV1,
+    };
 
     const URI_LIST_MIME: &str = "text/uri-list";
     const BTN_LEFT: u32 = 0x110;
 
-    pub(super) struct WaylandFileDrag {
+    pub(super) struct WaylandDesktop {
         connection: Connection,
         queue: EventQueue<DragState>,
         state: DragState,
@@ -310,6 +405,11 @@ mod wayland {
 
     #[derive(Default)]
     struct DragState {
+        activation: Option<XdgActivationV1>,
+        activation_surface: Option<WlSurface>,
+        activation_serial: Option<u32>,
+        pending_launches: Vec<PendingLaunch>,
+        launch_error: Option<String>,
         manager: Option<WlDataDeviceManager>,
         manager_version: u32,
         seat: Option<WlSeat>,
@@ -323,7 +423,13 @@ mod wayland {
         active: bool,
     }
 
-    impl WaylandFileDrag {
+    struct PendingLaunch {
+        token: XdgActivationTokenV1,
+        command: Command,
+        deadline: Instant,
+    }
+
+    impl WaylandDesktop {
         pub(super) fn new(creation_context: &eframe::CreationContext<'_>) -> Result<Self, String> {
             let display_handle = creation_context
                 .display_handle()
@@ -345,13 +451,9 @@ mod wayland {
             queue
                 .roundtrip(&mut state)
                 .map_err(|error| format!("failed to enumerate Wayland globals: {error}"))?;
-            queue
-                .roundtrip(&mut state)
-                .map_err(|error| format!("failed to initialize Wayland drag source: {error}"))?;
-
-            if state.manager.is_none() || state.data_device.is_none() || state.pointer.is_none() {
-                return Err("the Wayland compositor did not provide file drag support".to_string());
-            }
+            queue.roundtrip(&mut state).map_err(|error| {
+                format!("failed to initialize Wayland desktop integration: {error}")
+            })?;
 
             Ok(Self {
                 connection,
@@ -363,8 +465,51 @@ mod wayland {
         pub(super) fn poll(&mut self) -> Result<(), String> {
             self.queue
                 .dispatch_pending(&mut self.state)
-                .map(|_| ())
-                .map_err(|error| format!("Wayland file drag dispatch failed: {error}"))
+                .map_err(|error| format!("Wayland desktop dispatch failed: {error}"))?;
+            // An unresponsive activation service must not prevent video playback.
+            let now = Instant::now();
+            for index in (0..self.state.pending_launches.len()).rev() {
+                if self.state.pending_launches[index].deadline <= now {
+                    let mut launch = self.state.pending_launches.swap_remove(index);
+                    launch.token.destroy();
+                    spawn_mpv(&mut launch.command, None)?;
+                }
+            }
+            if let Some(error) = self.state.launch_error.take() {
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        pub(super) fn launch_mpv(&mut self, mut command: Command) -> Result<(), String> {
+            self.poll()?;
+            let Some(activation) = &self.state.activation else {
+                return spawn_mpv(&mut command, None);
+            };
+            let token = activation.get_activation_token(&self.queue.handle(), ());
+            if let (Some(serial), Some(seat)) = (self.state.activation_serial, &self.state.seat) {
+                token.set_serial(serial, seat);
+            }
+            if let Some(surface) = &self.state.activation_surface {
+                token.set_surface(surface);
+            }
+            token.set_app_id("mpv".to_string());
+            token.commit();
+            self.state.pending_launches.push(PendingLaunch {
+                token,
+                command,
+                deadline: Instant::now() + Duration::from_secs(1),
+            });
+            if self.connection.flush().is_err() {
+                let mut launch = self.state.pending_launches.pop().unwrap();
+                launch.token.destroy();
+                return spawn_mpv(&mut launch.command, None);
+            }
+            Ok(())
+        }
+
+        pub(super) fn has_pending_launches(&self) -> bool {
+            !self.state.pending_launches.is_empty()
         }
 
         pub(super) fn start(&mut self, path: &Path) -> Result<(), String> {
@@ -455,7 +600,10 @@ mod wayland {
                 return;
             };
 
-            if interface == WlDataDeviceManager::interface().name && state.manager.is_none() {
+            if interface == XdgActivationV1::interface().name && state.activation.is_none() {
+                state.activation = Some(registry.bind(name, 1, qh, ()));
+            } else if interface == WlDataDeviceManager::interface().name && state.manager.is_none()
+            {
                 let version = version.min(3);
                 state.manager = Some(registry.bind(name, version, qh, ()));
                 state.manager_version = version;
@@ -496,7 +644,11 @@ mod wayland {
             _qh: &QueueHandle<Self>,
         ) {
             match event {
-                wl_pointer::Event::Enter { surface, .. } => {
+                wl_pointer::Event::Enter {
+                    surface, serial, ..
+                } => {
+                    state.activation_surface = Some(surface.clone());
+                    state.activation_serial = Some(serial);
                     state.pointer_surface = Some(surface);
                 }
                 wl_pointer::Event::Leave { surface, .. } => {
@@ -513,17 +665,26 @@ mod wayland {
                     button,
                     state: button_state,
                     ..
-                } if button == BTN_LEFT => match button_state {
-                    WEnum::Value(wl_pointer::ButtonState::Pressed) => {
-                        state.press_serial = Some(serial);
-                        state.press_surface = state.pointer_surface.clone();
+                } => {
+                    state.activation_serial = Some(serial);
+                    if let Some(surface) = &state.pointer_surface {
+                        state.activation_surface = Some(surface.clone());
                     }
-                    WEnum::Value(wl_pointer::ButtonState::Released) if !state.active => {
-                        state.press_serial = None;
-                        state.press_surface = None;
+                    if button != BTN_LEFT {
+                        return;
                     }
-                    _ => {}
-                },
+                    match button_state {
+                        WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                            state.press_serial = Some(serial);
+                            state.press_surface = state.pointer_surface.clone();
+                        }
+                        WEnum::Value(wl_pointer::ButtonState::Released) if !state.active => {
+                            state.press_serial = None;
+                            state.press_surface = None;
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -538,6 +699,44 @@ mod wayland {
             _connection: &Connection,
             _qh: &QueueHandle<Self>,
         ) {
+        }
+    }
+
+    impl Dispatch<XdgActivationV1, ()> for DragState {
+        fn event(
+            _state: &mut Self,
+            _activation: &XdgActivationV1,
+            _event: xdg_activation_v1::Event,
+            _data: &(),
+            _connection: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<XdgActivationTokenV1, ()> for DragState {
+        fn event(
+            state: &mut Self,
+            token: &XdgActivationTokenV1,
+            event: xdg_activation_token_v1::Event,
+            _data: &(),
+            _connection: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_activation_token_v1::Event::Done {
+                token: activation_token,
+            } = event
+                && let Some(index) = state
+                    .pending_launches
+                    .iter()
+                    .position(|launch| &launch.token == token)
+            {
+                let mut launch = state.pending_launches.swap_remove(index);
+                launch.token.destroy();
+                if let Err(error) = spawn_mpv(&mut launch.command, Some(&activation_token)) {
+                    state.launch_error = Some(error);
+                }
+            }
         }
     }
 

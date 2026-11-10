@@ -30,6 +30,7 @@ num_cpus = "1.17"
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
 wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 
 [profile.dev.package."*"]
 opt-level = 3
