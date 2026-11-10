@@ -1,6 +1,13 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    mod app_version_runtime {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/build-support/app_version_runtime.rs"
+        ));
+    }
+    app_version_runtime::handle_cli();
     let mut args = std::env::args().skip(1);
     let src_path = args
         .next()

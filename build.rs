@@ -27,6 +27,7 @@ fn rust_string(value: &str) -> String {
 }
 
 fn main() {
+    app_version::emit(".", "rust:.");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
@@ -53,3 +54,6 @@ fn main() {
     );
     fs::write(output_path, source).expect("write Iris build identity");
 }
+
+#[path = "build-support/app_version.rs"]
+mod app_version;

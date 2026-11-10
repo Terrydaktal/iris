@@ -52,3 +52,7 @@ ChatGPT Image*.png
 
 # Generated extracted video still folders, when created inside the repo.
 *-video/
+
+# Generated application build versions.
+/.app-version/
+/build-support/__pycache__/
