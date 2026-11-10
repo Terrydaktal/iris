@@ -1,15 +1,238 @@
 use std::path::Path;
 
-pub(crate) struct OutboundFileDrag {
+#[derive(Default)]
+struct ViewerDragGesture {
+    export_attempted: bool,
+}
+
+impl ViewerDragGesture {
+    fn export_requested(&mut self, response: &eframe::egui::Response) -> bool {
+        use eframe::egui::{Event, PointerButton};
+
+        let (primary_down, shift_down, outside_window) = response.ctx.input(|input| {
+            let outside_window = input.pointer.latest_pos().map_or_else(
+                || {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::PointerGone))
+                },
+                |position| !input.viewport_rect().contains(position),
+            );
+            (
+                input.pointer.button_down(PointerButton::Primary),
+                input.modifiers.shift,
+                outside_window,
+            )
+        });
+        if !primary_down || response.drag_started_by(PointerButton::Primary) {
+            self.export_attempted = false;
+        }
+        if self.export_attempted || !response.dragged_by(PointerButton::Primary) {
+            return false;
+        }
+
+        // Keep panning inside the window; hand the held drag to the desktop on exit.
+        if outside_window || (shift_down && response.drag_started()) {
+            self.export_attempted = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod viewer_gesture_tests {
+    use super::*;
+    use eframe::egui;
+
+    fn frame(
+        ctx: &egui::Context,
+        gesture: &mut ViewerDragGesture,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> (bool, bool) {
+        let mut requested = false;
+        let mut dragging = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                events,
+                modifiers,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                    ui.label("Toolbar");
+                });
+                egui::SidePanel::right("duplicates")
+                    .exact_width(180.0)
+                    .show(ctx, |ui| {
+                        ui.label("Duplicates");
+                    });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (_, response) =
+                        ui.allocate_at_least(ui.available_size(), egui::Sense::click_and_drag());
+                    dragging |= response.dragged_by(egui::PointerButton::Primary);
+                    requested |= gesture.export_requested(&response);
+                });
+            },
+        );
+        (requested, dragging)
+    }
+
+    fn button(pressed: bool, button: egui::PointerButton) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(100.0, 100.0),
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn main_viewer_drag_pans_inside_then_exports_once_outside_and_can_be_repeated() {
+        let ctx = egui::Context::default();
+        let mut gesture = ViewerDragGesture::default();
+        let modifiers = egui::Modifiers::NONE;
+        frame(&ctx, &mut gesture, Vec::new(), modifiers);
+        for _ in 0..2 {
+            frame(
+                &ctx,
+                &mut gesture,
+                vec![button(true, egui::PointerButton::Primary)],
+                modifiers,
+            );
+            for position in [
+                egui::pos2(200.0, 130.0),
+                egui::pos2(520.0, 130.0), // Sidebar is still inside the app.
+                egui::pos2(200.0, 10.0),  // Toolbar is still inside the app.
+            ] {
+                assert_eq!(
+                    frame(
+                        &ctx,
+                        &mut gesture,
+                        vec![egui::Event::PointerMoved(position)],
+                        modifiers,
+                    ),
+                    (false, true),
+                );
+            }
+            assert!(
+                frame(
+                    &ctx,
+                    &mut gesture,
+                    vec![egui::Event::PointerMoved(egui::pos2(650.0, 130.0))],
+                    modifiers,
+                )
+                .0
+            );
+            assert!(
+                !frame(
+                    &ctx,
+                    &mut gesture,
+                    vec![egui::Event::PointerMoved(egui::pos2(670.0, 130.0))],
+                    modifiers,
+                )
+                .0
+            );
+            frame(
+                &ctx,
+                &mut gesture,
+                vec![button(false, egui::PointerButton::Primary)],
+                modifiers,
+            );
+        }
+    }
+
+    #[test]
+    fn window_exit_without_pointer_coordinates_still_exports_a_held_viewer_drag() {
+        let ctx = egui::Context::default();
+        let mut gesture = ViewerDragGesture::default();
+        let modifiers = egui::Modifiers::NONE;
+        frame(&ctx, &mut gesture, Vec::new(), modifiers);
+        assert!(
+            !frame(
+                &ctx,
+                &mut gesture,
+                vec![egui::Event::PointerGone],
+                modifiers,
+            )
+            .0
+        );
+        frame(
+            &ctx,
+            &mut gesture,
+            vec![button(true, egui::PointerButton::Primary)],
+            modifiers,
+        );
+        frame(
+            &ctx,
+            &mut gesture,
+            vec![egui::Event::PointerMoved(egui::pos2(220.0, 140.0))],
+            modifiers,
+        );
+        assert!(
+            frame(
+                &ctx,
+                &mut gesture,
+                vec![egui::Event::PointerGone],
+                modifiers,
+            )
+            .0
+        );
+        assert!(!frame(&ctx, &mut gesture, Vec::new(), modifiers).0);
+    }
+
+    #[test]
+    fn shift_starts_export_inside_window_but_other_mouse_buttons_do_not() {
+        for button_kind in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Middle,
+            egui::PointerButton::Extra1,
+            egui::PointerButton::Extra2,
+        ] {
+            let ctx = egui::Context::default();
+            let mut gesture = ViewerDragGesture::default();
+            let modifiers = egui::Modifiers::SHIFT;
+            frame(&ctx, &mut gesture, Vec::new(), modifiers);
+            assert!(
+                !frame(
+                    &ctx,
+                    &mut gesture,
+                    vec![button(true, button_kind)],
+                    modifiers,
+                )
+                .0
+            );
+            let requested = frame(
+                &ctx,
+                &mut gesture,
+                vec![egui::Event::PointerMoved(egui::pos2(220.0, 140.0))],
+                modifiers,
+            )
+            .0;
+            assert_eq!(requested, button_kind == egui::PointerButton::Primary);
+        }
+    }
+}
+
+pub(crate) struct DesktopIntegration {
+    viewer_gesture: ViewerDragGesture,
     #[cfg(target_os = "linux")]
     wayland: Option<wayland::WaylandFileDrag>,
 }
 
-impl OutboundFileDrag {
+impl DesktopIntegration {
     pub(crate) fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         #[cfg(target_os = "linux")]
         {
             Self {
+                viewer_gesture: ViewerDragGesture::default(),
                 wayland: wayland::WaylandFileDrag::new(creation_context).ok(),
             }
         }
@@ -17,7 +240,9 @@ impl OutboundFileDrag {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = creation_context;
-            Self {}
+            Self {
+                viewer_gesture: ViewerDragGesture::default(),
+            }
         }
     }
 
@@ -38,6 +263,11 @@ impl OutboundFileDrag {
 
         let _ = path;
         Err("outbound file dragging is unavailable on this display backend".to_string())
+    }
+
+    pub(crate) fn viewer_export_requested(&mut self, response: &eframe::egui::Response) -> bool {
+        let requested = self.viewer_gesture.export_requested(response);
+        requested && !self.is_active()
     }
 
     pub(crate) fn is_active(&self) -> bool {

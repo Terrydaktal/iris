@@ -93,10 +93,10 @@ mod thumbnail_cache_tests {
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Err(error) = self.outbound_file_drag.poll() {
+        if let Err(error) = self.desktop.poll() {
             self.semantic_status = error;
         }
-        if self.outbound_file_drag.is_active() {
+        if self.desktop.is_active() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -1157,16 +1157,16 @@ impl eframe::App for ImageViewer {
                     let primary_button_down =
                         ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
                     let shift_down = ui.input(|i| i.modifiers.shift);
-                    if response.drag_started() && primary_button_down && shift_down {
+                    if self.desktop.viewer_export_requested(&response) {
                         let actual_path = self.resolve_actual_path(&path);
-                        if let Err(error) = self.outbound_file_drag.start(&actual_path) {
+                        if let Err(error) = self.desktop.start(&actual_path) {
                             self.semantic_status = format!("File drag failed: {error}");
                         }
                     }
                     if response.dragged()
                         && primary_button_down
                         && !shift_down
-                        && !self.outbound_file_drag.is_active()
+                        && !self.desktop.is_active()
                     {
                         self.offset += response.drag_delta();
                         view_changed = true;
@@ -1186,7 +1186,7 @@ impl eframe::App for ImageViewer {
                             .is_some_and(|position| rect.contains(position))
                     });
                     if pointer_over_viewport && shift_down {
-                        ctx.set_cursor_icon(if self.outbound_file_drag.is_active() {
+                        ctx.set_cursor_icon(if self.desktop.is_active() {
                             egui::CursorIcon::Grabbing
                         } else {
                             egui::CursorIcon::Grab

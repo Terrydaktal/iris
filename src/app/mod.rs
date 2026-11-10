@@ -25,8 +25,8 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 mod binary;
 mod bootstrap;
 mod clipboard;
+mod desktop;
 mod diagnostics;
-mod drag_out;
 mod formatting;
 mod hashing;
 mod media_scan;
@@ -48,10 +48,10 @@ pub(crate) use clipboard::{
     clipboard_paste_signal, copy_image_file_to_clipboard, image_path_from_pasted_text,
     is_clipboard_image_path, save_clipboard_image_to_temp,
 };
+pub(crate) use desktop::DesktopIntegration;
 #[cfg(test)]
 pub(crate) use diagnostics::build_info_value;
 pub(crate) use diagnostics::{DiagnosticState, handle_cli};
-pub(crate) use drag_out::OutboundFileDrag;
 pub(crate) use formatting::{
     file_resolution_and_size, file_size_and_modified, raw_exif_layout_job, sift_info_line,
     wrapping_monospace_path,

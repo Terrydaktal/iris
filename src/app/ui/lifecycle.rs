@@ -9,7 +9,7 @@ impl ImageViewer {
         start_on_home_page: bool,
         comparison_paths: Option<Vec<PathBuf>>,
         diagnostics: DiagnosticState,
-        outbound_file_drag: OutboundFileDrag,
+        desktop: DesktopIntegration,
     ) -> Self {
         let path = path.canonicalize().unwrap_or(path);
         let open_target = path.clone();
@@ -96,7 +96,7 @@ impl ImageViewer {
 
         let mut viewer = Self {
             diagnostics,
-            outbound_file_drag,
+            desktop,
             images,
             current_index: 0,
             comparison_paths,

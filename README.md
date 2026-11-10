@@ -24,6 +24,7 @@ The app is intentionally local-first. Media files, embeddings, OCR output, dupli
 │   │   ├── mod.rs              # Application module wiring and internal facade
 │   │   ├── model.rs            # Shared application state and database/search value types
 │   │   ├── bootstrap.rs        # CLI parsing, daemon socket, and window startup
+│   │   ├── desktop.rs          # Native file dragging and focus handoff to video playback
 │   │   ├── viewer_assets.rs    # Viewer previews, visible-region detail loading, and texture limits
 │   │   ├── metadata.rs         # exiftool and ffprobe integration
 │   │   ├── binary.rs           # Image binary/chunk inspection parsers
@@ -218,6 +219,8 @@ Large images use a small preview when fitted to the window. Zooming loads a shar
 The toolbar stays one row high. `File` contains Filesystem, Open File, and Compare Paths. `Gallery` and `Layout` are highlighted when active, and their shortcuts appear in tooltips. The filename uses the remaining width and is shortened with an ellipsis when needed; hover it for the full name, dimensions, and file size. Comparison actions move into `More` when space is tight. On very narrow windows, controls that no longer fit remain available through `File`. Keyboard shortcuts are unchanged.
 
 The mouse wheel zooms up to 256 times the fitted view. Use the toolbar's smoothing dropdown, or the right-click menu's `Image Smoothing` submenu, to choose how enlarged images look. `Smooth` is the default; `Pixel Sharp` shows distinct source pixels. Downscaling stays smooth in both modes. The choice applies to the current window, including comparison images, and switches immediately without reloading the image or creating a second GPU texture. At native zoom and above, Iris requires a full-resolution crop instead of reusing a slightly downsampled one. Enlarging the image cannot add detail beyond the original pixels.
+
+Left-drag the image in the main viewer to pan it. Keep holding the button and drag outside the Iris window to turn that gesture into a file drag, then release over another application to drop the original file. `Shift` + drag starts a file drag immediately. File drag-and-drop currently requires native Wayland.
 
 Reuse an existing window:
 

@@ -1,6 +1,6 @@
 use super::{
-    DiagnosticState, OutboundFileDrag, ViewerDetail, ViewerPreview, ViewerSampling, ViewerTexture,
-    binary::FileChunk, metadata::VideoMetadata,
+    DesktopIntegration, DiagnosticState, ViewerDetail, ViewerPreview, ViewerSampling,
+    ViewerTexture, binary::FileChunk, metadata::VideoMetadata,
 };
 use anyhow::Result;
 use eframe::egui;
@@ -400,7 +400,7 @@ pub(crate) struct ImageEditor {
 
 pub(crate) struct ImageViewer {
     pub(crate) diagnostics: DiagnosticState,
-    pub(crate) outbound_file_drag: OutboundFileDrag,
+    pub(crate) desktop: DesktopIntegration,
     pub(crate) images: Vec<PathBuf>,
     pub(crate) current_index: usize,
     pub(crate) comparison_paths: Option<Vec<PathBuf>>,
