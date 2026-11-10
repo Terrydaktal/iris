@@ -15,6 +15,52 @@ fn semantic_gallery_indices_for_results(results: &[SearchResult], video_only: bo
         .collect()
 }
 
+fn show_gallery_rows(
+    ui: &mut egui::Ui,
+    viewport_width: f32,
+    thumbnail_scale: f32,
+    num_items: usize,
+    scroll_source: egui::scroll_area::ScrollSource,
+    mut show_tile: impl FnMut(&mut egui::Ui, usize, egui::Rect),
+) {
+    let scroll = ui.spacing().scroll;
+    let scrollbar_width = scroll
+        .allocated_width()
+        .max(scroll.bar_width + scroll.bar_inner_margin);
+    let content_width = (viewport_width - scrollbar_width).max(1.0);
+    let tile_width = (130.0 * thumbnail_scale).min(content_width);
+    let tile_height = tile_width * (160.0 / 130.0);
+    let col_width = tile_width + 12.0;
+    let cols = ((content_width + 12.0) / col_width).floor().max(1.0) as usize;
+    let num_rows = num_items.div_ceil(cols);
+    let row_height = tile_height + 12.0;
+    let visible_rows = (ui.available_height() / row_height).max(1.0);
+    let scroll_speed_multiplier = (10.0 / visible_rows).clamp(0.75, 4.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("gallery_scroll_area")
+        .max_width(viewport_width)
+        .min_scrolled_width(0.0)
+        .scroll_source(scroll_source)
+        .wheel_scroll_multiplier(egui::vec2(1.0, scroll_speed_multiplier))
+        .show_rows(ui, row_height, num_rows, |ui, row_range| {
+            for row_idx in row_range {
+                let start_idx = row_idx * cols;
+                let end_idx = (start_idx + cols).min(num_items);
+                let row_width = cols as f32 * tile_width + cols.saturating_sub(1) as f32 * 12.0;
+                let (row_rect, _) = ui
+                    .allocate_exact_size(egui::vec2(row_width, tile_height), egui::Sense::hover());
+                for (col_idx, item_idx) in (start_idx..end_idx).enumerate() {
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(row_rect.min.x + col_idx as f32 * col_width, row_rect.min.y),
+                        egui::vec2(tile_width, tile_height),
+                    );
+                    show_tile(ui, item_idx, rect);
+                }
+            }
+        });
+}
+
 impl ImageViewer {
     fn cached_semantic_gallery_indices(&mut self) -> Arc<[usize]> {
         let key = (self.semantic_results_revision, self.semantic_video_only);
@@ -81,6 +127,12 @@ impl ImageViewer {
 
     pub(crate) fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.gallery_visible_thumbnail_paths.clear();
+        // Unwrapped controls and long search status text can expand the UI's layout.
+        // Keep the actual visible width before they are added, including the sidebar.
+        let viewport_width = ui
+            .available_width()
+            .min(ui.clip_rect().right() - ui.available_rect_before_wrap().left())
+            .max(1.0);
         #[derive(Clone)]
         struct GalleryItem {
             path: PathBuf,
@@ -429,16 +481,6 @@ impl ImageViewer {
                 ui.ctx().request_repaint();
             }
 
-                    let tile_width = 130.0 * self.gallery_thumbnail_scale;
-                    let tile_height = 160.0 * self.gallery_thumbnail_scale;
-                    let available_width = (ui.available_width() - 16.0).max(tile_width);
-                    let col_width = tile_width + 12.0;
-                    let cols = (available_width / col_width).floor().max(1.0) as usize;
-                    let num_rows = (num_items + cols - 1) / cols;
-                    let row_height = tile_height + 12.0;
-                    let visible_rows = (gallery_rect.height() / row_height).max(1.0);
-                    let scroll_speed_multiplier = (10.0 / visible_rows).clamp(0.75, 4.0);
-
                     let mut double_clicked_item: Option<GalleryItem> = None;
                     let mut single_clicked_item: Option<GalleryItem> = None;
                     let mut clicked_similar: Option<PendingSearchRequest> = None;
@@ -453,22 +495,16 @@ impl ImageViewer {
                         egui::scroll_area::ScrollSource::ALL
                     };
 
-                    egui::ScrollArea::vertical()
-                        .id_salt("gallery_scroll_area")
-                        .scroll_source(gallery_scroll_source)
-                        .wheel_scroll_multiplier(egui::vec2(1.0, scroll_speed_multiplier))
-                        .show_rows(ui, row_height, num_rows, |ui, row_range| {
-                        for row_idx in row_range {
-                            let start_idx = row_idx * cols;
-                            let end_idx = (start_idx + cols).min(num_items);
-                            let row_width = (cols as f32 * tile_width)
-                                + (cols.saturating_sub(1) as f32 * 12.0);
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(row_width, tile_height),
-                                egui::Sense::hover(),
-                            );
-
-                            for (col_idx, item_idx) in (start_idx..end_idx).enumerate() {
+                    show_gallery_rows(
+                        ui,
+                        viewport_width,
+                        self.gallery_thumbnail_scale,
+                        num_items,
+                        gallery_scroll_source,
+                        |ui, item_idx, rect| {
+                                    let tile_width = rect.width();
+                                    let tile_height = rect.height();
+                                    let tile_scale = tile_width / 130.0;
                                     let temp_item;
                                     let item = if is_active_semantic_search {
                                         let result = &self.semantic_results
@@ -532,10 +568,6 @@ impl ImageViewer {
                                         false
                                     };
 
-                                    let rect = egui::Rect::from_min_size(
-                                        egui::pos2(row_rect.min.x + col_idx as f32 * col_width, row_rect.min.y),
-                                        egui::vec2(tile_width, tile_height),
-                                    );
                                     let response = ui.interact(
                                         rect,
                                         ui.make_persistent_id(("gallery_card", item_idx)),
@@ -657,7 +689,7 @@ impl ImageViewer {
                                                 });
                                             } else if self.thumbnail_failed.contains(&resolved_path) {
                                                 ui.vertical_centered(|ui| {
-                                                    ui.add_space(55.0 * self.gallery_thumbnail_scale);
+                                                    ui.add_space(55.0 * tile_scale);
                                                     if is_video_path(path) {
                                                         ui.weak("📹 Video");
                                                     } else {
@@ -666,8 +698,8 @@ impl ImageViewer {
                                                 });
                                             } else {
                                                 ui.vertical_centered(|ui| {
-                                                    ui.add_space(60.0 * self.gallery_thumbnail_scale);
-                                                    ui.add(egui::Spinner::new().size(20.0 * self.gallery_thumbnail_scale));
+                                                    ui.add_space(60.0 * tile_scale);
+                                                    ui.add(egui::Spinner::new().size(20.0 * tile_scale));
                                                 });
 
                                                 let max_threads = Self::thumbnail_worker_limit(&resolved_path);
@@ -712,7 +744,7 @@ impl ImageViewer {
                                         });
 
                     // Overlay 1: Filename banner at the bottom (semi-transparent black with rounded bottom corners)
-                                    let overlay_scale = self.gallery_thumbnail_scale;
+                                    let overlay_scale = tile_scale;
                                     let banner_height = 24.0 * overlay_scale;
                                     let banner_rect = egui::Rect::from_min_max(
                                         egui::pos2(rect.min.x, rect.max.y - banner_height),
@@ -864,9 +896,8 @@ impl ImageViewer {
                                     } else if response.clicked() {
                                         single_clicked_item = Some(item.clone());
                                     }
-                            }
-                        }
-                    });
+                        },
+                    );
 
                     if let Some(item) = double_clicked_item {
                         let path = item.path.clone();
@@ -989,6 +1020,85 @@ impl ImageViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gallery_wraps_within_viewport_after_overwide_controls_and_sidebar_changes() {
+        for scroll_style in [
+            egui::style::ScrollStyle::floating(),
+            egui::style::ScrollStyle::thin(),
+            egui::style::ScrollStyle::solid(),
+        ] {
+            for scale in [0.5, 1.0, 3.0] {
+                let ctx = egui::Context::default();
+                ctx.style_mut(|style| style.spacing.scroll = scroll_style);
+                for (width, sidebar) in [
+                    (1388.0, false),
+                    (1388.0, true),
+                    (960.0, true),
+                    (450.0, false),
+                    (140.0, false),
+                    (80.0, false),
+                    (1388.0, false),
+                ] {
+                    for _ in 0..2 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 850.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                if sidebar {
+                                    egui::SidePanel::right("duplicates")
+                                        .exact_width(400.0)
+                                        .show(ctx, |ui| {
+                                            ui.label("Duplicates");
+                                        });
+                                }
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    let viewport = ui.available_rect_before_wrap();
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("A long search path and status ".repeat(20));
+                                        });
+                                        assert!(ui.available_width() > viewport.width());
+                                        let mut tiles = Vec::new();
+                                        show_gallery_rows(
+                                            ui,
+                                            viewport.width(),
+                                            scale,
+                                            170_226,
+                                            egui::scroll_area::ScrollSource::ALL,
+                                            |_, index, rect| tiles.push((index, rect)),
+                                        );
+                                        assert!(!tiles.is_empty());
+                                        assert!(tiles.len() < 1000, "grid must stay virtualized");
+                                        for (_, rect) in &tiles {
+                                            assert!(rect.left() >= viewport.left() - 0.01);
+                                            assert!(
+                                                rect.right() <= viewport.right() + 0.01,
+                                                "tile {rect:?} exceeds {viewport:?} at scale {scale}",
+                                            );
+                                        }
+                                        assert!(tiles.windows(2).any(|pair| {
+                                            pair[1].1.top() > pair[0].1.top()
+                                                && pair[1].1.left() == tiles[0].1.left()
+                                        }), "tiles must wrap to a new row");
+                                        for pair in tiles.windows(2) {
+                                            assert_eq!(pair[1].0, pair[0].0 + 1);
+                                            assert!(!pair[0].1.intersects(pair[1].1));
+                                        }
+                                    });
+                                });
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn result(path: Option<&str>, is_video: bool) -> SearchResult {
         SearchResult {
