@@ -412,10 +412,21 @@ impl ImageViewer {
                     self.semantic_results_mode == Some(self.semantic_mode)
                 }
             };
+            let search_pending = matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr)
+                && (self.pending_semantic_search_mode == Some(self.semantic_mode)
+                    || self.pending_search_request.is_some()
+                    || self.on_demand_embed_rx.is_some()
+                    || self.semantic_search_rx.is_some()
+                    || self.semantic_date_sort_rx.is_some()
+                    || (self.db_loading && is_active_semantic_search));
 
             // Keep the folder grid empty until the recursive scan has completed and cache
             // the resulting index set so scrolling does not allocate O(N) every frame.
-            let filtered_images = self.cached_gallery_indices(is_active_semantic_search);
+            let filtered_images = if search_pending {
+                Arc::from([])
+            } else {
+                self.cached_gallery_indices(is_active_semantic_search)
+            };
 
             // Status message label
             ui.horizontal(|ui| {
@@ -431,7 +442,7 @@ impl ImageViewer {
                         ui.add(egui::Spinner::new().size(14.0));
                     }
                     ui.weak(&self.semantic_status);
-                } else if self.db_loading
+                } else if search_pending || self.db_loading
                     && matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr)
                 {
                     ui.add(egui::Spinner::new().size(14.0));
@@ -452,15 +463,12 @@ impl ImageViewer {
             ui.separator();
             ui.add_space(8.0);
 
-            if self.db_loading
-                && (is_active_semantic_search || self.pending_semantic_search_mode.is_some())
-            {
+            if search_pending {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Spinner::new().size(36.0));
                         ui.add_space(16.0);
-                        ui.heading("Lazy-loading AI Database Models & ONNX session...");
-                        ui.weak("Initializing standard text encoders and reading index maps. This happens fully in the background.");
+                        ui.weak(&self.semantic_status);
                     });
                 });
             } else {
