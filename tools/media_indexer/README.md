@@ -117,12 +117,76 @@ and `collection_roots`. One old file mapped to several per-chat reflinks becomes
 several database rows with the existing computed metadata and vectors preserved.
 All source tables are version-checked before publication, all existing scalar
 and vector indexes are rebuilt, and the completed database includes
-`relocation-report.json` with the source manifest digest and row counts.
+`relocation-report.json` with the source manifest digest, row counts, and exact
+captured source table versions for independent post-copy conservation checks.
+
+Size/SHA proofs are bound to each file's device, inode, size, nanosecond mtime
+and ctime before hashing, and checked again before publication. Restoring mtime
+after a rewrite cannot retain a valid proof. Both media roots and the output
+parent are bound to their directory and mounted-ancestor identities; missing
+destinations must remain absent. Unchanged file identities reuse the verified
+digest rather than rereading the full archive during the final checks. Stop
+external writers while migrating; changed files or mounts abort publication.
+
+For a later archive consolidation, `--coalesce-equivalent-sources` explicitly
+permits several old Iris paths to converge on one new per-chat media path.
+The default still refuses such collisions. Opting in hashes the actual old
+files (including aliases) and requires identical size/SHA-256 to the already
+verified new destination; pHash similarity and missing files cannot establish
+equivalence. Each old source still fans out to every visible destination.
+
+Compatible null metadata may fill missing fields, but conflicting metadata
+requires an explicit `primary: true` media record in the manifest; `iris_source`
+identifies its logical old Iris row when the physical source differs.
+Every contributing original main/ANN row is retained unchanged in typed
+`relocation_observations_<table>` evidence with source versions and generation
+bindings. Conflicting ANN payloads keep distinct, deterministic variant IDs
+and remain searchable without re-embedding. Historical `relocation_paths`
+events remain immutable, and the new generation appends its own mappings.
+Exact manifest exclusions and explicitly dropped unmapped paths are selected
+using path-only metadata before active main/ANN payloads are decoded. Immutable
+historical rows are copied as opaque Arrow batches; validation decodes only
+the new generation's typed observations, not historical excluded payloads.
+Reports separate coalesced occurrences, conflicts, variants and added evidence;
+canonical row conservation subtracts `coalesced_rows` and audit tables add
+`added_rows`. Copying uses a private disk-backed spool rather than retaining
+the complete collection in memory.
 
 An apply refuses unmapped collection rows because changing the collection root
-would make those keys invalid. If a reviewed dry run proves they are redundant
-legacy entries, repeat the dry run with `--drop-unmapped`, then use the same flag
-with `--apply`; removal happens only in the new database.
+would make those keys invalid. For a preservation-first tgbackman migration,
+export an inventory before planning the media copy:
+
+```bash
+UV_CACHE_DIR="/data/.cache/uv" uv run iris-relocate-collection \
+  --db-dir ./lancedb \
+  --collection-id telegram_backup \
+  --export-inventory /path/to/iris-path-inventory.json
+```
+
+This reads only scoped file names, collection roots, table versions and filesystem
+stat metadata, not image contents, OCR text, or vectors. It creates a new `0600`
+file. The key set includes all active main, ANN and other path-bearing tables,
+including ANN-only paths absent from the main table, but excludes immutable
+historical relocation and observation ledgers. Unmapped active keys block a
+root switch; explicitly mapped missing ANN rows keep their vectors without
+inventing main metadata. The inventory reports its main and side-only counts.
+It refuses to overwrite an existing inventory. Pass it to tgbackman's
+media planner with `--iris-inventory`: existing Iris-only files are copied under
+`legacy-unreferenced`, while absent files get explicit `missing_media` entries.
+The committed manifest must set `preserve_missing: true` to permit those entries.
+Iris retains the missing media rows and ANN vectors, remaps their keys to the
+intended absent destination, and records original paths and missing status in
+the `relocation_paths` helper table. Missing files are never marked verified.
+
+`--drop-unmapped` remains available for separately reviewed legacy manifests,
+but is rejected for preservation-first migrations. A row absent from the
+preservation manifest remains an apply blocker, never silently discarded.
+Explicit `excluded_sources` entries for previously purged files or quarantine
+paths are different: only those exact scoped keys and their ANN rows are omitted
+from the new database, and incoming references are cleared. A retained path with
+identical image bytes is unaffected. The original database remains untouched;
+`relocation_paths` records the targeted exclusion with no destination key.
+Blacklisting alone does not authorize this exclusion.
 Interrupted or failed work remains in a clearly named `.partial-*` directory for
 diagnosis, while the source database remains usable. Derived scene-still and
 cross-media work caches are deliberately invalidated because their directory
