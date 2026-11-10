@@ -26,7 +26,7 @@ impl ImageViewer {
         self.thumbnail_loading.clear();
         self.thumbnail_failed.clear();
         self.thumbnail_retry_at.clear();
-        self.gallery_visible_thumbnail_paths.clear();
+        self.visible_thumbnail_paths.clear();
         self.video_duration_cache.borrow_mut().clear();
         self.video_duration_loading.borrow_mut().clear();
 

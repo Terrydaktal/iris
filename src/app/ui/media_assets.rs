@@ -234,14 +234,24 @@ impl ImageViewer {
     pub(crate) fn draw_thumbnail_async(&mut self, ui: &mut egui::Ui, path: &Path, side_thumb: f32) {
         let resolved_path = self.get_thumbnail_path(path);
         if let Some(texture) = self.thumbnail_textures.get(&resolved_path) {
-            ui.add(
+            let response = ui.add(
                 egui::Image::from_texture(texture)
                     .max_size(egui::vec2(side_thumb, side_thumb))
                     .maintain_aspect_ratio(true),
             );
-        } else if self.thumbnail_failed.contains(&resolved_path) {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(side_thumb, side_thumb), egui::Sense::hover());
+            if ui.is_rect_visible(response.rect) {
+                self.visible_thumbnail_paths.insert(resolved_path);
+            }
+            return;
+        }
+
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(side_thumb, side_thumb), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        self.visible_thumbnail_paths.insert(resolved_path.clone());
+        if self.thumbnail_failed.contains(&resolved_path) {
             ui.painter()
                 .rect_filled(rect, 4.0, egui::Color32::from_gray(30));
             let text = if is_video_path(path) {
@@ -257,8 +267,6 @@ impl ImageViewer {
                 egui::Color32::GRAY,
             );
         } else {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(side_thumb, side_thumb), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 4.0, egui::Color32::from_gray(40));
             ui.painter().text(

@@ -1,5 +1,96 @@
 use super::*;
 
+const MAX_THUMBNAIL_TEXTURES: usize = 512;
+
+fn trim_thumbnail_textures(
+    textures: &mut HashMap<PathBuf, egui::TextureHandle>,
+    retained_paths: &HashSet<PathBuf>,
+) {
+    let mut remaining = textures.len().saturating_sub(MAX_THUMBNAIL_TEXTURES);
+    if remaining == 0 {
+        return;
+    }
+    // Visible textures must survive even when the viewport exceeds the cache target.
+    textures.retain(|path, _| {
+        if remaining > 0 && !retained_paths.contains(path) {
+            remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+#[cfg(test)]
+mod thumbnail_cache_tests {
+    use super::*;
+
+    fn texture(ctx: &egui::Context, path: &Path) -> egui::TextureHandle {
+        ctx.load_texture(
+            path.to_string_lossy(),
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::default(),
+        )
+    }
+
+    #[test]
+    fn gallery_scroll_preserves_loaded_sidebar_textures_under_cache_pressure() {
+        let ctx = egui::Context::default();
+        let mut textures = HashMap::new();
+        let sidebar_paths: HashSet<PathBuf> = (0..4)
+            .map(|index| PathBuf::from(format!("sidebar/{index}.jpg")))
+            .collect();
+        let sidebar_ids: HashMap<_, _> = sidebar_paths
+            .iter()
+            .map(|path| {
+                let texture = texture(&ctx, path);
+                let id = texture.id();
+                textures.insert(path.clone(), texture);
+                (path.clone(), id)
+            })
+            .collect();
+        for index in 0..MAX_THUMBNAIL_TEXTURES {
+            let path = PathBuf::from(format!("old/{index}.jpg"));
+            textures.insert(path.clone(), texture(&ctx, &path));
+        }
+
+        for scroll in 0..40 {
+            let mut visible_paths = sidebar_paths.clone();
+            for index in 0..32 {
+                let path = PathBuf::from(format!("gallery/{scroll}/{index}.jpg"));
+                textures.insert(path.clone(), texture(&ctx, &path));
+                visible_paths.insert(path);
+            }
+            trim_thumbnail_textures(&mut textures, &visible_paths);
+            assert_eq!(textures.len(), MAX_THUMBNAIL_TEXTURES);
+            for path in &visible_paths {
+                assert!(textures.contains_key(path), "visible texture was evicted");
+            }
+            for (path, id) in &sidebar_ids {
+                assert_eq!(textures[path].id(), *id, "sidebar texture was reloaded");
+            }
+        }
+    }
+
+    #[test]
+    fn thumbnail_cache_keeps_large_visible_grids_then_reclaims_hidden_textures() {
+        let ctx = egui::Context::default();
+        let mut textures = HashMap::new();
+        let visible_paths: HashSet<_> = (0..MAX_THUMBNAIL_TEXTURES + 40)
+            .map(|index| {
+                let path = PathBuf::from(format!("visible/{index}.jpg"));
+                textures.insert(path.clone(), texture(&ctx, &path));
+                path
+            })
+            .collect();
+        trim_thumbnail_textures(&mut textures, &visible_paths);
+        assert_eq!(textures.len(), visible_paths.len());
+
+        trim_thumbnail_textures(&mut textures, &HashSet::new());
+        assert_eq!(textures.len(), MAX_THUMBNAIL_TEXTURES);
+    }
+}
+
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Err(error) = self.outbound_file_drag.poll() {
@@ -96,7 +187,7 @@ impl eframe::App for ImageViewer {
             self.thumbnail_loading.remove(&path);
             ctx.request_repaint();
         }
-        self.trim_thumbnail_texture_cache();
+        self.visible_thumbnail_paths.clear();
 
         while let Ok((path, revision, result)) = self.viewer_texture_rx.try_recv() {
             let current_revision = self
@@ -374,6 +465,7 @@ impl eframe::App for ImageViewer {
 
         if self.show_home_page {
             self.show_home_page_view(ctx);
+            self.trim_thumbnail_texture_cache();
             return;
         }
 
@@ -1460,6 +1552,7 @@ impl eframe::App for ImageViewer {
             }
         });
 
+        self.trim_thumbnail_texture_cache();
         if self.flat_loading || self.grid_loading || self.sift_align_all_running {
             ctx.request_repaint();
         }
@@ -1468,27 +1561,17 @@ impl eframe::App for ImageViewer {
 
 impl ImageViewer {
     fn trim_thumbnail_texture_cache(&mut self) {
-        const MAX_THUMBNAIL_TEXTURES: usize = 512;
-        let mut retained_paths = HashSet::new();
+        if self.thumbnail_textures.len() <= MAX_THUMBNAIL_TEXTURES {
+            return;
+        }
+        let mut retained_paths = self.visible_thumbnail_paths.clone();
         if let Some(path) = self.images.get(self.current_index) {
             retained_paths.insert(path.clone());
             if let Some(still) = self.video_still_cache.borrow().get(path) {
                 retained_paths.insert(still.clone());
             }
         }
-        retained_paths.extend(self.gallery_visible_thumbnail_paths.iter().cloned());
-        while self.thumbnail_textures.len() > MAX_THUMBNAIL_TEXTURES {
-            let candidate = self
-                .thumbnail_textures
-                .keys()
-                .find(|path| !retained_paths.contains(*path))
-                .cloned()
-                .or_else(|| self.thumbnail_textures.keys().next().cloned());
-            let Some(path) = candidate else {
-                break;
-            };
-            self.thumbnail_textures.remove(&path);
-        }
+        trim_thumbnail_textures(&mut self.thumbnail_textures, &retained_paths);
     }
 
     fn poll_filename_search(&mut self, ctx: &egui::Context) {

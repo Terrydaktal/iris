@@ -126,7 +126,6 @@ impl ImageViewer {
     }
 
     pub(crate) fn show_grid_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.gallery_visible_thumbnail_paths.clear();
         // Unwrapped controls and long search status text can expand the UI's layout.
         // Keep the actual visible width before they are added, including the sidebar.
         let viewport_width = ui
@@ -667,7 +666,7 @@ impl ImageViewer {
                                         .corner_radius(6.0)
                                         .show(&mut child_ui, |ui| {
                                             let resolved_path = self.get_thumbnail_path(path);
-                                            self.gallery_visible_thumbnail_paths
+                                            self.visible_thumbnail_paths
                                                 .insert(resolved_path.clone());
                                             if self.thumbnail_failed.contains(&resolved_path)
                                                 && !is_video_path(&resolved_path)
