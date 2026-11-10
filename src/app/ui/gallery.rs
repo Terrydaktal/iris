@@ -132,6 +132,31 @@ impl ImageViewer {
             .available_width()
             .min(ui.clip_rect().right() - ui.available_rect_before_wrap().left())
             .max(1.0);
+        let search_id = ui.make_persistent_id("gallery_search_query");
+        let folder_id = ui.make_persistent_id("gallery_search_folder");
+        if matches!(self.semantic_mode, SearchMode::Clip | SearchMode::Ocr) {
+            let focus_jump = ui.memory(|memory| {
+                if memory.has_focus(search_id) {
+                    Some((egui::Modifiers::NONE, folder_id))
+                } else if memory.has_focus(folder_id) {
+                    Some((egui::Modifiers::SHIFT, search_id))
+                } else {
+                    None
+                }
+            });
+            if let Some((modifiers, target)) = focus_jump {
+                let tab_pressed = ui.input_mut(|input| {
+                    input.modifiers.matches_exact(modifiers)
+                        && input.consume_key(modifiers, egui::Key::Tab)
+                });
+                if tab_pressed {
+                    ui.memory_mut(|memory| {
+                        memory.move_focus(egui::FocusDirection::None);
+                        memory.request_focus(target);
+                    });
+                }
+            }
+        }
         #[derive(Clone)]
         struct GalleryItem {
             path: PathBuf,
@@ -264,6 +289,7 @@ impl ImageViewer {
 
                 ui.label("Search:");
                 let search_resp = ui.add(egui::TextEdit::singleline(&mut self.semantic_query)
+                    .id(search_id)
                     .hint_text(hint)
                     .desired_width(320.0));
                 let enter_pressed = text_edit_enter_pressed(&search_resp);
@@ -348,6 +374,7 @@ impl ImageViewer {
                     ui.label("Folder:");
                     let scope_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.semantic_folder)
+                            .id(folder_id)
                             .hint_text("Blank = all indexed folders, or enter indexed folder path")
                             .desired_width(520.0),
                     );
